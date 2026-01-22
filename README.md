@@ -17,9 +17,9 @@ pip install UnityPy Pillow
 
 ```
 Unity_Font_Replacer/
-├── sdf_replacer.py      # 폰트 교체 도구
-├── export_fonts.py      # 폰트 추출 도구 (개발용)
-├── KR_ASSETS/           # 한글 폰트 에셋
+├── unity_font_replacer.py   # 폰트 교체 도구
+├── export_fonts.py          # 폰트 추출 도구
+├── KR_ASSETS/               # 한글 폰트 에셋
 │   ├── Mulmaru.ttf
 │   ├── Mulmaru SDF.json
 │   ├── Mulmaru SDF Atlas.png
@@ -31,16 +31,16 @@ Unity_Font_Replacer/
 
 ## 사용법
 
-### 폰트 교체 (sdf_replacer.py)
+### 폰트 교체 (unity_font_replacer.py)
 
 #### 기본 사용법
 
 ```bash
 # 대화형 모드 (게임 경로 입력 프롬프트)
-python sdf_replacer.py
+python unity_font_replacer.py
 
 # 게임 경로 지정
-python sdf_replacer.py --gamepath "D:\Games\Muck" --mulmaru
+python unity_font_replacer.py --gamepath "D:\Games\Muck" --mulmaru
 ```
 
 #### 명령줄 옵션
@@ -59,16 +59,16 @@ python sdf_replacer.py --gamepath "D:\Games\Muck" --mulmaru
 
 ```bash
 # 폰트 정보 파싱 (Muck.json 생성)
-python sdf_replacer.py --gamepath "D:\Games\Muck" --parse
+python unity_font_replacer.py --gamepath "D:\Games\Muck" --parse
 
 # Mulmaru 폰트로 모든 폰트 교체
-python sdf_replacer.py --gamepath "D:\Games\Muck" --mulmaru
+python unity_font_replacer.py --gamepath "D:\Games\Muck" --mulmaru
 
 # NanumGothic 폰트로 SDF 폰트만 교체
-python sdf_replacer.py --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
+python unity_font_replacer.py --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
 
 # JSON 파일을 사용한 개별 폰트 교체
-python sdf_replacer.py --gamepath "D:\Games\Muck" --list Muck.json
+python unity_font_replacer.py --gamepath "D:\Games\Muck" --list Muck.json
 ```
 
 ### 개별 폰트 교체 (--list 옵션)

@@ -1,9 +1,12 @@
 name: Build and Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '릴리즈 버전 (예: 1.0.0)'
+        required: true
+        type: string
 
 jobs:
   build:
@@ -23,25 +26,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller UnityPy Pillow
 
-      - name: Build executable
+      - name: Build executables
         run: |
-          pyinstaller --onefile --name unity_font_replacer sdf_replacer.py
+          pyinstaller --onefile --name unity_font_replacer unity_font_replacer.py
+          pyinstaller --onefile --name export_fonts export_fonts.py
 
       - name: Prepare release files
         run: |
           mkdir release
           copy dist\unity_font_replacer.exe release\
+          copy dist\export_fonts.exe release\
           xcopy KR_ASSETS release\KR_ASSETS\ /E /I
           copy README.md release\
 
       - name: Create ZIP archive
         run: |
-          Compress-Archive -Path release\* -DestinationPath Unity_Font_Replacer_${{ github.ref_name }}.zip
+          Compress-Archive -Path release\* -DestinationPath Unity_Font_Replacer_v${{ inputs.version }}.zip
 
-      - name: Create Release
+      - name: Create tag and release
         uses: softprops/action-gh-release@v1
         with:
-          files: Unity_Font_Replacer_${{ github.ref_name }}.zip
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          files: Unity_Font_Replacer_v${{ inputs.version }}.zip
           generate_release_notes: true
+          target_commitish: ${{ github.sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
