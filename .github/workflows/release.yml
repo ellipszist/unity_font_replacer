@@ -51,6 +51,7 @@ jobs:
           copy dist\unity_font_replacer.exe release\
           copy dist\export_fonts.exe release\
           xcopy KR_ASSETS release\KR_ASSETS\ /E /I
+          xcopy Il2CppDumper release\Il2CppDumper\ /E /I
           copy README.md release\
 
       - name: Create ZIP archive

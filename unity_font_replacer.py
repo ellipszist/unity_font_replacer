@@ -6,26 +6,34 @@ import argparse
 from PIL import Image
 import UnityPy
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
-
+import subprocess
 
 def find_ggm_file(data_path):
     candidates = ["globalgamemanagers", "globalgamemanagers.assets", "data.unity3d"]
+    candidates_resources = ["unity default resources", "unity_builtin_extra"]
+    fls = []
+    for candidate in candidates_resources:
+        ggm_path = os.path.join(data_path, "Resources", candidate)
+        if os.path.exists(ggm_path):
+            fls.append(ggm_path)
     for candidate in candidates:
         ggm_path = os.path.join(data_path, candidate)
         if os.path.exists(ggm_path):
-            return ggm_path
+            fls.append(ggm_path)
+    if fls:
+        return fls[0]
     return None
 
 
 def resolve_game_path(path):
     path = os.path.normpath(os.path.abspath(path))
 
-    if path.endswith("_Data"):
+    if path.lower().endswith("_data"):
         data_path = path
         game_path = os.path.dirname(path)
     else:
         game_path = path
-        data_folders = [d for d in os.listdir(path) if d.endswith("_Data") and os.path.isdir(os.path.join(path, d))]
+        data_folders = [d for d in os.listdir(path) if d.lower().endswith("_data") and os.path.isdir(os.path.join(path, d))]
 
         if not data_folders:
             raise FileNotFoundError(f"'{path}'에서 _Data 폴더를 찾을 수 없습니다.")
@@ -40,7 +48,7 @@ def resolve_game_path(path):
 
 
 def get_data_path(game_path):
-    data_folders = [i for i in os.listdir(game_path) if i.endswith("_Data")]
+    data_folders = [i for i in os.listdir(game_path) if i.lower().endswith("_data")]
     if not data_folders:
         raise FileNotFoundError(f"'{game_path}'에서 _Data 폴더를 찾을 수 없습니다.")
     return os.path.join(game_path, data_folders[0])
@@ -80,10 +88,16 @@ def find_assets_files(game_path):
                 assets_files.append(os.path.join(root, fn))
     return assets_files
 
+def get_compile_method(datapath):
+    if "Managed" in os.listdir(datapath):
+        return "Mono"
+    else:
+        return "Il2cpp"
 
 def scan_fonts(game_path):
     unity_version = get_unity_version(game_path)
     assets_files = find_assets_files(game_path)
+    compile_method = get_compile_method(get_data_path(game_path))
 
     fonts = {
         "ttf": [],
@@ -94,27 +108,67 @@ def scan_fonts(game_path):
         try:
             env = UnityPy.load(assets_file)
             generator = TypeTreeGenerator(unity_version)
-            generator.load_local_game(game_path)
+            if compile_method == "Mono":
+                generator.load_local_dll_folder(os.path.join(get_data_path(game_path), "Managed"))
+            else:
+                il2cpp_path = os.path.join(game_path, "GameAssembly.dll")
+                with open(il2cpp_path, "rb") as f:
+                    il2cpp = f.read()
+                metadata_path = os.path.join(get_data_path(game_path), "il2cpp_data", "Metadata", "global-metadata.dat")
+                with open(metadata_path, "rb") as f:
+                    metadata = f.read()
+                generator.load_il2cpp(il2cpp, metadata)
             env.typetree_generator = generator
 
-            for obj in env.objects:
+        except Exception as e:
+            print(e)
+            continue
+
+        for obj in env.objects:
+            try:
                 if obj.type.name == "Font":
                     font = obj.parse_as_object()
                     fonts["ttf"].append({
                         "file": os.path.basename(assets_file),
+                        "assets_name": obj.assets_file.name,
                         "name": font.m_Name,
                         "path_id": obj.path_id
                     })
                 elif obj.type.name == "MonoBehaviour":
-                    parse_obj = obj.parse_as_object()
-                    if parse_obj.get_type() == "TMP_FontAsset":
+                    is_font = False
+                    try:
+                        parse_obj = obj.parse_as_object()
+                        if hasattr(parse_obj, 'get_type') and parse_obj.get_type() == "TMP_FontAsset":
+                            is_font = True
+                    except:
+                        pass
+                    if not is_font:
+                        try:
+                            parse_dict = obj.parse_as_dict()
+                            if "m_AtlasTextures" in parse_dict and "m_FaceInfo" in parse_dict:
+                                is_font = True
+                        except:
+                            pass
+                    if is_font:
+                        try:
+                            parse_dict = obj.parse_as_dict()
+                            atlas_textures = parse_dict.get("m_AtlasTextures", [])
+                            glyph_count = len(parse_dict.get("m_GlyphTable", []))
+                            if atlas_textures and atlas_textures[0].get("m_FileID", 0) != 0:
+                                continue
+                            if glyph_count == 0:
+                                continue
+                        except:
+                            pass
                         fonts["sdf"].append({
                             "file": os.path.basename(assets_file),
+                            "assets_name": obj.assets_file.name,
                             "name": obj.peek_name(),
                             "path_id": obj.path_id
                         })
-        except Exception as e:
-            print(f"경고: '{assets_file}' 처리 중 오류 발생: {e}")
+            except Exception as e:
+                print(e)
+                pass
 
     return fonts
 
@@ -127,9 +181,10 @@ def parse_fonts(game_path):
     result = {}
 
     for font in fonts["ttf"]:
-        key = f"{font['file']}|TTF|{font['path_id']}"
+        key = f"{font['file']}|{font['assets_name']}|{font['name']}|TTF|{font['path_id']}"
         result[key] = {
             "Name": font["name"],
+            "assets_name": font["assets_name"],
             "Path_ID": font["path_id"],
             "Type": "TTF",
             "File": font["file"],
@@ -137,9 +192,10 @@ def parse_fonts(game_path):
         }
 
     for font in fonts["sdf"]:
-        key = f"{font['file']}|SDF|{font['path_id']}"
+        key = f"{font['file']}|{font['assets_name']}|{font['name']}|SDF|{font['path_id']}"
         result[key] = {
             "Name": font["name"],
+            "assets_name": font["assets_name"],
             "Path_ID": font["path_id"],
             "Type": "SDF",
             "File": font["file"],
@@ -189,6 +245,7 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
     fn_without_path = os.path.basename(assets_file)
     data_path = get_data_path(game_path)
     tmp_path = os.path.join(data_path, "temp")
+    compile_method = get_compile_method(data_path)
 
     if not os.path.exists(tmp_path):
         os.makedirs(tmp_path)
@@ -198,21 +255,32 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
 
     env = UnityPy.load(assets_file)
     generator = TypeTreeGenerator(unity_version)
-    generator.load_local_game(game_path)
+    if compile_method == "Mono":
+        generator.load_local_dll_folder(os.path.join(data_path, "Managed"))
+    else:
+        il2cpp_path = os.path.join(game_path, "GameAssembly.dll")
+        with open(il2cpp_path, "rb") as f:
+            il2cpp = f.read()
+        metadata_path = os.path.join(data_path, "il2cpp_data", "Metadata", "global-metadata.dat")
+        with open(metadata_path, "rb") as f:
+            metadata = f.read()
+        generator.load_il2cpp(il2cpp, metadata)
     env.typetree_generator = generator
 
     texture_replacements = {}
+    material_replacements = {}
     modified = False
 
     for obj in env.objects:
+        assets_name = obj.assets_file.name
         if obj.type.name == "Font" and replace_ttf:
             font = obj.parse_as_object()
             font_name = font.m_Name
             font_pathid = obj.path_id
-
+            
             replacement_font = None
             for key, info in replacements.items():
-                if info.get("Type") == "TTF" and info.get("File") == fn_without_path and info.get("Path_ID") == font_pathid:
+                if info.get("Type") == "TTF" and info.get("File") == fn_without_path and info.get("Path_ID") == font_pathid and info.get("assets_name") == assets_name:
                     if info.get("Replace_to"):
                         replacement_font = info["Replace_to"]
                         break
@@ -220,20 +288,31 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
             if replacement_font:
                 assets = load_font_assets(replacement_font)
                 if assets["ttf_data"]:
-                    print(f"TTF 폰트 교체: {font_name} (PathID: {font_pathid}) -> {replacement_font}")
+                    print(f"TTF 폰트 교체: {assets_name} | {font_name} | (PathID: {font_pathid} -> {replacement_font})")
                     font.m_FontData = assets["ttf_data"]
                     font.save()
                     modified = True
 
         if obj.type.name == "MonoBehaviour" and replace_sdf:
-            parse_obj = obj.parse_as_object()
-            if parse_obj.get_type() == "TMP_FontAsset":
+            try:
+                parse_dict = obj.parse_as_dict()
+            except:
+                continue
+            if "m_FaceInfo" in parse_dict and "m_AtlasTextures" in parse_dict:
+                # 폰트 참조만 있는 경우 건너뛰기 (실제 폰트 데이터가 아님)
+                atlas_textures = parse_dict.get("m_AtlasTextures", [])
+                glyph_count = len(parse_dict.get("m_GlyphTable", []))
+                if atlas_textures and atlas_textures[0].get("m_FileID", 0) != 0:
+                    continue
+                if glyph_count == 0:
+                    continue
+
                 objname = obj.peek_name()
                 pathid = obj.path_id
 
                 replacement_font = None
                 for key, info in replacements.items():
-                    if info.get("Type") == "SDF" and info.get("File") == fn_without_path and info.get("Path_ID") == pathid:
+                    if info.get("Type") == "SDF" and info.get("File") == fn_without_path and info.get("Path_ID") == pathid and info.get("assets_name") == assets_name:
                         if info.get("Replace_to"):
                             replacement_font = info["Replace_to"]
                             break
@@ -241,10 +320,10 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                 if replacement_font:
                     assets = load_font_assets(replacement_font)
                     if assets["sdf_data"] and assets["sdf_atlas"]:
-                        print(f"SDF 폰트 교체: {objname} (PathID: {pathid}) -> {replacement_font}")
+                        print(f"SDF 폰트 교체: {assets_name} | {objname} | (PathID: {pathid}) -> {replacement_font}")
 
                         parse_dict = obj.parse_as_dict()
-                        test_data = assets["sdf_data"]
+                        replace_data = assets["sdf_data"]
 
                         m_GameObject_FileID = parse_dict["m_GameObject"]["m_FileID"]
                         m_GameObject_PathID = parse_dict["m_GameObject"]["m_PathID"]
@@ -263,21 +342,21 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                         m_AtlasTextures_FileID = parse_dict["m_AtlasTextures"][0]["m_FileID"]
                         m_AtlasTextures_PathID = parse_dict["m_AtlasTextures"][0]["m_PathID"]
 
-                        if "m_GlyphTable" in test_data and type(test_data["m_GlyphTable"]) == list:
-                            for glyph in test_data["m_GlyphTable"]:
+                        if "m_GlyphTable" in replace_data and type(replace_data["m_GlyphTable"]) == list:
+                            for glyph in replace_data["m_GlyphTable"]:
                                 glyph["m_ClassDefinitionType"] = 0
 
-                        parse_dict["m_FaceInfo"] = test_data["m_FaceInfo"]
-                        parse_dict["m_GlyphTable"] = test_data["m_GlyphTable"]
-                        parse_dict["m_CharacterTable"] = test_data["m_CharacterTable"]
-                        parse_dict["m_AtlasTextures"] = test_data["m_AtlasTextures"]
-                        parse_dict["m_AtlasWidth"] = test_data["m_AtlasWidth"]
-                        parse_dict["m_AtlasHeight"] = test_data["m_AtlasHeight"]
-                        parse_dict["m_AtlasPadding"] = test_data["m_AtlasPadding"]
-                        parse_dict["m_AtlasRenderMode"] = test_data["m_AtlasRenderMode"]
-                        parse_dict["m_UsedGlyphRects"] = test_data["m_UsedGlyphRects"]
-                        parse_dict["m_FreeGlyphRects"] = test_data["m_FreeGlyphRects"]
-                        parse_dict["m_FontWeightTable"] = test_data["m_FontWeightTable"]
+                        parse_dict["m_FaceInfo"] = replace_data["m_FaceInfo"]
+                        parse_dict["m_GlyphTable"] = replace_data["m_GlyphTable"]
+                        parse_dict["m_CharacterTable"] = replace_data["m_CharacterTable"]
+                        parse_dict["m_AtlasTextures"] = replace_data["m_AtlasTextures"]
+                        parse_dict["m_AtlasWidth"] = replace_data["m_AtlasWidth"]
+                        parse_dict["m_AtlasHeight"] = replace_data["m_AtlasHeight"]
+                        parse_dict["m_AtlasPadding"] = replace_data["m_AtlasPadding"]
+                        parse_dict["m_AtlasRenderMode"] = replace_data["m_AtlasRenderMode"]
+                        parse_dict["m_UsedGlyphRects"] = replace_data["m_UsedGlyphRects"]
+                        parse_dict["m_FreeGlyphRects"] = replace_data["m_FreeGlyphRects"]
+                        parse_dict["m_FontWeightTable"] = replace_data["m_FontWeightTable"]
 
                         def ensure_int(data, keys):
                             if not data:
@@ -325,22 +404,35 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                         parse_dict["m_AtlasTextures"][0]["m_PathID"] = m_AtlasTextures_PathID
                         parse_dict["m_CreationSettings"]["characterSequence"] = ""
 
-                        texture_replacements[m_AtlasTextures_PathID] = assets["sdf_atlas"]
+                        texture_replacements[f"{assets_name}|{m_AtlasTextures_PathID}"] = assets["sdf_atlas"]
+                        if m_Material_FileID == 0 and m_Material_PathID != 0:
+                            material_replacements[f"{assets_name}|{m_Material_PathID}"] = {"w": assets["sdf_atlas"].width, "h": assets["sdf_atlas"].height}
                         obj.patch(parse_dict)
                         modified = True
 
     for obj in env.objects:
+        assets_name = obj.assets_file.name
         if obj.type.name == "Texture2D":
-            if obj.path_id in texture_replacements:
-                parse_obj = obj.parse_as_object()
+            if f"{assets_name}|{obj.path_id}" in texture_replacements:
+                parse_dict = obj.parse_as_object()
                 print(f"텍스처 교체: {obj.peek_name()} (PathID: {obj.path_id})")
-                parse_obj.image = texture_replacements[obj.path_id]
-                parse_obj.save()
+                parse_dict.image = texture_replacements[f"{assets_name}|{obj.path_id}"]
+                parse_dict.save()
                 modified = True
+        if obj.type.name == "Material":
+            if f"{assets_name}|{obj.path_id}" in material_replacements:
+                parse_dict = obj.parse_as_object()
+
+                for i in range(len(parse_dict.m_SavedProperties.m_Floats)):
+                    if parse_dict.m_SavedProperties.m_Floats[i][0] == '_TextureHeight':
+                        parse_dict.m_SavedProperties.m_Floats[i] = ('_TextureHeight', float(material_replacements[f"{assets_name}|{obj.path_id}"]["h"]))
+                    if parse_dict.m_SavedProperties.m_Floats[i][0] == '_TextureWidth':
+                        parse_dict.m_SavedProperties.m_Floats[i] = ('_TextureWidth', float(material_replacements[f"{assets_name}|{obj.path_id}"]["w"]))
+                parse_dict.save()
 
     if modified:
         print(f"'{fn_without_path}' 저장 중...")
-        env.save(out_path=tmp_path)
+        env.save(pack="none", out_path=tmp_path)
         shutil.move(os.path.join(tmp_path, fn_without_path), assets_file)
 
     if os.path.exists(tmp_path):
@@ -358,6 +450,7 @@ def create_batch_replacements(game_path, font_name, replace_ttf=True, replace_sd
             key = f"{font['file']}|TTF|{font['path_id']}"
             replacements[key] = {
                 "Name": font["name"],
+                "assets_name": font["assets_name"],
                 "Path_ID": font["path_id"],
                 "Type": "TTF",
                 "File": font["file"],
@@ -369,6 +462,7 @@ def create_batch_replacements(game_path, font_name, replace_ttf=True, replace_sd
             key = f"{font['file']}|SDF|{font['path_id']}"
             replacements[key] = {
                 "Name": font["name"],
+                "assets_name": font["assets_name"],
                 "Path_ID": font["path_id"],
                 "Type": "SDF",
                 "File": font["file"],
@@ -406,7 +500,6 @@ def main():
     parser.add_argument("--list", type=str, metavar="JSON_FILE", help="JSON 파일을 읽어서 폰트 교체")
 
     args = parser.parse_args()
-
     input_path = args.gamepath
     if not input_path:
         input_path = input("게임 경로를 입력하세요: ").strip()
@@ -418,12 +511,14 @@ def main():
 
     try:
         game_path, data_path = resolve_game_path(input_path)
+        compile_method = get_compile_method(data_path)
         print(f"게임 경로: {game_path}")
         print(f"데이터 경로: {data_path}")
-        print()
+        print(f"컴파일 방식: {compile_method}")
     except FileNotFoundError as e:
         exit_with_error(str(e))
-
+    if os.path.exists(os.path.join(data_path, "temp")):
+        shutil.rmtree(os.path.join(data_path, "temp"))
     replace_ttf = not args.sdfonly
     replace_sdf = not args.ttfonly
 
@@ -463,6 +558,42 @@ def main():
             mode = "nanumgothic"
         else:
             exit_with_error("잘못된 선택입니다.")
+
+    if compile_method == "Il2cpp" and os.path.exists(os.path.join(data_path, "Managed")) == False:
+        binary_path = os.path.join(game_path, "GameAssembly.dll")
+        metadata_path = os.path.join(data_path, "il2cpp_data", "Metadata", "global-metadata.dat")
+        if not os.path.exists(binary_path) or not os.path.exists(metadata_path):
+            exit_with_error("Il2cpp 게임의 경우 'Managed' 폴더 또는 'GameAssembly.dll'과 'global-metadata.dat' 파일이 필요합니다.\n올바른 Unity 게임 폴더인지 확인해주세요.")
+        dumper_path = os.path.join(get_script_dir(), "Il2CppDumper", "Il2CppDumper.exe")
+        target_path = os.path.join(get_data_path(game_path), "Managed_")
+        os.makedirs(target_path, exist_ok=True)
+        command = [os.path.abspath(dumper_path), os.path.abspath(binary_path), os.path.abspath(metadata_path), os.path.abspath(target_path)]
+        print("Il2cpp 게임을 위한 Managed 폴더를 생성합니다...")
+        print(os.path.abspath(target_path))
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                startupinfo=startupinfo,
+                encoding='utf-8'
+            )
+
+            if process.returncode == 0:
+                print(process.stdout)
+                shutil.move(os.path.join(get_data_path(game_path), "Managed_", "DummyDll"), os.path.join(get_data_path(game_path), "Managed"))
+                shutil.rmtree(os.path.join(get_data_path(game_path), "Managed_"))
+                print("더미 DLL 생성에 성공했습니다!")
+            else:
+                print(process.stderr)
+                exit_with_error("Il2cpp 더미 DLL 생성 실패")
+
+        except Exception as e:
+            print(f"실행 중 예외 발생: {e}")
+
 
     if mode == "parse":
         parse_fonts(game_path)
