@@ -145,6 +145,13 @@ SDF 폰트 데이터는 `export_fonts.py`로 추출할 수 있습니다.
 - 일부 게임에서는 무결성 검사로 인해 수정된 파일이 작동하지 않을 수 있습니다.
 - 온라인 게임에서 사용 시 이용 약관을 확인하세요.
 
+## Special Thanks
+
+- [UnityPy](https://github.com/K0lb3/UnityPy) by K0lb3
+- [Il2CppDumper](https://github.com/Perfare/Il2CppDumper) by Perfare
+- [나눔고딕](https://hangeul.naver.com/font) by NAVER | [License](https://help.naver.com/service/30016/contents/18088?osType=PC&lang=ko)
+- [물마루](https://github.com/mushsooni/mulmaru) by mushsooni
+
 ## 라이선스
 
 MIT License
