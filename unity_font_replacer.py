@@ -414,15 +414,20 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                         
                         texture_replacements[f"{assets_name}|{m_AtlasTextures_PathID}"] = assets["sdf_atlas"]
                         if m_Material_FileID == 0 and m_Material_PathID != 0:
-                            material_props = assets.get("sdf_materials", {}).get("m_SavedProperties", {})
-                            float_properties = material_props.get("m_Floats", [])
-
-                            for key, value in float_properties:
-                                if key == "_GradientScale":
-                                    GradientScale = value
-                            else:
-                                GradientScale = None
-                            material_replacements[f"{assets_name}|{m_Material_PathID}"] = {"w": assets["sdf_atlas"].width, "h": assets["sdf_atlas"].height, "gs": GradientScale}
+                            gradient_scale = None
+                            material_data = assets.get("sdf_materials")
+                            if material_data:
+                                material_props = material_data.get("m_SavedProperties", {})
+                                float_properties = material_props.get("m_Floats", [])
+                                for prop in float_properties:
+                                    if prop[0] == "_GradientScale":
+                                        gradient_scale = prop[1]
+                                        break
+                            material_replacements[f"{assets_name}|{m_Material_PathID}"] = {
+                                "w": assets["sdf_atlas"].width,
+                                "h": assets["sdf_atlas"].height,
+                                "gs": gradient_scale
+                            }
                         obj.patch(parse_dict)
                         modified = True
 
@@ -439,13 +444,15 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
             if f"{assets_name}|{obj.path_id}" in material_replacements:
                 parse_dict = obj.parse_as_object()
 
+                mat_info = material_replacements[f"{assets_name}|{obj.path_id}"]
                 for i in range(len(parse_dict.m_SavedProperties.m_Floats)):
-                    if parse_dict.m_SavedProperties.m_Floats[i][0] == '_TextureHeight':
-                        parse_dict.m_SavedProperties.m_Floats[i] = ('_TextureHeight', float(material_replacements[f"{assets_name}|{obj.path_id}"]["h"]))
-                    if parse_dict.m_SavedProperties.m_Floats[i][0] == '_TextureWidth':
-                        parse_dict.m_SavedProperties.m_Floats[i] = ('_TextureWidth', float(material_replacements[f"{assets_name}|{obj.path_id}"]["w"]))
-                    if parse_dict.m_SavedProperties.m_Floats[i][0] == '_GradientScale' and material_replacements[f"{assets_name}|{obj.path_id}"]["gs"]:
-                        parse_dict.m_SavedProperties.m_Floats[i] = ('_GradientScale', float(material_replacements[f"{assets_name}|{obj.path_id}"]["_GradientScale"]))
+                    prop_name = parse_dict.m_SavedProperties.m_Floats[i][0]
+                    if prop_name == '_TextureHeight':
+                        parse_dict.m_SavedProperties.m_Floats[i] = ('_TextureHeight', float(mat_info["h"]))
+                    elif prop_name == '_TextureWidth':
+                        parse_dict.m_SavedProperties.m_Floats[i] = ('_TextureWidth', float(mat_info["w"]))
+                    elif prop_name == '_GradientScale' and mat_info["gs"] is not None:
+                        parse_dict.m_SavedProperties.m_Floats[i] = ('_GradientScale', float(mat_info["gs"]))
                 parse_dict.save()
 
     if modified:
@@ -457,7 +464,7 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
         except struct.error:
             print(f"  압축 모드로 재시도...")
             sf = env.file.save(packer="lz4")
-            with open("{", "wb") as f:
+            with open(f"{tmp_path}/{fn_without_path}", "wb") as f:
                 f.write(sf)
         shutil.move(os.path.join(tmp_path, fn_without_path), assets_file)
 
