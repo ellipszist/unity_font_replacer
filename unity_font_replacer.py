@@ -470,6 +470,22 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                 # AssetsFile.save does not support packer; fall back to default
                 return env.file.save()
 
+        def _make_packer_with_flags(compression_flag):
+            dataflags = getattr(env.file, "dataflags", None)
+            if dataflags is None:
+                return None
+            try:
+                data_flag = int(dataflags)
+                block_info_flag = int(getattr(env.file, "_block_info_flags", 0))
+            except Exception:
+                return None
+            # Preserve structure flags; only change compression bits.
+            data_flag = (data_flag & ~0x3F) | int(compression_flag)
+            block_info_flag = (block_info_flag & ~0x3F) | int(compression_flag)
+            # Ensure only compression bits are set in block_info_flag (UnityFS expects 0x3F mask).
+            block_info_flag &= 0x3F
+            return (data_flag, block_info_flag)
+
         def _try_save(packer_label, log_label):
             nonlocal save_success
             try:
@@ -483,11 +499,14 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                 return False
 
         # Prefer preserving original bundle compression/layout when possible.
-        if not _try_save("original", "1"):
+        original_packer = _make_packer_with_flags(int(getattr(env.file, "_block_info_flags", 0)) & 0x3F)
+        if not _try_save(original_packer or "original", "1"):
+            lz4_packer = _make_packer_with_flags(2)
             print("  lz4 압축 모드로 재시도...")
-            if not _try_save("lz4", "2"):
+            if not _try_save(lz4_packer or "lz4", "2"):
+                none_packer = _make_packer_with_flags(0)
                 print("  비압축 모드로 재시도...")
-                _try_save("none", "3")
+                _try_save(none_packer or "none", "3")
 
         if save_success:
             def _close_reader(obj):
