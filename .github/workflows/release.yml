@@ -8,6 +8,9 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -26,10 +29,37 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller UnityPy Pillow
 
+      - name: Get UnityPy data paths
+        id: unitypy_paths
+        shell: python
+        run: |
+          import os
+          import UnityPy
+          import TypeTreeGeneratorAPI
+
+          unitypy_dir = os.path.dirname(UnityPy.__file__)
+          tpk_path = os.path.join(unitypy_dir, "resources", "uncompressed.tpk")
+
+          ttg_dir = os.path.dirname(TypeTreeGeneratorAPI.__file__)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"tpk_path={tpk_path}\n")
+              f.write(f"unitypy_dir={unitypy_dir}\n")
+              f.write(f"ttg_dir={ttg_dir}\n")
+
       - name: Build executables
         run: |
-          pyinstaller --onefile --name unity_font_replacer unity_font_replacer.py
-          pyinstaller --onefile --name export_fonts export_fonts.py
+          pyinstaller --onefile --name unity_font_replacer `
+            --add-data "${{ steps.unitypy_paths.outputs.tpk_path }};UnityPy/resources" `
+            --add-data "${{ steps.unitypy_paths.outputs.ttg_dir }}/capstone.dll;TypeTreeGeneratorAPI" `
+            --add-data "${{ steps.unitypy_paths.outputs.ttg_dir }}/TypeTreeGeneratorAPI.dll;TypeTreeGeneratorAPI" `
+            unity_font_replacer.py
+
+          pyinstaller --onefile --name export_fonts `
+            --add-data "${{ steps.unitypy_paths.outputs.tpk_path }};UnityPy/resources" `
+            --add-data "${{ steps.unitypy_paths.outputs.ttg_dir }}/capstone.dll;TypeTreeGeneratorAPI" `
+            --add-data "${{ steps.unitypy_paths.outputs.ttg_dir }}/TypeTreeGeneratorAPI.dll;TypeTreeGeneratorAPI" `
+            export_fonts.py
 
       - name: Prepare release files
         run: |
@@ -43,13 +73,19 @@ jobs:
         run: |
           Compress-Archive -Path release\* -DestinationPath Unity_Font_Replacer_v${{ inputs.version }}.zip
 
-      - name: Create tag and release
+      - name: Create tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag v${{ inputs.version }} ${{ github.sha }}
+          git push origin v${{ inputs.version }}
+
+      - name: Create release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ inputs.version }}
           name: v${{ inputs.version }}
           files: Unity_Font_Replacer_v${{ inputs.version }}.zip
           generate_release_notes: true
-          target_commitish: ${{ github.sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
