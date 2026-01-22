@@ -6,6 +6,12 @@ from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 from PIL import Image
 
 
+def exit_with_error(message):
+    print(f"오류: {message}")
+    input("\n엔터를 눌러 종료...")
+    sys.exit(1)
+
+
 def resolve_game_path(path=None):
     if path is None:
         path = os.getcwd()
@@ -20,17 +26,13 @@ def resolve_game_path(path=None):
         data_folders = [d for d in os.listdir(path) if d.endswith("_Data") and os.path.isdir(os.path.join(path, d))]
 
         if not data_folders:
-            print(f"오류: '{path}'에서 _Data 폴더를 찾을 수 없습니다.")
-            print("게임 루트 폴더 또는 _Data 폴더에서 실행해주세요.")
-            sys.exit(1)
+            exit_with_error(f"'{path}'에서 _Data 폴더를 찾을 수 없습니다.\n게임 루트 폴더 또는 _Data 폴더에서 실행해주세요.")
 
         data_path = os.path.join(game_path, data_folders[0])
 
     ggm_path = os.path.join(data_path, "globalgamemanagers")
     if not os.path.exists(ggm_path):
-        print(f"오류: '{data_path}'에서 globalgamemanagers 파일을 찾을 수 없습니다.")
-        print("올바른 Unity 게임 폴더인지 확인해주세요.")
-        sys.exit(1)
+        exit_with_error(f"'{data_path}'에서 globalgamemanagers 파일을 찾을 수 없습니다.\n올바른 Unity 게임 폴더인지 확인해주세요.")
 
     return game_path, data_path
 
@@ -121,7 +123,13 @@ def main():
 
     print()
     print(f"완료! {exported_count}개의 SDF 폰트가 추출되었습니다.")
+    input("\n엔터를 눌러 종료...")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\n예상치 못한 오류가 발생했습니다: {e}")
+        input("\n엔터를 눌러 종료...")
+        sys.exit(1)

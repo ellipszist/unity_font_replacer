@@ -364,6 +364,12 @@ def create_batch_replacements(game_path, font_name, replace_ttf=True, replace_sd
     return replacements
 
 
+def exit_with_error(message):
+    print(f"오류: {message}")
+    input("\n엔터를 눌러 종료...")
+    sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Unity 게임의 폰트를 한글 폰트로 교체합니다.",
@@ -391,12 +397,10 @@ def main():
     if not input_path:
         input_path = input("게임 경로를 입력하세요: ").strip()
         if not input_path:
-            print("오류: 게임 경로가 필요합니다.")
-            sys.exit(1)
+            exit_with_error("게임 경로가 필요합니다.")
 
     if not os.path.isdir(input_path):
-        print(f"오류: '{input_path}'는 유효한 디렉토리가 아닙니다.")
-        sys.exit(1)
+        exit_with_error(f"'{input_path}'는 유효한 디렉토리가 아닙니다.")
 
     try:
         game_path, data_path = resolve_game_path(input_path)
@@ -404,19 +408,18 @@ def main():
         print(f"데이터 경로: {data_path}")
         print()
     except FileNotFoundError as e:
-        print(f"오류: {e}")
-        sys.exit(1)
+        exit_with_error(str(e))
 
     if args.parse:
         parse_fonts(game_path)
+        input("\n엔터를 눌러 종료...")
         return
 
     replace_ttf = not args.sdfonly
     replace_sdf = not args.ttfonly
 
     if args.sdfonly and args.ttfonly:
-        print("오류: --sdfonly와 --ttfonly를 동시에 사용할 수 없습니다.")
-        sys.exit(1)
+        exit_with_error("--sdfonly와 --ttfonly를 동시에 사용할 수 없습니다.")
 
     replacements = None
 
@@ -428,8 +431,7 @@ def main():
         replacements = create_batch_replacements(game_path, "NanumGothic", replace_ttf, replace_sdf)
     elif args.list:
         if not os.path.exists(args.list):
-            print(f"오류: '{args.list}' 파일을 찾을 수 없습니다.")
-            sys.exit(1)
+            exit_with_error(f"'{args.list}' 파일을 찾을 수 없습니다.")
 
         print(f"'{args.list}' 파일을 읽어서 교체합니다...")
         with open(args.list, "r", encoding="utf-8") as f:
@@ -441,6 +443,7 @@ def main():
     else:
         print("오류: --mulmaru, --nanumgothic, 또는 --list 옵션 중 하나가 필요합니다.")
         print("폰트 정보를 먼저 확인하려면 --parse 옵션을 사용하세요.")
+        input("\n엔터를 눌러 종료...")
         sys.exit(1)
 
     unity_version = get_unity_version(game_path)
@@ -460,7 +463,13 @@ def main():
                 modified_count += 1
 
     print(f"\n완료! {modified_count}개의 파일이 수정되었습니다.")
+    input("\n엔터를 눌러 종료...")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\n예상치 못한 오류가 발생했습니다: {e}")
+        input("\n엔터를 눌러 종료...")
+        sys.exit(1)
