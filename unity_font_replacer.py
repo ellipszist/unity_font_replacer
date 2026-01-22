@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import shutil
+import struct
 import argparse
 from PIL import Image
 import UnityPy
@@ -432,7 +433,11 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
 
     if modified:
         print(f"'{fn_without_path}' 저장 중...")
-        env.save(pack="none", out_path=tmp_path)
+        try:
+            env.save(pack="none", out_path=tmp_path)
+        except struct.error:
+            print(f"  압축 모드로 재시도...")
+            env.save(pack="lz4", out_path=tmp_path)
         shutil.move(os.path.join(tmp_path, fn_without_path), assets_file)
 
     if os.path.exists(tmp_path):
@@ -643,6 +648,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
+        import traceback
         print(f"\n예상치 못한 오류가 발생했습니다: {e}")
+        traceback.print_exc()
         input("\n엔터를 눌러 종료...")
         sys.exit(1)
