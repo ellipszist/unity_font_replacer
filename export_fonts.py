@@ -12,6 +12,15 @@ def exit_with_error(message):
     sys.exit(1)
 
 
+def find_ggm_file(data_path):
+    candidates = ["globalgamemanagers", "globalgamemanagers.assets", "data.unity3d"]
+    for candidate in candidates:
+        ggm_path = os.path.join(data_path, candidate)
+        if os.path.exists(ggm_path):
+            return ggm_path
+    return None
+
+
 def resolve_game_path(path=None):
     if path is None:
         path = os.getcwd()
@@ -30,15 +39,15 @@ def resolve_game_path(path=None):
 
         data_path = os.path.join(game_path, data_folders[0])
 
-    ggm_path = os.path.join(data_path, "globalgamemanagers")
-    if not os.path.exists(ggm_path):
+    ggm_path = find_ggm_file(data_path)
+    if not ggm_path:
         exit_with_error(f"'{data_path}'에서 globalgamemanagers 파일을 찾을 수 없습니다.\n올바른 Unity 게임 폴더인지 확인해주세요.")
 
     return game_path, data_path
 
 
 def get_unity_version(data_path):
-    ggm_path = os.path.join(data_path, "globalgamemanagers")
+    ggm_path = find_ggm_file(data_path)
     return UnityPy.load(ggm_path).objects[0].assets_file.unity_version
 
 
