@@ -457,16 +457,68 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
 
     if modified:
         print(f"'{fn_without_path}' 저장 중...")
+
+        save_success = False
+
         try:
             sf = env.file.save(packer="none")
             with open(f"{tmp_path}/{fn_without_path}", "wb") as f:
                 f.write(sf)
-        except struct.error:
-            print(f"  압축 모드로 재시도...")
-            sf = env.file.save(packer="lz4")
-            with open(f"{tmp_path}/{fn_without_path}", "wb") as f:
-                f.write(sf)
-        shutil.move(os.path.join(tmp_path, fn_without_path), assets_file)
+            save_success = True
+        except (struct.error, Exception) as e:
+            print(f"  저장 방법 1 실패: {e}")
+
+        if not save_success:
+            try:
+                print(f"  lz4 압축 모드로 재시도...")
+                sf = env.file.save(packer="lz4")
+                with open(f"{tmp_path}/{fn_without_path}", "wb") as f:
+                    f.write(sf)
+                save_success = True
+            except (struct.error, Exception) as e:
+                print(f"  저장 방법 2 실패: {e}")
+
+        if save_success:
+            def _close_reader(obj):
+                reader = getattr(obj, "reader", None)
+                if reader is not None and hasattr(reader, "dispose"):
+                    try:
+                        reader.dispose()
+                    except Exception:
+                        pass
+                if hasattr(obj, "dispose"):
+                    try:
+                        obj.dispose()
+                    except Exception:
+                        pass
+
+            def _close_env(environment):
+                if not environment:
+                    return
+                stack = []
+                files = getattr(environment, "files", None)
+                if isinstance(files, dict):
+                    stack.extend(files.values())
+                while stack:
+                    item = stack.pop()
+                    _close_reader(item)
+                    sub_files = getattr(item, "files", None)
+                    if isinstance(sub_files, dict):
+                        stack.extend(sub_files.values())
+
+            _close_env(env)
+
+            saved_file_path = os.path.join(tmp_path, fn_without_path)
+            if os.path.exists(saved_file_path):
+                saved_size = os.path.getsize(saved_file_path)
+                shutil.move(saved_file_path, assets_file)
+                print(f"  저장 완료 (크기: {saved_size} bytes)")
+            else:
+                print(f"  경고: 저장된 파일을 찾을 수 없습니다")
+                save_success = False
+
+        if not save_success:
+            print("  오류: 파일 저장에 실패했습니다.")
 
     if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
