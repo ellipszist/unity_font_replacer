@@ -89,6 +89,7 @@ def export_fonts(game_path, data_path, output_dir=None):
 
         texture_pointers = []
         texture_names = {}
+        material_pointers = []
 
         for obj in env.objects:
             try:
@@ -99,12 +100,20 @@ def export_fonts(game_path, data_path, output_dir=None):
                         pathid = obj.path_id
                         parse_dict = obj.parse_as_dict()
                         m_AtlasTextures_PathID = parse_dict["m_AtlasTextures"][0]["m_PathID"]
-
+                        if parse_dict.get("m_Material") is not None:
+                            m_Material_FileID = parse_dict["m_Material"]["m_FileID"]
+                            m_Material_PathID = parse_dict["m_Material"]["m_PathID"]
+                        else:
+                            m_Material_FileID = parse_dict["material"]["m_FileID"]
+                            m_Material_PathID = parse_dict["material"]["m_PathID"]
+                        parse_dict["m_CreationSettings"]["characterSequence"] = ""
                         print(f"SDF 폰트 발견: {objname} (PathID: {pathid})")
                         print(f"  Atlas 텍스처 PathID: {m_AtlasTextures_PathID}")
+                        print(f"  머티리얼 PathID: {m_Material_PathID}")
 
                         texture_pointers.append(m_AtlasTextures_PathID)
                         texture_names[m_AtlasTextures_PathID] = objname.replace(" SDF", " SDF Atlas")
+                        material_pointers.append(m_Material_PathID)
 
                         json_path = os.path.join(output_dir, f"{objname}.json")
                         with open(json_path, "w", encoding="utf-8") as f:
@@ -127,8 +136,14 @@ def export_fonts(game_path, data_path, output_dir=None):
                         png_path = os.path.join(output_dir, f"{objname}.png")
                         image.save(png_path)
                         print(f"  -> {objname}.png 저장됨")
+                elif obj.path_id in material_pointers:
+                    if obj.type.name == "Material":
+                        mat = obj.read_typetree()
+                        mat_name = obj.peek_name()
+                        with open(f"{mat_name}.json", "w", encoding="utf-8") as f:
+                            f.write(json.dumps(mat, ensure_ascii=False, indent=4))
             except Exception as e:
-                print(f"경고: 텍스처 추출 중 오류 (PathID: {obj.path_id}): {e}")
+                print(f"경고: 추출 중 오류 (PathID: {obj.path_id}): {e}")
 
     return exported_count
 

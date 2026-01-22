@@ -235,10 +235,17 @@ def load_font_assets(font_name):
             sdf_atlas = Image.open(f)
             sdf_atlas.load()
 
+    sdf_material_path = os.path.join(kr_assets, f"{normalized} SDF Material.json")
+    sdf_material_data = None
+    if os.path.exists(sdf_material_path):
+        with open(sdf_material_path, "r", encoding="utf-8") as f:
+            sdf_material_data = json.load(f)
+
     return {
         "ttf_data": ttf_data,
         "sdf_data": sdf_data,
-        "sdf_atlas": sdf_atlas
+        "sdf_atlas": sdf_atlas,
+        "sdf_materials": sdf_material_data
     }
 
 
@@ -404,10 +411,18 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                         parse_dict["m_AtlasTextures"][0]["m_FileID"] = m_AtlasTextures_FileID
                         parse_dict["m_AtlasTextures"][0]["m_PathID"] = m_AtlasTextures_PathID
                         parse_dict["m_CreationSettings"]["characterSequence"] = ""
-
+                        
                         texture_replacements[f"{assets_name}|{m_AtlasTextures_PathID}"] = assets["sdf_atlas"]
                         if m_Material_FileID == 0 and m_Material_PathID != 0:
-                            material_replacements[f"{assets_name}|{m_Material_PathID}"] = {"w": assets["sdf_atlas"].width, "h": assets["sdf_atlas"].height}
+                            material_props = assets.get("sdf_materials", {}).get("m_SavedProperties", {})
+                            float_properties = material_props.get("m_Floats", [])
+
+                            for key, value in float_properties:
+                                if key == "_GradientScale":
+                                    GradientScale = value
+                            else:
+                                GradientScale = None
+                            material_replacements[f"{assets_name}|{m_Material_PathID}"] = {"w": assets["sdf_atlas"].width, "h": assets["sdf_atlas"].height, "gs": GradientScale}
                         obj.patch(parse_dict)
                         modified = True
 
@@ -429,15 +444,21 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                         parse_dict.m_SavedProperties.m_Floats[i] = ('_TextureHeight', float(material_replacements[f"{assets_name}|{obj.path_id}"]["h"]))
                     if parse_dict.m_SavedProperties.m_Floats[i][0] == '_TextureWidth':
                         parse_dict.m_SavedProperties.m_Floats[i] = ('_TextureWidth', float(material_replacements[f"{assets_name}|{obj.path_id}"]["w"]))
+                    if parse_dict.m_SavedProperties.m_Floats[i][0] == '_GradientScale' and material_replacements[f"{assets_name}|{obj.path_id}"]["gs"]:
+                        parse_dict.m_SavedProperties.m_Floats[i] = ('_GradientScale', float(material_replacements[f"{assets_name}|{obj.path_id}"]["_GradientScale"]))
                 parse_dict.save()
 
     if modified:
         print(f"'{fn_without_path}' 저장 중...")
         try:
-            env.save(pack="none", out_path=tmp_path)
+            sf = env.file.save(packer="none")
+            with open(f"{tmp_path}/{fn_without_path}", "wb") as f:
+                f.write(sf)
         except struct.error:
             print(f"  압축 모드로 재시도...")
-            env.save(pack="lz4", out_path=tmp_path)
+            sf = env.file.save(packer="lz4")
+            with open("{", "wb") as f:
+                f.write(sf)
         shutil.move(os.path.join(tmp_path, fn_without_path), assets_file)
 
     if os.path.exists(tmp_path):
