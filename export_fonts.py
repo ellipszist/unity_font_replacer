@@ -71,10 +71,15 @@ def export_fonts(game_path, data_path, output_dir=None):
             generator = TypeTreeGenerator(unity_version)
             generator.load_local_game(game_path)
             env.typetree_generator = generator
+        except Exception as e:
+            print(f"경고: '{os.path.basename(assets_file)}' 로드 중 오류: {e}")
+            continue
 
-            texture_pointers = []
+        texture_pointers = []
+        texture_names = {}
 
-            for obj in env.objects:
+        for obj in env.objects:
+            try:
                 if obj.type.name == "MonoBehaviour":
                     parse_obj = obj.parse_as_object()
                     if parse_obj.get_type() == "TMP_FontAsset":
@@ -87,28 +92,31 @@ def export_fonts(game_path, data_path, output_dir=None):
                         print(f"  Atlas 텍스처 PathID: {m_AtlasTextures_PathID}")
 
                         texture_pointers.append(m_AtlasTextures_PathID)
+                        texture_names[m_AtlasTextures_PathID] = objname.replace(" SDF", " SDF Atlas")
 
                         json_path = os.path.join(output_dir, f"{objname}.json")
                         with open(json_path, "w", encoding="utf-8") as f:
                             json.dump(parse_dict, indent=4, ensure_ascii=False, fp=f)
                         print(f"  -> {objname}.json 저장됨")
                         exported_count += 1
+            except Exception as e:
+                pass
 
-            for obj in env.objects:
+        for obj in env.objects:
+            try:
                 if obj.path_id in texture_pointers:
                     if obj.type.name == "Texture2D":
                         tex = obj.read()
                         image = tex.image
-                        objname = obj.peek_name()
+                        objname = texture_names.get(obj.path_id, obj.peek_name())
 
                         print(f"텍스처 추출: {objname} (PathID: {obj.path_id})")
 
                         png_path = os.path.join(output_dir, f"{objname}.png")
                         image.save(png_path)
                         print(f"  -> {objname}.png 저장됨")
-
-        except Exception as e:
-            print(f"경고: '{os.path.basename(assets_file)}' 처리 중 오류: {e}")
+            except Exception as e:
+                print(f"경고: 텍스처 추출 중 오류 (PathID: {obj.path_id}): {e}")
 
     return exported_count
 

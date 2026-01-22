@@ -457,9 +457,11 @@ def main():
     elif mode == "mulmaru":
         print("Mulmaru 폰트로 일괄 교체합니다...")
         replacements = create_batch_replacements(game_path, "Mulmaru", replace_ttf, replace_sdf)
+        print(f"발견된 폰트: TTF {sum(1 for v in replacements.values() if v['Type'] == 'TTF')}개, SDF {sum(1 for v in replacements.values() if v['Type'] == 'SDF')}개")
     elif mode == "nanumgothic":
         print("NanumGothic 폰트로 일괄 교체합니다...")
         replacements = create_batch_replacements(game_path, "NanumGothic", replace_ttf, replace_sdf)
+        print(f"발견된 폰트: TTF {sum(1 for v in replacements.values() if v['Type'] == 'TTF')}개, SDF {sum(1 for v in replacements.values() if v['Type'] == 'SDF')}개")
     elif mode == "list":
         if not os.path.exists(args.list):
             exit_with_error(f"'{args.list}' 파일을 찾을 수 없습니다.")
