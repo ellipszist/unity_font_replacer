@@ -410,11 +410,6 @@ def main():
     except FileNotFoundError as e:
         exit_with_error(str(e))
 
-    if args.parse:
-        parse_fonts(game_path)
-        input("\n엔터를 눌러 종료...")
-        return
-
     replace_ttf = not args.sdfonly
     replace_sdf = not args.ttfonly
 
@@ -422,14 +417,50 @@ def main():
         exit_with_error("--sdfonly와 --ttfonly를 동시에 사용할 수 없습니다.")
 
     replacements = None
+    mode = None
 
-    if args.mulmaru:
+    if args.parse:
+        mode = "parse"
+    elif args.mulmaru:
+        mode = "mulmaru"
+    elif args.nanumgothic:
+        mode = "nanumgothic"
+    elif args.list:
+        mode = "list"
+    else:
+        print("작업을 선택하세요:")
+        print("  1. 폰트 정보 추출 (JSON 파일 생성)")
+        print("  2. JSON 파일로 폰트 교체")
+        print("  3. Mulmaru(물마루체)로 일괄 교체")
+        print("  4. NanumGothic(나눔고딕)으로 일괄 교체")
+        print()
+        choice = input("선택 (1-4): ").strip()
+
+        if choice == "1":
+            mode = "parse"
+        elif choice == "2":
+            mode = "list"
+            args.list = input("JSON 파일 경로를 입력하세요: ").strip()
+            if not args.list:
+                exit_with_error("JSON 파일 경로가 필요합니다.")
+        elif choice == "3":
+            mode = "mulmaru"
+        elif choice == "4":
+            mode = "nanumgothic"
+        else:
+            exit_with_error("잘못된 선택입니다.")
+
+    if mode == "parse":
+        parse_fonts(game_path)
+        input("\n엔터를 눌러 종료...")
+        return
+    elif mode == "mulmaru":
         print("Mulmaru 폰트로 일괄 교체합니다...")
         replacements = create_batch_replacements(game_path, "Mulmaru", replace_ttf, replace_sdf)
-    elif args.nanumgothic:
+    elif mode == "nanumgothic":
         print("NanumGothic 폰트로 일괄 교체합니다...")
         replacements = create_batch_replacements(game_path, "NanumGothic", replace_ttf, replace_sdf)
-    elif args.list:
+    elif mode == "list":
         if not os.path.exists(args.list):
             exit_with_error(f"'{args.list}' 파일을 찾을 수 없습니다.")
 
@@ -440,11 +471,6 @@ def main():
         for key, info in replacements.items():
             if info.get("Replace_to"):
                 info["Replace_to"] = normalize_font_name(info["Replace_to"])
-    else:
-        print("오류: --mulmaru, --nanumgothic, 또는 --list 옵션 중 하나가 필요합니다.")
-        print("폰트 정보를 먼저 확인하려면 --parse 옵션을 사용하세요.")
-        input("\n엔터를 눌러 종료...")
-        sys.exit(1)
 
     unity_version = get_unity_version(game_path)
     assets_files = find_assets_files(game_path)
