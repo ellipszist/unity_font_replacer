@@ -53,9 +53,12 @@ def get_unity_version(data_path):
 
 def find_assets_files(data_path):
     assets_files = []
-    for fn in os.listdir(data_path):
-        if fn.endswith(".assets") or fn == "resources.assets":
-            assets_files.append(os.path.join(data_path, fn))
+    exclude_exts = {".dll", ".manifest", ".exe", ".txt", ".json", ".xml", ".log", ".ini", ".cfg", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".wav", ".mp3", ".ogg", ".mp4", ".avi", ".mov"}
+    for root, _, files in os.walk(data_path):
+        for fn in files:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in exclude_exts:
+                assets_files.append(os.path.join(root, fn))
     return assets_files
 
 
