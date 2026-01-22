@@ -122,6 +122,7 @@ def scan_fonts(game_path):
             env.typetree_generator = generator
 
         except Exception as e:
+            print(f"[scan_fonts] UnityPy.load failed: {assets_file}")
             print(e)
             continue
 
@@ -460,23 +461,33 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
 
         save_success = False
 
-        try:
-            sf = env.file.save(packer="none")
-            with open(f"{tmp_path}/{fn_without_path}", "wb") as f:
-                f.write(sf)
-            save_success = True
-        except (struct.error, Exception) as e:
-            print(f"  저장 방법 1 실패: {e}")
-
-        if not save_success:
+        def _save_env_file(packer=None):
             try:
-                print(f"  lz4 압축 모드로 재시도...")
-                sf = env.file.save(packer="lz4")
+                if packer is None:
+                    return env.file.save()
+                return env.file.save(packer=packer)
+            except TypeError:
+                # AssetsFile.save does not support packer; fall back to default
+                return env.file.save()
+
+        def _try_save(packer_label, log_label):
+            nonlocal save_success
+            try:
+                sf = _save_env_file(packer_label)
                 with open(f"{tmp_path}/{fn_without_path}", "wb") as f:
                     f.write(sf)
                 save_success = True
+                return True
             except (struct.error, Exception) as e:
-                print(f"  저장 방법 2 실패: {e}")
+                print(f"  저장 방법 {log_label} 실패: {e}")
+                return False
+
+        # Prefer preserving original bundle compression/layout when possible.
+        if not _try_save("original", "1"):
+            print("  lz4 압축 모드로 재시도...")
+            if not _try_save("lz4", "2"):
+                print("  비압축 모드로 재시도...")
+                _try_save("none", "3")
 
         if save_success:
             def _close_reader(obj):
