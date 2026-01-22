@@ -150,7 +150,7 @@ SDF 폰트 데이터는 `export_fonts.py`로 추출할 수 있습니다.
 - [UnityPy](https://github.com/K0lb3/UnityPy) by K0lb3
 - [Il2CppDumper](https://github.com/Perfare/Il2CppDumper) by Perfare
 - [나눔고딕](https://hangeul.naver.com/font) by NAVER | [License](https://help.naver.com/service/30016/contents/18088?osType=PC&lang=ko)
-- [물마루](https://github.com/mushsooni/mulmaru) by mushsooni
+- [물마루](https://github.com/mushsooni/mulmaru) by mushsooni | [License](https://github.com/mushsooni/mulmaru/blob/main/LICENSE_ko)
 
 ## 라이선스
 
