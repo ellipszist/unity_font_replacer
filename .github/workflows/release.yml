@@ -45,6 +45,20 @@ jobs:
             --collect-all archspec `
             export_fonts.py
 
+          pyinstaller --onefile --name unity_font_replacer_en `
+            --collect-all UnityPy `
+            --collect-all TypeTreeGeneratorAPI `
+            --collect-all fmod_toolkit `
+            --collect-all archspec `
+            unity_font_replacer_en.py
+
+          pyinstaller --onefile --name export_fonts_en `
+            --collect-all UnityPy `
+            --collect-all TypeTreeGeneratorAPI `
+            --collect-all fmod_toolkit `
+            --collect-all archspec `
+            export_fonts_en.py
+
       - name: Prepare release files
         run: |
           mkdir release
@@ -53,10 +67,17 @@ jobs:
           xcopy KR_ASSETS release\KR_ASSETS\ /E /I
           xcopy Il2CppDumper release\Il2CppDumper\ /E /I
           copy README.md release\
+          mkdir release_en
+          copy dist\unity_font_replacer_en.exe release_en\
+          copy dist\export_fonts_en.exe release_en\
+          xcopy KR_ASSETS release_en\KR_ASSETS\ /E /I
+          xcopy Il2CppDumper release_en\Il2CppDumper\ /E /I
+          copy README_EN.md release_en\
 
       - name: Create ZIP archive
         run: |
           Compress-Archive -Path release\* -DestinationPath Unity_Font_Replacer_v${{ inputs.version }}.zip
+          Compress-Archive -Path release_en\* -DestinationPath Unity_Font_Replacer_EN_v${{ inputs.version }}.zip
 
       - name: Create tag
         run: |
@@ -70,7 +91,9 @@ jobs:
         with:
           tag_name: v${{ inputs.version }}
           name: v${{ inputs.version }}
-          files: Unity_Font_Replacer_v${{ inputs.version }}.zip
+          files: |
+            Unity_Font_Replacer_v${{ inputs.version }}.zip
+            Unity_Font_Replacer_EN_v${{ inputs.version }}.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

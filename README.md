@@ -1,3 +1,5 @@
+[> for English verison of README.md](README_EN.md)
+
 # Unity Font Replacer
 
 Unity 게임의 폰트를 한글 폰트로 교체하는 도구입니다. TTF 폰트와 TextMeshPro SDF 폰트를 모두 지원합니다.
@@ -18,7 +20,9 @@ pip install UnityPy Pillow
 ```
 Unity_Font_Replacer/
 ├── unity_font_replacer.py   # 폰트 교체 도구
+├── unity_font_replacer_en.py # 폰트 교체 도구 (영문 UI)
 ├── export_fonts.py          # 폰트 추출 도구
+├── export_fonts_en.py       # 폰트 추출 도구 (영문 UI)
 ├── KR_ASSETS/               # 한글 폰트 에셋
 │   ├── Mulmaru.ttf
 │   ├── Mulmaru SDF.json
@@ -106,7 +110,7 @@ JSON 파일 형식:
 
 ### 폰트 추출 (export_fonts.py)
 
-자신이 개발한 Unity 게임에서 SDF 폰트를 추출하는 도구입니다.
+자신이 폰트제작용으로 만든 Unity 게임에서 TextMeshPro SDF 폰트를 추출하는 도구입니다.
 
 ```bash
 # 게임 루트 폴더에서 실행
@@ -118,7 +122,7 @@ cd "D:\MyGame\MyGame_Data"
 python C:\path\to\export_fonts.py
 ```
 
-현재 작업 디렉토리에 JSON 파일과 Atlas PNG 파일이 생성됩니다.
+현재 작업 디렉토리에 JSON 파일, Atlas PNG 파일, (있는 경우) Material JSON 파일이 생성됩니다.
 
 ## 지원하는 폰트
 
