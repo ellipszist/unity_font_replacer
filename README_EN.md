@@ -86,18 +86,20 @@ python unity_font_replacer.py --gamepath "D:\Games\Muck" --list Muck.json
 JSON format:
 ```json
 {
-    "sharedassets0.assets|TTF|123": {
-        "Name": "Arial",
+    "sharedassets0.assets|sharedassets0.assets|Arial|TTF|123": {
+        "File": "sharedassets0.assets",
+        "assets_name": "sharedassets0.assets",
         "Path_ID": 123,
         "Type": "TTF",
-        "File": "sharedassets0.assets",
+        "Name": "Arial",
         "Replace_to": "Mulmaru"
     },
-    "sharedassets0.assets|SDF|456": {
-        "Name": "Arial SDF",
+    "sharedassets0.assets|sharedassets0.assets|Arial SDF|SDF|456": {
+        "File": "sharedassets0.assets",
+        "assets_name": "sharedassets0.assets",
         "Path_ID": 456,
         "Type": "SDF",
-        "File": "sharedassets0.assets",
+        "Name": "Arial SDF",
         "Replace_to": ""
     }
 }
@@ -147,7 +149,7 @@ SDF font data can be exported with `export_fonts.py`.
 
 ## Notes
 
-- Files are saved via UnityPy in uncompressed mode (packer="none").
+- Files are saved preserving the original compression when possible, falling back to LZ4 then uncompressed.
 - Always back up game files before modifying.
 - Some games may fail integrity checks after modification.
 - Check Terms of Service before using in online games.

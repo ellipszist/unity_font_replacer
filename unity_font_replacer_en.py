@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import shutil
-import struct
 import argparse
 from PIL import Image
 import UnityPy
@@ -95,10 +94,35 @@ def get_compile_method(datapath):
     else:
         return "Il2cpp"
 
+def _create_generator(unity_version, game_path, data_path, compile_method):
+    generator = TypeTreeGenerator(unity_version)
+    if compile_method == "Mono":
+        managed_dir = os.path.join(data_path, "Managed")
+        for fn in os.listdir(managed_dir):
+            if not fn.endswith(".dll"):
+                continue
+            try:
+                with open(os.path.join(managed_dir, fn), "rb") as f:
+                    generator.load_dll(f.read())
+            except Exception:
+                pass
+    else:
+        il2cpp_path = os.path.join(game_path, "GameAssembly.dll")
+        with open(il2cpp_path, "rb") as f:
+            il2cpp = f.read()
+        metadata_path = os.path.join(data_path, "il2cpp_data", "Metadata", "global-metadata.dat")
+        with open(metadata_path, "rb") as f:
+            metadata = f.read()
+        generator.load_il2cpp(il2cpp, metadata)
+    return generator
+
+
 def scan_fonts(game_path):
+    data_path = get_data_path(game_path)
     unity_version = get_unity_version(game_path)
     assets_files = find_assets_files(game_path)
-    compile_method = get_compile_method(get_data_path(game_path))
+    compile_method = get_compile_method(data_path)
+    generator = _create_generator(unity_version, game_path, data_path, compile_method)
 
     fonts = {
         "ttf": [],
@@ -108,17 +132,6 @@ def scan_fonts(game_path):
     for assets_file in assets_files:
         try:
             env = UnityPy.load(assets_file)
-            generator = TypeTreeGenerator(unity_version)
-            if compile_method == "Mono":
-                generator.load_local_dll_folder(os.path.join(get_data_path(game_path), "Managed"))
-            else:
-                il2cpp_path = os.path.join(game_path, "GameAssembly.dll")
-                with open(il2cpp_path, "rb") as f:
-                    il2cpp = f.read()
-                metadata_path = os.path.join(get_data_path(game_path), "il2cpp_data", "Metadata", "global-metadata.dat")
-                with open(metadata_path, "rb") as f:
-                    metadata = f.read()
-                generator.load_il2cpp(il2cpp, metadata)
             env.typetree_generator = generator
 
         except Exception as e:
@@ -137,6 +150,7 @@ def scan_fonts(game_path):
                         "path_id": obj.path_id
                     })
                 elif obj.type.name == "MonoBehaviour":
+                    parse_dict = None
                     is_font = False
                     try:
                         parse_obj = obj.parse_as_object()
@@ -153,7 +167,8 @@ def scan_fonts(game_path):
                             pass
                     if is_font:
                         try:
-                            parse_dict = obj.parse_as_dict()
+                            if parse_dict is None:
+                                parse_dict = obj.parse_as_dict()
                             atlas_textures = parse_dict.get("m_AtlasTextures", [])
                             glyph_count = len(parse_dict.get("m_GlyphTable", []))
                             if atlas_textures and atlas_textures[0].get("m_FileID", 0) != 0:
@@ -185,22 +200,22 @@ def parse_fonts(game_path):
     for font in fonts["ttf"]:
         key = f"{font['file']}|{font['assets_name']}|{font['name']}|TTF|{font['path_id']}"
         result[key] = {
-            "Name": font["name"],
+            "File": font["file"],
             "assets_name": font["assets_name"],
             "Path_ID": font["path_id"],
             "Type": "TTF",
-            "File": font["file"],
+            "Name": font["name"],
             "Replace_to": ""
         }
 
     for font in fonts["sdf"]:
         key = f"{font['file']}|{font['assets_name']}|{font['name']}|SDF|{font['path_id']}"
         result[key] = {
-            "Name": font["name"],
+            "File": font["file"],
             "assets_name": font["assets_name"],
             "Path_ID": font["path_id"],
             "Type": "SDF",
-            "File": font["file"],
+            "Name": font["name"],
             "Replace_to": ""
         }
 
@@ -221,7 +236,7 @@ def load_font_assets(font_name):
     ttf_data = None
     if os.path.exists(ttf_path):
         with open(ttf_path, "rb") as f:
-            ttf_data = list(f.read())
+            ttf_data = f.read()
 
     sdf_json_path = os.path.join(kr_assets, f"{normalized} SDF.json")
     sdf_data = None
@@ -250,11 +265,10 @@ def load_font_assets(font_name):
     }
 
 
-def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, replace_ttf=True, replace_sdf=True):
+def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, replace_ttf=True, replace_sdf=True, generator=None):
     fn_without_path = os.path.basename(assets_file)
     data_path = get_data_path(game_path)
     tmp_path = os.path.join(data_path, "temp")
-    compile_method = get_compile_method(data_path)
 
     if not os.path.exists(tmp_path):
         os.makedirs(tmp_path)
@@ -263,17 +277,9 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
         os.makedirs(tmp_path)
 
     env = UnityPy.load(assets_file)
-    generator = TypeTreeGenerator(unity_version)
-    if compile_method == "Mono":
-        generator.load_local_dll_folder(os.path.join(data_path, "Managed"))
-    else:
-        il2cpp_path = os.path.join(game_path, "GameAssembly.dll")
-        with open(il2cpp_path, "rb") as f:
-            il2cpp = f.read()
-        metadata_path = os.path.join(data_path, "il2cpp_data", "Metadata", "global-metadata.dat")
-        with open(metadata_path, "rb") as f:
-            metadata = f.read()
-        generator.load_il2cpp(il2cpp, metadata)
+    if generator is None:
+        compile_method = get_compile_method(data_path)
+        generator = _create_generator(unity_version, game_path, data_path, compile_method)
     env.typetree_generator = generator
 
     texture_replacements = {}
@@ -283,10 +289,8 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
     for obj in env.objects:
         assets_name = obj.assets_file.name
         if obj.type.name == "Font" and replace_ttf:
-            font = obj.parse_as_object()
-            font_name = font.m_Name
             font_pathid = obj.path_id
-            
+
             replacement_font = None
             for key, info in replacements.items():
                 if info.get("Type") == "TTF" and info.get("File") == fn_without_path and info.get("Path_ID") == font_pathid and info.get("assets_name") == assets_name:
@@ -297,7 +301,8 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
             if replacement_font:
                 assets = load_font_assets(replacement_font)
                 if assets["ttf_data"]:
-                    print(f"Replacing TTF font: {assets_name} | {font_name} | (PathID: {font_pathid} -> {replacement_font})")
+                    font = obj.parse_as_object()
+                    print(f"Replacing TTF font: {assets_name} | {font.m_Name} | (PathID: {font_pathid} -> {replacement_font})")
                     font.m_FontData = assets["ttf_data"]
                     font.save()
                     modified = True
@@ -331,7 +336,6 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                     if assets["sdf_data"] and assets["sdf_atlas"]:
                         print(f"Replacing SDF font: {assets_name} | {objname} | (PathID: {pathid}) -> {replacement_font}")
 
-                        parse_dict = obj.parse_as_dict()
                         replace_data = assets["sdf_data"]
 
                         m_GameObject_FileID = parse_dict["m_GameObject"]["m_FileID"]
@@ -351,7 +355,7 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                         m_AtlasTextures_FileID = parse_dict["m_AtlasTextures"][0]["m_FileID"]
                         m_AtlasTextures_PathID = parse_dict["m_AtlasTextures"][0]["m_PathID"]
 
-                        if "m_GlyphTable" in replace_data and type(replace_data["m_GlyphTable"]) == list:
+                        if "m_GlyphTable" in replace_data and isinstance(replace_data["m_GlyphTable"], list):
                             for glyph in replace_data["m_GlyphTable"]:
                                 glyph["m_ClassDefinitionType"] = 0
 
@@ -470,21 +474,16 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                 # AssetsFile.save does not support packer; fall back to default
                 return env.file.save()
 
-        def _make_packer_with_flags(compression_flag):
+        def _make_packer(compression_flag):
+            """block_info_flag gets pure compression bits only, data_flag keeps structure bits + compression"""
             dataflags = getattr(env.file, "dataflags", None)
             if dataflags is None:
                 return None
             try:
-                data_flag = int(dataflags)
-                block_info_flag = int(getattr(env.file, "_block_info_flags", 0))
+                data_flag = (int(dataflags) & ~0x3F) | compression_flag
             except Exception:
                 return None
-            # Preserve structure flags; only change compression bits.
-            data_flag = (data_flag & ~0x3F) | int(compression_flag)
-            block_info_flag = (block_info_flag & ~0x3F) | int(compression_flag)
-            # Ensure only compression bits are set in block_info_flag (UnityFS expects 0x3F mask).
-            block_info_flag &= 0x3F
-            return (data_flag, block_info_flag)
+            return (data_flag, compression_flag)
 
         def _try_save(packer_label, log_label):
             nonlocal save_success
@@ -494,17 +493,18 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                     f.write(sf)
                 save_success = True
                 return True
-            except (struct.error, Exception) as e:
+            except Exception as e:
                 print(f"  Save method {log_label} failed: {e}")
                 return False
 
-        # Prefer preserving original bundle compression/layout when possible.
-        original_packer = _make_packer_with_flags(int(getattr(env.file, "_block_info_flags", 0)) & 0x3F)
+        # Try original compression -> LZ4 -> uncompressed fallback
+        original_compression = int(getattr(env.file, "_block_info_flags", 0)) & 0x3F
+        original_packer = _make_packer(original_compression)
         if not _try_save(original_packer or "original", "1"):
-            lz4_packer = _make_packer_with_flags(2)
+            lz4_packer = _make_packer(2)
             print("  Retrying with lz4 compression...")
             if not _try_save(lz4_packer or "lz4", "2"):
-                none_packer = _make_packer_with_flags(0)
+                none_packer = _make_packer(0)
                 print("  Retrying with no compression...")
                 _try_save(none_packer or "none", "3")
 
@@ -674,13 +674,13 @@ Examples:
         else:
             exit_with_error("Invalid selection.")
 
-    if compile_method == "Il2cpp" and os.path.exists(os.path.join(data_path, "Managed")) == False:
+    if compile_method == "Il2cpp" and not os.path.exists(os.path.join(data_path, "Managed")):
         binary_path = os.path.join(game_path, "GameAssembly.dll")
         metadata_path = os.path.join(data_path, "il2cpp_data", "Metadata", "global-metadata.dat")
         if not os.path.exists(binary_path) or not os.path.exists(metadata_path):
             exit_with_error("For Il2cpp games, the 'Managed' folder or 'GameAssembly.dll' and 'global-metadata.dat' files are required.\nPlease check that this is a valid Unity game folder.")
         dumper_path = os.path.join(get_script_dir(), "Il2CppDumper", "Il2CppDumper.exe")
-        target_path = os.path.join(get_data_path(game_path), "Managed_")
+        target_path = os.path.join(data_path, "Managed_")
         os.makedirs(target_path, exist_ok=True)
         command = [os.path.abspath(dumper_path), os.path.abspath(binary_path), os.path.abspath(metadata_path), os.path.abspath(target_path)]
         print("Creating Managed folder for Il2cpp game...")
@@ -699,16 +699,15 @@ Examples:
 
             if process.returncode == 0:
                 print(process.stdout)
-                shutil.move(os.path.join(get_data_path(game_path), "Managed_", "DummyDll"), os.path.join(get_data_path(game_path), "Managed"))
-                shutil.rmtree(os.path.join(get_data_path(game_path), "Managed_"))
+                shutil.move(os.path.join(data_path, "Managed_", "DummyDll"), os.path.join(data_path, "Managed"))
+                shutil.rmtree(os.path.join(data_path, "Managed_"))
                 print("Dummy DLL generated successfully!")
             else:
                 print(process.stderr)
                 exit_with_error("Failed to generate Il2cpp dummy DLL")
 
         except Exception as e:
-            print(f"Exception while running: {e}")
-
+            exit_with_error(f"Exception while running Il2CppDumper: {e}")
 
     if mode == "parse":
         parse_fonts(game_path)
@@ -736,6 +735,7 @@ Examples:
 
     unity_version = get_unity_version(game_path)
     assets_files = find_assets_files(game_path)
+    generator = _create_generator(unity_version, game_path, data_path, compile_method)
 
     files_to_process = set()
     for key, info in replacements.items():
@@ -747,7 +747,7 @@ Examples:
         fn = os.path.basename(assets_file)
         if fn in files_to_process:
             print(f"\nProcessing: {fn}")
-            if replace_fonts_in_file(unity_version, game_path, assets_file, replacements, replace_ttf, replace_sdf):
+            if replace_fonts_in_file(unity_version, game_path, assets_file, replacements, replace_ttf, replace_sdf, generator=generator):
                 modified_count += 1
 
     print(f"\nDone! Modified {modified_count} file(s).")

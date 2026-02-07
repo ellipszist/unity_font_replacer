@@ -101,10 +101,8 @@ def export_fonts(game_path, data_path, output_dir=None):
                         parse_dict = obj.parse_as_dict()
                         m_AtlasTextures_PathID = parse_dict["m_AtlasTextures"][0]["m_PathID"]
                         if parse_dict.get("m_Material") is not None:
-                            m_Material_FileID = parse_dict["m_Material"]["m_FileID"]
                             m_Material_PathID = parse_dict["m_Material"]["m_PathID"]
                         else:
-                            m_Material_FileID = parse_dict["material"]["m_FileID"]
                             m_Material_PathID = parse_dict["material"]["m_PathID"]
                         parse_dict["m_CreationSettings"]["characterSequence"] = ""
                         print(f"SDF 폰트 발견: {objname} (PathID: {pathid})")
@@ -140,8 +138,9 @@ def export_fonts(game_path, data_path, output_dir=None):
                     if obj.type.name == "Material":
                         mat = obj.read_typetree()
                         mat_name = obj.peek_name()
-                        with open(f"{mat_name}.json", "w", encoding="utf-8") as f:
-                            f.write(json.dumps(mat, ensure_ascii=False, indent=4))
+                        mat_path = os.path.join(output_dir, f"{mat_name}.json")
+                        with open(mat_path, "w", encoding="utf-8") as f:
+                            json.dump(mat, f, indent=4, ensure_ascii=False)
             except Exception as e:
                 print(f"경고: 추출 중 오류 (PathID: {obj.path_id}): {e}")
 
