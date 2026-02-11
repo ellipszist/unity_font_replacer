@@ -3,10 +3,35 @@ import sys
 import json
 import shutil
 import argparse
+import io
+import traceback as tb_module
 from PIL import Image
 import UnityPy
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 import subprocess
+
+
+class TeeWriter:
+    """stdout/stderr를 콘솔과 파일에 동시에 출력하는 클래스"""
+    def __init__(self, file, original_stream):
+        self.file = file
+        self.original = original_stream
+
+    def write(self, data):
+        self.original.write(data)
+        self.file.write(data)
+        self.file.flush()
+
+    def flush(self):
+        self.original.flush()
+        self.file.flush()
+
+    def fileno(self):
+        return self.original.fileno()
+
+    @property
+    def encoding(self):
+        return self.original.encoding
 
 def find_ggm_file(data_path):
     candidates = ["globalgamemanagers", "globalgamemanagers.assets", "data.unity3d"]
@@ -75,6 +100,201 @@ def normalize_font_name(name):
     elif name.endswith(" SDF"):
         name = name[:-len(" SDF")]
     return name
+
+
+def ensure_int(data, keys):
+    """dict 내 지정된 키의 값을 int로 변환"""
+    if not data:
+        return
+    for key in keys:
+        if key in data and data[key] is not None:
+            data[key] = int(data[key])
+
+
+def detect_tmp_version(data):
+    """SDF 폰트 데이터가 신버전(new) TMP인지 구버전(old) TMP인지 판별.
+
+    Returns:
+        "new" - 신버전 TMP (m_FaceInfo, m_GlyphTable, m_CharacterTable, m_AtlasTextures)
+        "old" - 구버전 TMP (m_fontInfo, m_glyphInfoList, atlas)
+    """
+    has_new_glyphs = len(data.get("m_GlyphTable", [])) > 0
+    has_old_glyphs = len(data.get("m_glyphInfoList", [])) > 0
+
+    # 실데이터가 있는 쪽 우선 (양쪽 키가 모두 있지만 한쪽만 채워진 경우 대응)
+    if has_new_glyphs:
+        return "new"
+    if has_old_glyphs:
+        return "old"
+
+    # 글리프가 둘 다 없으면 키 존재로 판별
+    if "m_FaceInfo" in data:
+        return "new"
+    if "m_fontInfo" in data:
+        return "old"
+
+    return "new"  # 기본값
+
+
+def convert_face_info_new_to_old(face_info, atlas_padding=0, atlas_width=0, atlas_height=0):
+    """신버전 m_FaceInfo → 구버전 m_fontInfo 변환"""
+    return {
+        "Name": face_info.get("m_FamilyName", ""),
+        "PointSize": face_info.get("m_PointSize", 0),
+        "Scale": face_info.get("m_Scale", 1.0),
+        "CharacterCount": 0,  # 호출 측에서 설정
+        "LineHeight": face_info.get("m_LineHeight", 0),
+        "Baseline": face_info.get("m_Baseline", 0),
+        "Ascender": face_info.get("m_AscentLine", 0),
+        "CapHeight": face_info.get("m_CapLine", 0),
+        "Descender": face_info.get("m_DescentLine", 0),
+        "CenterLine": face_info.get("m_MeanLine", 0),
+        "SuperscriptOffset": face_info.get("m_SuperscriptOffset", 0),
+        "SubscriptOffset": face_info.get("m_SubscriptOffset", 0),
+        "SubSize": face_info.get("m_SubscriptSize", 0.5),
+        "Underline": face_info.get("m_UnderlineOffset", 0),
+        "UnderlineThickness": face_info.get("m_UnderlineThickness", 0),
+        "strikethrough": face_info.get("m_StrikethroughOffset", 0),
+        "strikethroughThickness": face_info.get("m_StrikethroughThickness", 0),
+        "TabWidth": face_info.get("m_TabWidth", 0),
+        "Padding": atlas_padding,
+        "AtlasWidth": atlas_width,
+        "AtlasHeight": atlas_height,
+    }
+
+
+def convert_face_info_old_to_new(font_info):
+    """구버전 m_fontInfo → 신버전 m_FaceInfo 변환"""
+    return {
+        "m_FaceIndex": 0,
+        "m_FamilyName": font_info.get("Name", ""),
+        "m_StyleName": "regular",
+        "m_PointSize": font_info.get("PointSize", 0),
+        "m_Scale": font_info.get("Scale", 1.0),
+        "m_UnitsPerEM": 0,
+        "m_LineHeight": font_info.get("LineHeight", 0),
+        "m_AscentLine": font_info.get("Ascender", 0),
+        "m_CapLine": font_info.get("CapHeight", 0),
+        "m_MeanLine": font_info.get("CenterLine", 0),
+        "m_Baseline": font_info.get("Baseline", 0),
+        "m_DescentLine": font_info.get("Descender", 0),
+        "m_SuperscriptOffset": font_info.get("SuperscriptOffset", 0),
+        "m_SuperscriptSize": 0.5,
+        "m_SubscriptOffset": font_info.get("SubscriptOffset", 0),
+        "m_SubscriptSize": font_info.get("SubSize", 0.5),
+        "m_UnderlineOffset": font_info.get("Underline", 0),
+        "m_UnderlineThickness": font_info.get("UnderlineThickness", 0),
+        "m_StrikethroughOffset": font_info.get("strikethrough", 0),
+        "m_StrikethroughThickness": font_info.get("strikethroughThickness", 0),
+        "m_TabWidth": font_info.get("TabWidth", 0),
+    }
+
+
+def convert_glyphs_new_to_old(glyph_table, char_table):
+    """신버전 m_GlyphTable + m_CharacterTable → 구버전 m_glyphInfoList 변환"""
+    glyph_by_index = {}
+    for g in glyph_table:
+        glyph_by_index[g["m_Index"]] = g
+    result = []
+    for char in char_table:
+        unicode_val = char.get("m_Unicode", 0)
+        glyph_idx = char.get("m_GlyphIndex", 0)
+        g = glyph_by_index.get(glyph_idx, {})
+        metrics = g.get("m_Metrics", {})
+        rect = g.get("m_GlyphRect", {})
+        result.append({
+            "id": int(unicode_val),
+            "x": float(rect.get("m_X", 0)),
+            "y": float(rect.get("m_Y", 0)),
+            "width": float(metrics.get("m_Width", 0)),
+            "height": float(metrics.get("m_Height", 0)),
+            "xOffset": float(metrics.get("m_HorizontalBearingX", 0)),
+            "yOffset": float(metrics.get("m_HorizontalBearingY", 0)),
+            "xAdvance": float(metrics.get("m_HorizontalAdvance", 0)),
+            "scale": float(g.get("m_Scale", 1.0))
+        })
+    return result
+
+
+def convert_glyphs_old_to_new(glyph_info_list):
+    """구버전 m_glyphInfoList → 신버전 (m_GlyphTable, m_CharacterTable) 변환"""
+    glyph_table = []
+    char_table = []
+    # 구버전은 glyph index가 별도로 없으므로 순번을 index로 사용
+    glyph_index_map = {}  # unicode(id) → glyph_index
+    glyph_idx = 0
+    for glyph in glyph_info_list:
+        uid = glyph.get("id", 0)
+        # 같은 glyph 데이터라도 unicode별로 별도 생성
+        glyph_table.append({
+            "m_Index": glyph_idx,
+            "m_Metrics": {
+                "m_Width": glyph.get("width", 0),
+                "m_Height": glyph.get("height", 0),
+                "m_HorizontalBearingX": glyph.get("xOffset", 0),
+                "m_HorizontalBearingY": glyph.get("yOffset", 0),
+                "m_HorizontalAdvance": glyph.get("xAdvance", 0),
+            },
+            "m_GlyphRect": {
+                "m_X": int(glyph.get("x", 0)),
+                "m_Y": int(glyph.get("y", 0)),
+                "m_Width": int(glyph.get("width", 0)),
+                "m_Height": int(glyph.get("height", 0)),
+            },
+            "m_Scale": glyph.get("scale", 1.0),
+            "m_AtlasIndex": 0,
+            "m_ClassDefinitionType": 0,
+        })
+        char_table.append({
+            "m_ElementType": 1,
+            "m_Unicode": int(uid),
+            "m_GlyphIndex": glyph_idx,
+            "m_Scale": 1.0,
+        })
+        glyph_idx += 1
+    return glyph_table, char_table
+
+
+def normalize_sdf_data(data):
+    """SDF 교체 데이터를 신버전 TMP 형식으로 정규화.
+    구버전이든 신버전이든 항상 신버전 형식으로 통일하여 반환.
+    원본을 수정하지 않고 새 dict를 반환."""
+    import copy
+    result = copy.deepcopy(data)
+    version = detect_tmp_version(result)
+
+    if version == "old":
+        font_info = result.get("m_fontInfo", {})
+        glyph_info_list = result.get("m_glyphInfoList", [])
+        atlas_padding = font_info.get("Padding", 0)
+        atlas_width = font_info.get("AtlasWidth", 0)
+        atlas_height = font_info.get("AtlasHeight", 0)
+
+        # face info 변환
+        result["m_FaceInfo"] = convert_face_info_old_to_new(font_info)
+
+        # glyph 변환
+        glyph_table, char_table = convert_glyphs_old_to_new(glyph_info_list)
+        result["m_GlyphTable"] = glyph_table
+        result["m_CharacterTable"] = char_table
+
+        # atlas 관련 필드 설정
+        if "m_AtlasTextures" not in result or not result["m_AtlasTextures"]:
+            atlas_ref = result.get("atlas", {"m_FileID": 0, "m_PathID": 0})
+            result["m_AtlasTextures"] = [atlas_ref]
+        result.setdefault("m_AtlasWidth", int(atlas_width))
+        result.setdefault("m_AtlasHeight", int(atlas_height))
+        result.setdefault("m_AtlasPadding", int(atlas_padding))
+        result.setdefault("m_AtlasRenderMode", 4118)
+        result.setdefault("m_UsedGlyphRects", [])
+        result.setdefault("m_FreeGlyphRects", [])
+
+        # FontWeightTable
+        if "m_FontWeightTable" not in result:
+            font_weights = result.get("fontWeights", [])
+            result["m_FontWeightTable"] = font_weights if font_weights else []
+
+    return result
 
 
 def find_assets_files(game_path):
@@ -161,7 +381,10 @@ def scan_fonts(game_path):
                     if not is_font:
                         try:
                             parse_dict = obj.parse_as_dict()
-                            if "m_AtlasTextures" in parse_dict and "m_FaceInfo" in parse_dict:
+                            # 신버전 TMP: m_FaceInfo + m_AtlasTextures
+                            # 구버전 TMP: m_fontInfo + atlas
+                            if ("m_AtlasTextures" in parse_dict and "m_FaceInfo" in parse_dict) or \
+                               ("atlas" in parse_dict and "m_fontInfo" in parse_dict):
                                 is_font = True
                         except:
                             pass
@@ -169,10 +392,21 @@ def scan_fonts(game_path):
                         try:
                             if parse_dict is None:
                                 parse_dict = obj.parse_as_dict()
+                            # 신버전/구버전 필드 호환
                             atlas_textures = parse_dict.get("m_AtlasTextures", [])
                             glyph_count = len(parse_dict.get("m_GlyphTable", []))
-                            if atlas_textures and atlas_textures[0].get("m_FileID", 0) != 0:
-                                continue
+                            # 구버전 TMP인 경우
+                            if not atlas_textures and "atlas" in parse_dict:
+                                atlas_textures = []  # 구버전은 atlas가 단일 참조
+                            if glyph_count == 0:
+                                glyph_count = len(parse_dict.get("m_glyphInfoList", []))
+                            if atlas_textures:
+                                first_atlas = atlas_textures[0]
+                                file_id = first_atlas.get("m_FileID", 0)
+                                path_id = first_atlas.get("m_PathID", 0)
+                                # FileID != 0이고 PathID도 없으면 외부 참조 stub
+                                if file_id != 0 and path_id == 0:
+                                    continue
                             if glyph_count == 0:
                                 continue
                         except:
@@ -193,7 +427,7 @@ def scan_fonts(game_path):
 def parse_fonts(game_path):
     fonts = scan_fonts(game_path)
     game_name = os.path.basename(game_path)
-    output_file = f"{game_name}.json"
+    output_file = os.path.join(get_script_dir(), f"{game_name}.json")
 
     result = {}
 
@@ -312,12 +546,20 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                 parse_dict = obj.parse_as_dict()
             except:
                 continue
-            if "m_FaceInfo" in parse_dict and "m_AtlasTextures" in parse_dict:
-                # 폰트 참조만 있는 경우 건너뛰기 (실제 폰트 데이터가 아님)
-                atlas_textures = parse_dict.get("m_AtlasTextures", [])
-                glyph_count = len(parse_dict.get("m_GlyphTable", []))
-                if atlas_textures and atlas_textures[0].get("m_FileID", 0) != 0:
-                    continue
+            is_new_tmp = "m_FaceInfo" in parse_dict and "m_AtlasTextures" in parse_dict
+            is_old_tmp = "m_fontInfo" in parse_dict and "atlas" in parse_dict
+            if is_new_tmp or is_old_tmp:
+                # 외부 참조 stub만 건너뛰기
+                if is_new_tmp:
+                    atlas_textures = parse_dict.get("m_AtlasTextures", [])
+                    glyph_count = len(parse_dict.get("m_GlyphTable", []))
+                else:
+                    atlas_textures = []
+                    glyph_count = len(parse_dict.get("m_glyphInfoList", []))
+                if atlas_textures:
+                    first_atlas = atlas_textures[0]
+                    if first_atlas.get("m_FileID", 0) != 0 and first_atlas.get("m_PathID", 0) == 0:
+                        continue
                 if glyph_count == 0:
                     continue
 
@@ -336,8 +578,10 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                     if assets["sdf_data"] and assets["sdf_atlas"]:
                         print(f"SDF 폰트 교체: {assets_name} | {objname} | (PathID: {pathid}) -> {replacement_font}")
 
-                        replace_data = assets["sdf_data"]
+                        # 교체 데이터를 신버전 형식으로 정규화 (구버전/신버전 JSON 모두 대응)
+                        replace_data = normalize_sdf_data(assets["sdf_data"])
 
+                        # 원본 참조 보존
                         m_GameObject_FileID = parse_dict["m_GameObject"]["m_FileID"]
                         m_GameObject_PathID = parse_dict["m_GameObject"]["m_PathID"]
                         m_Script_FileID = parse_dict["m_Script"]["m_FileID"]
@@ -350,55 +594,82 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                             m_Material_FileID = parse_dict["material"]["m_FileID"]
                             m_Material_PathID = parse_dict["material"]["m_PathID"]
 
-                        m_SourceFontFile_FileID = parse_dict["m_SourceFontFile"]["m_FileID"]
-                        m_SourceFontFile_PathID = parse_dict["m_SourceFontFile"]["m_PathID"]
-                        m_AtlasTextures_FileID = parse_dict["m_AtlasTextures"][0]["m_FileID"]
-                        m_AtlasTextures_PathID = parse_dict["m_AtlasTextures"][0]["m_PathID"]
+                        if is_old_tmp:
+                            # 대상이 구버전 TMP → 신버전 데이터를 구버전으로 변환하여 적용
+                            atlas_ref = parse_dict["atlas"]
+                            m_AtlasTextures_FileID = atlas_ref["m_FileID"]
+                            m_AtlasTextures_PathID = atlas_ref["m_PathID"]
 
-                        if "m_GlyphTable" in replace_data and isinstance(replace_data["m_GlyphTable"], list):
-                            for glyph in replace_data["m_GlyphTable"]:
-                                glyph["m_ClassDefinitionType"] = 0
+                            old_font_info = convert_face_info_new_to_old(
+                                replace_data["m_FaceInfo"],
+                                replace_data.get("m_AtlasPadding", 0),
+                                replace_data.get("m_AtlasWidth", 0),
+                                replace_data.get("m_AtlasHeight", 0)
+                            )
+                            old_glyph_list = convert_glyphs_new_to_old(
+                                replace_data.get("m_GlyphTable", []),
+                                replace_data.get("m_CharacterTable", [])
+                            )
+                            old_font_info["CharacterCount"] = len(old_glyph_list)
+                            parse_dict["m_fontInfo"] = old_font_info
+                            parse_dict["m_glyphInfoList"] = old_glyph_list
 
-                        parse_dict["m_FaceInfo"] = replace_data["m_FaceInfo"]
-                        parse_dict["m_GlyphTable"] = replace_data["m_GlyphTable"]
-                        parse_dict["m_CharacterTable"] = replace_data["m_CharacterTable"]
-                        parse_dict["m_AtlasTextures"] = replace_data["m_AtlasTextures"]
-                        parse_dict["m_AtlasWidth"] = replace_data["m_AtlasWidth"]
-                        parse_dict["m_AtlasHeight"] = replace_data["m_AtlasHeight"]
-                        parse_dict["m_AtlasPadding"] = replace_data["m_AtlasPadding"]
-                        parse_dict["m_AtlasRenderMode"] = replace_data["m_AtlasRenderMode"]
-                        parse_dict["m_UsedGlyphRects"] = replace_data["m_UsedGlyphRects"]
-                        parse_dict["m_FreeGlyphRects"] = replace_data["m_FreeGlyphRects"]
-                        parse_dict["m_FontWeightTable"] = replace_data["m_FontWeightTable"]
+                            if "m_CreationSettings" in parse_dict:
+                                cs = parse_dict["m_CreationSettings"]
+                                cs["atlasWidth"] = int(replace_data.get("m_AtlasWidth", cs.get("atlasWidth", 0)))
+                                cs["atlasHeight"] = int(replace_data.get("m_AtlasHeight", cs.get("atlasHeight", 0)))
+                                cs["pointSize"] = int(old_font_info["PointSize"])
+                                cs["padding"] = int(old_font_info["Padding"])
+                                cs["characterSequence"] = ""
 
-                        def ensure_int(data, keys):
-                            if not data:
-                                return
-                            for key in keys:
-                                if key in data and data[key] is not None:
-                                    data[key] = int(data[key])
+                        else:
+                            # 대상이 신버전 TMP → 정규화된 데이터를 그대로 적용
+                            m_SourceFontFile_FileID = parse_dict["m_SourceFontFile"]["m_FileID"]
+                            m_SourceFontFile_PathID = parse_dict["m_SourceFontFile"]["m_PathID"]
+                            m_AtlasTextures_FileID = parse_dict["m_AtlasTextures"][0]["m_FileID"]
+                            m_AtlasTextures_PathID = parse_dict["m_AtlasTextures"][0]["m_PathID"]
 
-                        if "m_FaceInfo" in parse_dict:
+                            if "m_GlyphTable" in replace_data and isinstance(replace_data["m_GlyphTable"], list):
+                                for glyph in replace_data["m_GlyphTable"]:
+                                    glyph["m_ClassDefinitionType"] = 0
+
+                            parse_dict["m_FaceInfo"] = replace_data["m_FaceInfo"]
+                            parse_dict["m_GlyphTable"] = replace_data["m_GlyphTable"]
+                            parse_dict["m_CharacterTable"] = replace_data["m_CharacterTable"]
+                            parse_dict["m_AtlasTextures"] = replace_data["m_AtlasTextures"]
+                            parse_dict["m_AtlasWidth"] = replace_data["m_AtlasWidth"]
+                            parse_dict["m_AtlasHeight"] = replace_data["m_AtlasHeight"]
+                            parse_dict["m_AtlasPadding"] = replace_data["m_AtlasPadding"]
+                            parse_dict["m_AtlasRenderMode"] = replace_data.get("m_AtlasRenderMode", 4118)
+                            parse_dict["m_UsedGlyphRects"] = replace_data.get("m_UsedGlyphRects", [])
+                            parse_dict["m_FreeGlyphRects"] = replace_data.get("m_FreeGlyphRects", [])
+                            parse_dict["m_FontWeightTable"] = replace_data.get("m_FontWeightTable", [])
+
                             ensure_int(parse_dict["m_FaceInfo"], ["m_PointSize", "m_AtlasWidth", "m_AtlasHeight"])
 
-                        if "m_CreationSettings" in parse_dict:
-                            ensure_int(parse_dict["m_CreationSettings"], ["pointSize", "atlasWidth", "atlasHeight", "padding"])
+                            if "m_CreationSettings" in parse_dict:
+                                ensure_int(parse_dict["m_CreationSettings"], ["pointSize", "atlasWidth", "atlasHeight", "padding"])
 
-                        if "m_GlyphTable" in parse_dict:
                             for glyph in parse_dict["m_GlyphTable"]:
                                 ensure_int(glyph, ["m_Index", "m_AtlasIndex", "m_ClassDefinitionType"])
                                 if "m_GlyphRect" in glyph:
                                     ensure_int(glyph["m_GlyphRect"], ["m_X", "m_Y", "m_Width", "m_Height"])
 
-                        if "m_CharacterTable" in parse_dict:
                             for char in parse_dict["m_CharacterTable"]:
                                 ensure_int(char, ["m_Unicode", "m_GlyphIndex", "m_ElementType"])
 
-                        for rect_list_name in ["m_UsedGlyphRects", "m_FreeGlyphRects"]:
-                            if rect_list_name in parse_dict:
-                                for rect in parse_dict[rect_list_name]:
-                                    ensure_int(rect, ["m_X", "m_Y", "m_Width", "m_Height"])
+                            for rect_list_name in ["m_UsedGlyphRects", "m_FreeGlyphRects"]:
+                                if rect_list_name in parse_dict:
+                                    for rect in parse_dict[rect_list_name]:
+                                        ensure_int(rect, ["m_X", "m_Y", "m_Width", "m_Height"])
 
+                            parse_dict["m_SourceFontFile"]["m_FileID"] = m_SourceFontFile_FileID
+                            parse_dict["m_SourceFontFile"]["m_PathID"] = m_SourceFontFile_PathID
+                            parse_dict["m_AtlasTextures"][0]["m_FileID"] = m_AtlasTextures_FileID
+                            parse_dict["m_AtlasTextures"][0]["m_PathID"] = m_AtlasTextures_PathID
+                            parse_dict["m_CreationSettings"]["characterSequence"] = ""
+
+                        # 공통: 참조 복원
                         parse_dict["m_GameObject"]["m_FileID"] = m_GameObject_FileID
                         parse_dict["m_GameObject"]["m_PathID"] = m_GameObject_PathID
                         parse_dict["m_Script"]["m_FileID"] = m_Script_FileID
@@ -411,12 +682,10 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                             parse_dict["material"]["m_FileID"] = m_Material_FileID
                             parse_dict["material"]["m_PathID"] = m_Material_PathID
 
-                        parse_dict["m_SourceFontFile"]["m_FileID"] = m_SourceFontFile_FileID
-                        parse_dict["m_SourceFontFile"]["m_PathID"] = m_SourceFontFile_PathID
-                        parse_dict["m_AtlasTextures"][0]["m_FileID"] = m_AtlasTextures_FileID
-                        parse_dict["m_AtlasTextures"][0]["m_PathID"] = m_AtlasTextures_PathID
-                        parse_dict["m_CreationSettings"]["characterSequence"] = ""
-                        
+                        if is_old_tmp:
+                            parse_dict["atlas"]["m_FileID"] = m_AtlasTextures_FileID
+                            parse_dict["atlas"]["m_PathID"] = m_AtlasTextures_PathID
+
                         texture_replacements[f"{assets_name}|{m_AtlasTextures_PathID}"] = assets["sdf_atlas"]
                         if m_Material_FileID == 0 and m_Material_PathID != 0:
                             gradient_scale = None
@@ -613,8 +882,18 @@ def main():
     parser.add_argument("--sdfonly", action="store_true", help="SDF 폰트만 교체")
     parser.add_argument("--ttfonly", action="store_true", help="TTF 폰트만 교체")
     parser.add_argument("--list", type=str, metavar="JSON_FILE", help="JSON 파일을 읽어서 폰트 교체")
+    parser.add_argument("--verbose", action="store_true", help="모든 로그를 verbose.txt 파일로 저장")
 
     args = parser.parse_args()
+
+    verbose_file = None
+    if args.verbose:
+        verbose_path = os.path.join(get_script_dir(), "verbose.txt")
+        verbose_file = open(verbose_path, "w", encoding="utf-8")
+        sys.stdout = TeeWriter(verbose_file, sys.__stdout__)
+        sys.stderr = TeeWriter(verbose_file, sys.__stderr__)
+        print(f"[verbose] 로그를 '{verbose_path}'에 저장합니다.")
+
     input_path = args.gamepath
     if not input_path:
         input_path = input("게임 경로를 입력하세요: ").strip()
@@ -758,8 +1037,15 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        import traceback
         print(f"\n예상치 못한 오류가 발생했습니다: {e}")
-        traceback.print_exc()
+        tb_module.print_exc()
         input("\n엔터를 눌러 종료...")
         sys.exit(1)
+    finally:
+        # verbose TeeWriter 정리
+        if isinstance(sys.stdout, TeeWriter):
+            sys.stdout.file.close()
+            sys.stdout = sys.__stdout__
+        if isinstance(sys.stderr, TeeWriter):
+            sys.stderr.file.close()
+            sys.stderr = sys.__stderr__
