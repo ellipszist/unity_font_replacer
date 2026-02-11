@@ -546,9 +546,12 @@ def replace_fonts_in_file(unity_version, game_path, assets_file, replacements, r
                 parse_dict = obj.parse_as_dict()
             except:
                 continue
-            is_new_tmp = "m_FaceInfo" in parse_dict and "m_AtlasTextures" in parse_dict
-            is_old_tmp = "m_fontInfo" in parse_dict and "atlas" in parse_dict
-            if is_new_tmp or is_old_tmp:
+            has_new_keys = "m_FaceInfo" in parse_dict and "m_AtlasTextures" in parse_dict
+            has_old_keys = "m_fontInfo" in parse_dict and "atlas" in parse_dict
+            if has_new_keys or has_old_keys:
+                target_version = detect_tmp_version(parse_dict)
+                is_new_tmp = (target_version == "new")
+                is_old_tmp = (target_version == "old")
                 # 외부 참조 stub만 건너뛰기
                 if is_new_tmp:
                     atlas_textures = parse_dict.get("m_AtlasTextures", [])
