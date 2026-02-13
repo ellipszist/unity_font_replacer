@@ -1,89 +1,84 @@
-[> for Korean verison of README.md](README.md)
+[> for Korean version of README.md](README.md)
 
 # Unity Font Replacer
 
-A tool to replace Unity game fonts with custom fonts. Supports both TTF fonts and TextMeshPro SDF fonts.
+A tool to replace Unity game fonts with Korean/custom fonts. Supports both TTF and TextMeshPro SDF fonts.
 
-## Requirements
+## Quick Start (EXE-first)
 
-- Python 3.8+
-- Dependencies:
-  - UnityPy
-  - Pillow
-
-```bash
-pip install UnityPy Pillow
-```
-
-## File Layout
+After extracting a release ZIP, the folder typically looks like this:
 
 ```
-Unity_Font_Replacer/
-├── unity_font_replacer.py    # Font replacement tool (Korean UI)
-├── unity_font_replacer_en.py # Font replacement tool (English UI)
-├── export_fonts.py           # Font export tool (Korean UI)
-├── export_fonts_en.py        # Font export tool (English UI)
-├── KR_ASSETS/                # Korean font assets
-│   ├── Mulmaru.ttf
-│   ├── Mulmaru SDF.json
-│   ├── Mulmaru SDF Atlas.png
-│   ├── NanumGothic.ttf
-│   ├── NanumGothic SDF.json
-│   └── NanumGothic SDF Atlas.png
-└── README.md
+release_en/
+├── unity_font_replacer_en.exe
+├── export_fonts_en.exe
+├── KR_ASSETS/
+├── Il2CppDumper/
+└── README_EN.md
 ```
 
-## Usage
+Recommended run:
 
-Use the *_en.py scripts for English UI.
-
-### Font Replacement (unity_font_replacer.py)
-
-#### Basic Usage
-
-```bash
-# Interactive mode (prompt for game path)
-python unity_font_replacer.py
-
-# Provide game path
-python unity_font_replacer.py --gamepath "D:\Games\Muck" --mulmaru
+```bat
+cd release_en
+unity_font_replacer_en.exe
 ```
 
-#### Command Line Options
+Executables:
+
+- `unity_font_replacer.exe`: Font replacement tool (Korean UI)
+- `unity_font_replacer_en.exe`: Font replacement tool (English UI)
+- `export_fonts.exe`: TMP SDF font exporter (Korean UI)
+- `export_fonts_en.exe`: TMP SDF font exporter (English UI)
+
+## Font Replacement (unity_font_replacer_en.exe)
+
+### Basic Usage
+
+```bat
+:: Interactive mode (asks for game path)
+unity_font_replacer_en.exe
+
+:: Set game path + bulk replace with Mulmaru
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
+```
+
+### Command Line Options
 
 | Option | Description |
 |------|------|
-| `--gamepath <path>` | Game root path or _Data folder path |
-| `--parse` | Export font info to a JSON file |
-| `--mulmaru` | Replace all fonts with Mulmaru |
-| `--nanumgothic` | Replace all fonts with NanumGothic |
-| `--sdfonly` | Replace SDF fonts only (exclude TTF) |
-| `--ttfonly` | Replace TTF fonts only (exclude SDF) |
-| `--list <JSON>` | Replace fonts based on a JSON file |
+| `--gamepath <path>` | Game root path or `_Data` folder path |
+| `--parse` | Export font info to JSON |
+| `--mulmaru` | Bulk replace all fonts with Mulmaru |
+| `--nanumgothic` | Bulk replace all fonts with NanumGothic |
+| `--sdfonly` | Replace SDF fonts only |
+| `--ttfonly` | Replace TTF fonts only |
+| `--list <JSON>` | Replace fonts from a JSON mapping |
 
-#### Examples
+### Examples
 
-```bash
-# Parse font info (create Muck.json)
-python unity_font_replacer.py --gamepath "D:\Games\Muck" --parse
+```bat
+:: Export font info (creates Muck.json)
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --parse
 
-# Replace all fonts with Mulmaru
-python unity_font_replacer.py --gamepath "D:\Games\Muck" --mulmaru
+:: Replace all fonts with Mulmaru
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 
-# Replace SDF fonts only with NanumGothic
-python unity_font_replacer.py --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
+:: Replace SDF only with NanumGothic
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
 
-# Replace fonts using a JSON file
-python unity_font_replacer.py --gamepath "D:\Games\Muck" --list Muck.json
+:: Replace using JSON mapping
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --list Muck.json
 ```
 
-### Per-Font Replacement (--list)
+## Per-Font Replacement (--list)
 
-1. Run `--parse` to create a JSON file with font info
-2. Set the target font name in the `Replace_to` field
-3. Run `--list` to apply replacements
+1. Run `--parse` to generate font info JSON.
+2. Fill `Replace_to` for entries you want to replace.
+3. Run with `--list`.
 
-JSON format:
+JSON example:
+
 ```json
 {
     "sharedassets0.assets|sharedassets0.assets|Arial|TTF|123": {
@@ -105,53 +100,76 @@ JSON format:
 }
 ```
 
-If `Replace_to` is empty, the font will not be replaced.
+- If `Replace_to` is empty, that font is skipped.
+- Valid `Replace_to` forms:
+  - `Mulmaru` or `Mulmaru.ttf`
+  - `NanumGothic` or `NanumGothic.ttf`
+  - `Mulmaru SDF` or `Mulmaru SDF.json` or `Mulmaru SDF Atlas.png`
 
-Valid `Replace_to` formats:
-- `Mulmaru` or `Mulmaru.ttf`
-- `NanumGothic` or `NanumGothic.ttf`
-- `Mulmaru SDF` or `Mulmaru SDF.json` or `Mulmaru SDF Atlas.png`
+## Font Export (export_fonts_en.exe)
 
-### Font Export (export_fonts.py)
+Exports TMP SDF font assets.
 
-A tool to export TextMeshPro SDF fonts from your own Unity project/game for build custom SDF font.
+```bat
+:: Positional path argument (recommended)
+export_fonts_en.exe "D:\MyGame"
 
-```bash
-# Run from the game root folder
-cd "D:\MyGame"
-python C:\path\to\export_fonts.py
+:: You can also pass _Data directly
+export_fonts_en.exe "D:\MyGame\MyGame_Data"
 
-# Or run from the _Data folder
-cd "D:\MyGame\MyGame_Data"
-python C:\path\to\export_fonts.py
+:: If omitted, it prompts for the game path
+export_fonts_en.exe
 ```
 
-JSON files, atlas PNG files, and (if present) material JSON files are created in the current working directory.
+Output files are created in the current working directory:
+
+- `TMP_FontAssetName.json`
+- `TMP_FontAssetName SDF Atlas.png`
+- (if present) `Material_*.json`
 
 ## Supported Fonts
-
-### Included Fonts
 
 | Font | Description |
 |-----------|------|
 | Mulmaru | Mulmaru Korean font |
 | NanumGothic | NanumGothic Korean font |
 
-### Adding Custom Fonts
+## Adding Custom Fonts
 
-Add the following files to `KR_ASSETS`:
+Add these files under `KR_ASSETS`:
 
-- `FontName.ttf` - TTF font file
-- `FontName SDF.json` - SDF font data
-- `FontName SDF Atlas.png` - SDF atlas texture
+- `FontName.ttf`
+- `FontName SDF.json`
+- `FontName SDF Atlas.png`
 
-SDF font data can be exported with `export_fonts.py`.
+You can generate SDF font data with `export_fonts_en.exe`.
+
+## Run from Source (Optional)
+
+If you prefer Python scripts instead of EXEs:
+
+### Requirements
+
+- Python 3.12 recommended
+- Packages: `UnityPy`, `TypeTreeGeneratorAPI`, `Pillow`
+
+```bash
+pip install UnityPy TypeTreeGeneratorAPI Pillow
+```
+
+### Examples
+
+```bash
+python unity_font_replacer_en.py --gamepath "D:\Games\Muck" --mulmaru
+python export_fonts_en.py "D:\MyGame"
+```
 
 ## Notes
 
-- Files are saved preserving the original compression when possible, falling back to LZ4 then uncompressed.
-- Always back up game files before modifying.
-- Some games may fail integrity checks after modification.
+- Save tries to preserve original compression; fallback order is `lz4 -> safe-none`.
+- `TypeTreeGeneratorAPI` is required for TMP(FontAsset) parsing/replacement.
+- Back up game files before modification.
+- Some games may restore modified files by integrity checks.
 - Check Terms of Service before using in online games.
 
 ## Special Thanks

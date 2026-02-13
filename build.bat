@@ -1,26 +1,50 @@
 @echo off
 setlocal
 
+set "VERSION="
 set /p VERSION=Enter version (e.g. v1.0.6): 
+for /f "tokens=* delims= " %%A in ("%VERSION%") do set "VERSION=%%A"
+:trim_version_tail
+if "%VERSION%"=="" goto version_check
+if not "%VERSION:~-1%"==" " goto version_check
+set "VERSION=%VERSION:~0,-1%"
+goto trim_version_tail
+
+:version_check
 if "%VERSION%"=="" (
   echo Version is required.
   exit /b 1
 )
 
-where python >nul 2>&1
-if errorlevel 1 (
-  echo Python not found in PATH.
+set "VENV_DIR=venv"
+set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
+
+if not exist "%VENV_PY%" (
+  echo [build] Creating virtual environment: %VENV_DIR%
+  py -3.12 -m venv "%VENV_DIR%" 2>nul
+  if errorlevel 1 (
+    python -m venv "%VENV_DIR%" 2>nul
+  )
+)
+
+if not exist "%VENV_PY%" (
+  echo Failed to create or find venv python at "%VENV_PY%".
+  echo Ensure Python 3.12 or python is installed and available.
   exit /b 1
 )
 
-python -c "import UnityPy,sys; print(sys.version); print(UnityPy.__file__)"
+echo [build] Using venv python: %VENV_PY%
+
+"%VENV_PY%" -m pip install --upgrade pip
+"%VENV_PY%" -m pip install pyinstaller UnityPy TypeTreeGeneratorAPI Pillow fmod_toolkit archspec
+"%VENV_PY%" -c "import UnityPy,sys; print(sys.version); print(UnityPy.__file__)"
 
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist unity_font_replacer.spec del unity_font_replacer.spec
 if exist export_fonts.spec del export_fonts.spec
 
-python -m PyInstaller --onefile --name unity_font_replacer ^
+"%VENV_PY%" -m PyInstaller --onefile --name unity_font_replacer ^
   --clean ^
   --noconfirm ^
   --collect-all UnityPy ^
@@ -29,7 +53,7 @@ python -m PyInstaller --onefile --name unity_font_replacer ^
   --collect-all archspec ^
   unity_font_replacer.py
 
-python -m PyInstaller --onefile --name export_fonts ^
+"%VENV_PY%" -m PyInstaller --onefile --name export_fonts ^
   --clean ^
   --noconfirm ^
   --collect-all UnityPy ^

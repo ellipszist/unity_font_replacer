@@ -4,84 +4,79 @@
 
 Unity 게임의 폰트를 한글 폰트로 교체하는 도구입니다. TTF 폰트와 TextMeshPro SDF 폰트를 모두 지원합니다.
 
-## 요구 사항
+## 빠른 시작 (EXE 기준)
 
-- Python 3.8 이상
-- 의존성 패키지:
-  - UnityPy
-  - Pillow
-
-```bash
-pip install UnityPy Pillow
-```
-
-## 파일 구성
+릴리즈 ZIP을 풀면 보통 아래처럼 구성됩니다.
 
 ```
-Unity_Font_Replacer/
-├── unity_font_replacer.py   # 폰트 교체 도구
-├── unity_font_replacer_en.py # 폰트 교체 도구 (영문 UI)
-├── export_fonts.py          # 폰트 추출 도구
-├── export_fonts_en.py       # 폰트 추출 도구 (영문 UI)
-├── KR_ASSETS/               # 한글 폰트 에셋
-│   ├── Mulmaru.ttf
-│   ├── Mulmaru SDF.json
-│   ├── Mulmaru SDF Atlas.png
-│   ├── NanumGothic.ttf
-│   ├── NanumGothic SDF.json
-│   └── NanumGothic SDF Atlas.png
+release/
+├── unity_font_replacer.exe
+├── export_fonts.exe
+├── KR_ASSETS/
+├── Il2CppDumper/
 └── README.md
 ```
 
-## 사용법
+권장 실행 방식:
 
-### 폰트 교체 (unity_font_replacer.py)
-
-#### 기본 사용법
-
-```bash
-# 대화형 모드 (게임 경로 입력 프롬프트)
-python unity_font_replacer.py
-
-# 게임 경로 지정
-python unity_font_replacer.py --gamepath "D:\Games\Muck" --mulmaru
+```bat
+cd release
+unity_font_replacer.exe
 ```
 
-#### 명령줄 옵션
+- `unity_font_replacer.exe`: 폰트 교체 도구 (한국어 UI)
+- `unity_font_replacer_en.exe`: 폰트 교체 도구 (영문 UI)
+- `export_fonts.exe`: TMP SDF 폰트 추출 도구 (한국어 UI)
+- `export_fonts_en.exe`: TMP SDF 폰트 추출 도구 (영문 UI)
+
+## 폰트 교체 (unity_font_replacer.exe)
+
+### 기본 사용법
+
+```bat
+:: 대화형 모드 (게임 경로 입력)
+unity_font_replacer.exe
+
+:: 게임 경로 지정 + Mulmaru 일괄 교체
+unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
+```
+
+### 명령줄 옵션
 
 | 옵션 | 설명 |
 |------|------|
-| `--gamepath <경로>` | 게임의 루트 경로 또는 _Data 폴더 경로 |
-| `--parse` | 게임의 폰트 정보를 JSON 파일로 출력 |
-| `--mulmaru` | 모든 폰트를 Mulmaru 폰트로 일괄 교체 |
-| `--nanumgothic` | 모든 폰트를 NanumGothic 폰트로 일괄 교체 |
-| `--sdfonly` | SDF 폰트만 교체 (TTF 폰트 제외) |
-| `--ttfonly` | TTF 폰트만 교체 (SDF 폰트 제외) |
-| `--list <JSON파일>` | JSON 파일을 참조하여 개별 폰트 교체 |
+| `--gamepath <경로>` | 게임 루트 경로 또는 `_Data` 폴더 경로 |
+| `--parse` | 게임 폰트 정보를 JSON 파일로 출력 |
+| `--mulmaru` | 모든 폰트를 Mulmaru로 일괄 교체 |
+| `--nanumgothic` | 모든 폰트를 NanumGothic으로 일괄 교체 |
+| `--sdfonly` | SDF 폰트만 교체 |
+| `--ttfonly` | TTF 폰트만 교체 |
+| `--list <JSON파일>` | JSON 파일 기준 개별 폰트 교체 |
 
-#### 사용 예시
+### 사용 예시
 
-```bash
-# 폰트 정보 파싱 (Muck.json 생성)
-python unity_font_replacer.py --gamepath "D:\Games\Muck" --parse
+```bat
+:: 폰트 정보 파싱 (Muck.json 생성)
+unity_font_replacer.exe --gamepath "D:\Games\Muck" --parse
 
-# Mulmaru 폰트로 모든 폰트 교체
-python unity_font_replacer.py --gamepath "D:\Games\Muck" --mulmaru
+:: Mulmaru로 전체 교체
+unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
 
-# NanumGothic 폰트로 SDF 폰트만 교체
-python unity_font_replacer.py --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
+:: NanumGothic으로 SDF만 교체
+unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
 
-# JSON 파일을 사용한 개별 폰트 교체
-python unity_font_replacer.py --gamepath "D:\Games\Muck" --list Muck.json
+:: JSON 기반 개별 교체
+unity_font_replacer.exe --gamepath "D:\Games\Muck" --list Muck.json
 ```
 
-### 개별 폰트 교체 (--list 옵션)
+## 개별 폰트 교체 (--list)
 
-1. `--parse` 옵션으로 폰트 정보 JSON 파일 생성
-2. JSON 파일에서 교체할 폰트의 `Replace_to` 필드에 원하는 폰트 이름 입력
-3. `--list` 옵션으로 교체 실행
+1. `--parse`로 폰트 정보 JSON 생성
+2. JSON의 `Replace_to` 필드에 원하는 폰트 이름 입력
+3. `--list`로 교체 실행
 
-JSON 파일 형식:
+JSON 예시:
+
 ```json
 {
     "sharedassets0.assets|sharedassets0.assets|Arial|TTF|123": {
@@ -103,54 +98,76 @@ JSON 파일 형식:
 }
 ```
 
-`Replace_to` 필드가 비어있으면 해당 폰트는 교체되지 않습니다.
+- `Replace_to`가 비어 있으면 해당 항목은 교체하지 않습니다.
+- `Replace_to` 예시:
+  - `Mulmaru` 또는 `Mulmaru.ttf`
+  - `NanumGothic` 또는 `NanumGothic.ttf`
+  - `Mulmaru SDF` 또는 `Mulmaru SDF.json` 또는 `Mulmaru SDF Atlas.png`
 
-`Replace_to`에 사용할 수 있는 폰트 이름 형식:
-- `Mulmaru` 또는 `Mulmaru.ttf`
-- `NanumGothic` 또는 `NanumGothic.ttf`
-- `Mulmaru SDF` 또는 `Mulmaru SDF.json` 또는 `Mulmaru SDF Atlas.png`
+## 폰트 추출 (export_fonts.exe)
 
-### 폰트 추출 (export_fonts.py)
+TextMeshPro SDF 폰트를 추출하는 도구입니다.
 
-자신이 폰트제작용으로 만든 Unity 게임에서 TextMeshPro SDF 폰트를 추출하는 도구입니다.
+```bat
+:: 경로 인자 방식 (권장)
+export_fonts.exe "D:\MyGame"
 
-```bash
-# 게임 루트 폴더에서 실행
-cd "D:\MyGame"
-python C:\path\to\export_fonts.py
+:: 또는 _Data 직접 지정
+export_fonts.exe "D:\MyGame\MyGame_Data"
 
-# 또는 _Data 폴더에서 실행
-cd "D:\MyGame\MyGame_Data"
-python C:\path\to\export_fonts.py
+:: 인자 생략 시 대화형 프롬프트
+export_fonts.exe
 ```
 
-현재 작업 디렉토리에 JSON 파일, Atlas PNG 파일, (있는 경우) Material JSON 파일이 생성됩니다.
+실행 후 현재 작업 디렉터리에 다음 파일이 생성됩니다.
+- `TMP_FontAsset이름.json`
+- `TMP_FontAsset이름 SDF Atlas.png`
+- (있는 경우) `Material_*.json`
 
-## 지원하는 폰트
-
-### 기본 제공 폰트
+## 지원 폰트
 
 | 폰트 이름 | 설명 |
 |-----------|------|
 | Mulmaru | 물마루체 |
 | NanumGothic | 나눔고딕 |
 
-### 커스텀 폰트 추가
+## 커스텀 폰트 추가
 
-`KR_ASSETS` 폴더에 다음 파일을 추가하면 됩니다:
+`KR_ASSETS` 폴더에 아래 파일을 추가하면 됩니다.
 
-- `폰트이름.ttf` - TTF 폰트 파일
-- `폰트이름 SDF.json` - SDF 폰트 데이터
-- `폰트이름 SDF Atlas.png` - SDF Atlas 텍스처
+- `폰트이름.ttf`
+- `폰트이름 SDF.json`
+- `폰트이름 SDF Atlas.png`
 
-SDF 폰트 데이터는 `export_fonts.py`로 추출할 수 있습니다.
+SDF 데이터는 `export_fonts.exe`로 추출할 수 있습니다.
+
+## 소스 실행 (선택)
+
+EXE 대신 Python 소스로 실행하려면:
+
+### 요구 사항
+
+- Python 3.12 권장
+- 패키지: `UnityPy`, `TypeTreeGeneratorAPI`, `Pillow`
+
+```bash
+pip install UnityPy TypeTreeGeneratorAPI Pillow
+```
+
+### 실행 예시
+
+```bash
+python unity_font_replacer.py --gamepath "D:\Games\Muck" --mulmaru
+python export_fonts.py "D:\MyGame"
+```
 
 ## 주의 사항
 
-- 저장 시 원본 압축 방식 유지를 시도하며, 실패 시 LZ4 → 무압축 순으로 폴백합니다.
-- 게임 파일을 수정하기 전에 반드시 백업하세요.
-- 일부 게임에서는 무결성 검사로 인해 수정된 파일이 작동하지 않을 수 있습니다.
-- 온라인 게임에서 사용 시 이용 약관을 확인하세요.
+- 저장 시 원본 압축 방식 유지를 시도하며, 실패 시 `lz4 -> safe-none` 순으로 폴백합니다.
+- TMP(FontAsset) 파싱/교체를 위해 `TypeTreeGeneratorAPI`가 필요합니다.
+- 게임 파일 수정 전 백업을 권장합니다.
+- 일부 게임은 무결성 검사로 수정 파일이 원복될 수 있습니다.
+- 온라인 게임 사용 시 이용 약관을 확인하세요.
 
 ## Special Thanks
 
