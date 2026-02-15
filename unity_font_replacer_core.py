@@ -837,6 +837,7 @@ def replace_fonts_in_file(
     replacements: dict[str, JsonDict],
     replace_ttf: bool = True,
     replace_sdf: bool = True,
+    use_game_mat: bool = False,
     generator: TypeTreeGenerator | None = None,
     replacement_lookup: dict[tuple[str, str, str, int], str] | None = None,
     lang: Language = "ko",
@@ -1062,11 +1063,12 @@ def replace_fonts_in_file(
                         texture_replacements[f"{assets_name}|{m_AtlasTextures_PathID}"] = assets["sdf_atlas"]
                         if m_Material_FileID == 0 and m_Material_PathID != 0:
                             gradient_scale = None
+                            apply_replacement_material = not use_game_mat
+                            float_overrides: dict[str, float] = {}
                             material_data = assets.get("sdf_materials")
-                            if material_data:
+                            if material_data and apply_replacement_material:
                                 material_props = material_data.get("m_SavedProperties", {})
                                 float_properties = material_props.get("m_Floats", [])
-                                float_overrides: dict[str, float] = {}
                                 for prop in float_properties:
                                     if not isinstance(prop, (list, tuple)) or len(prop) < 2:
                                         continue
@@ -1081,7 +1083,7 @@ def replace_fonts_in_file(
                                 "w": assets["sdf_atlas"].width,
                                 "h": assets["sdf_atlas"].height,
                                 "gs": gradient_scale,
-                                "float_overrides": float_overrides if material_data else {},
+                                "float_overrides": float_overrides,
                             }
                         obj.patch(parse_dict)
                         modified = True
@@ -1351,6 +1353,7 @@ def main_cli(lang: Language = "ko") -> None:
         sdf_help = "SDF 폰트만 교체"
         ttf_help = "TTF 폰트만 교체"
         list_help = "JSON 파일을 읽어서 폰트 교체"
+        game_mat_help = "SDF 교체 시 게임 원본 Material 파라미터를 유지"
         verbose_help = "모든 로그를 verbose.txt 파일로 저장"
     else:
         description = "Replace Unity game fonts with Korean fonts."
@@ -1368,6 +1371,7 @@ Examples:
         sdf_help = "Replace SDF fonts only"
         ttf_help = "Replace TTF fonts only"
         list_help = "Replace fonts using a JSON file"
+        game_mat_help = "Keep original in-game Material parameters for SDF replacement"
         verbose_help = "Save all logs to verbose.txt"
 
     parser = argparse.ArgumentParser(
@@ -1382,6 +1386,7 @@ Examples:
     parser.add_argument("--sdfonly", action="store_true", help=sdf_help)
     parser.add_argument("--ttfonly", action="store_true", help=ttf_help)
     parser.add_argument("--list", type=str, metavar="JSON_FILE", help=list_help)
+    parser.add_argument("--use-game-mat", action="store_true", help=game_mat_help)
     parser.add_argument("--verbose", action="store_true", help=verbose_help)
 
     args = parser.parse_args()
@@ -1671,6 +1676,7 @@ Examples:
                         file_ttf_replacements,
                         replace_ttf=True,
                         replace_sdf=False,
+                        use_game_mat=args.use_game_mat,
                         generator=generator,
                         replacement_lookup=file_ttf_lookup,
                         lang=lang,
@@ -1688,6 +1694,7 @@ Examples:
                             single_sdf,
                             replace_ttf=False,
                             replace_sdf=True,
+                            use_game_mat=args.use_game_mat,
                             generator=generator,
                             replacement_lookup=single_sdf_lookup,
                             lang=lang,
@@ -1701,6 +1708,7 @@ Examples:
                     replacements,
                     replace_ttf,
                     replace_sdf,
+                    use_game_mat=args.use_game_mat,
                     generator=generator,
                     replacement_lookup=replacement_lookup,
                     lang=lang,

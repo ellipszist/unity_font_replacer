@@ -54,6 +54,7 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--sdfonly` | Replace SDF fonts only |
 | `--ttfonly` | Replace TTF fonts only |
 | `--list <JSON>` | Replace fonts from a JSON mapping |
+| `--use-game-mat` | Keep original in-game Material parameters for SDF replacement |
 
 ### Examples
 
@@ -66,6 +67,9 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 
 :: Replace SDF only with NanumGothic
 unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
+
+:: Replace SDF and keep original in-game material parameters
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-mat
 
 :: Replace using JSON mapping
 unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --list Muck.json
@@ -167,6 +171,8 @@ python export_fonts_en.py "D:\MyGame"
 ## Notes
 
 - Save tries to preserve original compression; fallback order is `lz4 -> safe-none`.
+- For SDF replacement, default behavior applies material floats from `KR_ASSETS/* SDF Material.json`.
+  Use `--use-game-mat` to preserve original in-game material style.
 - `TypeTreeGeneratorAPI` is required for TMP(FontAsset) parsing/replacement.
 - Back up game files before modification.
 - Some games may restore modified files by integrity checks.
