@@ -13,7 +13,7 @@ from functools import lru_cache
 from typing import Any, Callable, Iterable, Literal, NoReturn, cast
 
 import UnityPy
-from PIL import Image
+from PIL import Image, ImageStat
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 
 
@@ -348,7 +348,109 @@ def convert_face_info_old_to_new(font_info: JsonDict) -> JsonDict:
     }
 
 
-def convert_glyphs_new_to_old(glyph_table: list[JsonDict], char_table: list[JsonDict]) -> list[JsonDict]:
+def _new_glyph_rect_to_int(rect: JsonDict) -> tuple[int, int, int, int]:
+    """KR: 신형 TMP glyph rect를 정수 좌표/크기로 정규화합니다.
+    EN: Normalize new TMP glyph rect to integer coordinates/sizes.
+    """
+    x = int(round(float(rect.get("m_X", 0))))
+    y = int(round(float(rect.get("m_Y", 0))))
+    w = max(1, int(round(float(rect.get("m_Width", 0)))))
+    h = max(1, int(round(float(rect.get("m_Height", 0)))))
+    return x, y, w, h
+
+
+def detect_new_glyph_y_flip(
+    glyph_table: list[JsonDict],
+    char_table: list[JsonDict],
+    atlas_image: Image.Image | None,
+    sample_limit: int = 256,
+) -> bool:
+    """KR: 신형 TMP glyph Y축이 구형 TMP 기준으로 반전되어 있는지 추정합니다.
+    EN: Estimate whether new TMP glyph Y coordinates must be flipped for old TMP.
+    """
+    if atlas_image is None or not glyph_table or not char_table:
+        return False
+
+    glyph_by_index: dict[int, JsonDict] = {}
+    for glyph in glyph_table:
+        glyph_by_index[int(glyph.get("m_Index", 0))] = glyph
+
+    # KR: 문자 테이블 순서를 따라 샘플을 뽑아 실제 렌더와 가까운 분포를 사용합니다.
+    # EN: Sample in character-table order to match runtime usage distribution.
+    rect_samples: list[tuple[int, int, int, int]] = []
+    seen_indices: set[int] = set()
+    for char in char_table:
+        glyph_idx = int(char.get("m_GlyphIndex", -1))
+        if glyph_idx in seen_indices:
+            continue
+        seen_indices.add(glyph_idx)
+        glyph = glyph_by_index.get(glyph_idx)
+        if not glyph:
+            continue
+        rect = glyph.get("m_GlyphRect", {})
+        x, y, w, h = _new_glyph_rect_to_int(rect)
+        if w <= 1 or h <= 1:
+            continue
+        rect_samples.append((x, y, w, h))
+
+    if not rect_samples:
+        return False
+
+    if len(rect_samples) > sample_limit:
+        step = max(1, len(rect_samples) // sample_limit)
+        rect_samples = rect_samples[::step][:sample_limit]
+
+    if "A" in atlas_image.getbands():
+        alpha = atlas_image.getchannel("A")
+    else:
+        alpha = atlas_image.convert("L")
+
+    atlas_w, atlas_h = alpha.size
+
+    def _score(flip_y: bool) -> tuple[int, float, int]:
+        non_zero_count = 0
+        mean_sum = 0.0
+        valid_rects = 0
+
+        for x, y, w, h in rect_samples:
+            yy = atlas_h - y - h if flip_y else y
+            x0 = max(0, min(atlas_w - 1, x))
+            y0 = max(0, min(atlas_h - 1, yy))
+            x1 = max(x0 + 1, min(atlas_w, x0 + w))
+            y1 = max(y0 + 1, min(atlas_h, y0 + h))
+
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            region = alpha.crop((x0, y0, x1, y1))
+            stats = ImageStat.Stat(region)
+            mean_sum += float(stats.mean[0]) if stats.mean else 0.0
+            if region.getbbox() is not None:
+                non_zero_count += 1
+            valid_rects += 1
+
+        return non_zero_count, mean_sum, valid_rects
+
+    direct_non_zero, direct_mean, direct_valid = _score(False)
+    flipped_non_zero, flipped_mean, flipped_valid = _score(True)
+
+    valid_count = min(direct_valid, flipped_valid)
+    if valid_count == 0:
+        return False
+
+    non_zero_margin = max(2, valid_count // 20)  # 5%
+    return (
+        flipped_non_zero > direct_non_zero + non_zero_margin
+        or (flipped_non_zero >= direct_non_zero and flipped_mean > (direct_mean * 1.2))
+    )
+
+
+def convert_glyphs_new_to_old(
+    glyph_table: list[JsonDict],
+    char_table: list[JsonDict],
+    atlas_height: int | None = None,
+    flip_y: bool = False,
+) -> list[JsonDict]:
     """KR: 신형 글리프/문자 테이블을 구형 m_glyphInfoList로 변환합니다.
     EN: Convert new glyph/character tables into old m_glyphInfoList.
     """
@@ -362,10 +464,14 @@ def convert_glyphs_new_to_old(glyph_table: list[JsonDict], char_table: list[Json
         g = glyph_by_index.get(glyph_idx, {})
         metrics = g.get("m_Metrics", {})
         rect = g.get("m_GlyphRect", {})
+        rect_y = float(rect.get("m_Y", 0))
+        rect_h = float(rect.get("m_Height", 0))
+        if flip_y and atlas_height:
+            rect_y = float(atlas_height) - rect_y - rect_h
         result.append({
             "id": int(unicode_val),
             "x": float(rect.get("m_X", 0)),
-            "y": float(rect.get("m_Y", 0)),
+            "y": rect_y,
             "width": float(metrics.get("m_Width", 0)),
             "height": float(metrics.get("m_Height", 0)),
             "xOffset": float(metrics.get("m_HorizontalBearingX", 0)),
@@ -851,9 +957,28 @@ def replace_fonts_in_file(
                                 replace_data.get("m_AtlasWidth", 0),
                                 replace_data.get("m_AtlasHeight", 0)
                             )
+                            replacement_atlas = assets.get("sdf_atlas")
+                            atlas_height = int(
+                                replace_data.get(
+                                    "m_AtlasHeight",
+                                    replacement_atlas.height if replacement_atlas is not None else 0,
+                                )
+                            )
+                            flip_new_glyph_y = detect_new_glyph_y_flip(
+                                replace_data.get("m_GlyphTable", []),
+                                replace_data.get("m_CharacterTable", []),
+                                replacement_atlas if isinstance(replacement_atlas, Image.Image) else None,
+                            )
+                            if flip_new_glyph_y:
+                                if lang == "ko":
+                                    print("  구형 TMP 좌표계 보정(Y-flip) 적용")
+                                else:
+                                    print("  Applying old TMP coordinate fix (Y-flip)")
                             old_glyph_list = convert_glyphs_new_to_old(
                                 replace_data.get("m_GlyphTable", []),
-                                replace_data.get("m_CharacterTable", [])
+                                replace_data.get("m_CharacterTable", []),
+                                atlas_height=atlas_height,
+                                flip_y=flip_new_glyph_y,
                             )
                             old_font_info["CharacterCount"] = len(old_glyph_list)
                             parse_dict["m_fontInfo"] = old_font_info
@@ -941,14 +1066,22 @@ def replace_fonts_in_file(
                             if material_data:
                                 material_props = material_data.get("m_SavedProperties", {})
                                 float_properties = material_props.get("m_Floats", [])
+                                float_overrides: dict[str, float] = {}
                                 for prop in float_properties:
-                                    if prop[0] == "_GradientScale":
-                                        gradient_scale = prop[1]
-                                        break
+                                    if not isinstance(prop, (list, tuple)) or len(prop) < 2:
+                                        continue
+                                    key = str(prop[0])
+                                    try:
+                                        value = float(prop[1])
+                                    except (TypeError, ValueError):
+                                        continue
+                                    float_overrides[key] = value
+                                gradient_scale = float_overrides.get("_GradientScale")
                             material_replacements[f"{assets_name}|{m_Material_PathID}"] = {
                                 "w": assets["sdf_atlas"].width,
                                 "h": assets["sdf_atlas"].height,
-                                "gs": gradient_scale
+                                "gs": gradient_scale,
+                                "float_overrides": float_overrides if material_data else {},
                             }
                         obj.patch(parse_dict)
                         modified = True
@@ -970,9 +1103,12 @@ def replace_fonts_in_file(
                 parse_dict = obj.parse_as_object()
 
                 mat_info = material_replacements[f"{assets_name}|{obj.path_id}"]
+                float_overrides = mat_info.get("float_overrides", {})
                 for i in range(len(parse_dict.m_SavedProperties.m_Floats)):
                     prop_name = parse_dict.m_SavedProperties.m_Floats[i][0]
-                    if prop_name == '_TextureHeight':
+                    if prop_name in float_overrides:
+                        parse_dict.m_SavedProperties.m_Floats[i] = (prop_name, float(float_overrides[prop_name]))
+                    elif prop_name == '_TextureHeight':
                         parse_dict.m_SavedProperties.m_Floats[i] = ('_TextureHeight', float(mat_info["h"]))
                     elif prop_name == '_TextureWidth':
                         parse_dict.m_SavedProperties.m_Floats[i] = ('_TextureWidth', float(mat_info["w"]))
