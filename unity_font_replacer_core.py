@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import io
 import json
 import os
@@ -995,14 +996,16 @@ def replace_fonts_in_file(
             if not callable(save_fn):
                 raise AttributeError("UnityPy environment file object has no callable save().")
             typed_save = cast(Callable[..., bytes], save_fn)
+            # KR: save() 시그니처를 기준으로 packer 지원 여부를 판별해 내부 TypeError를 가리지 않도록 합니다.
+            # EN: Detect packer support from save() signature so we don't swallow internal TypeError.
             try:
-                if packer is None:
-                    return typed_save()
-                return typed_save(packer=packer)
-            except TypeError:
-                # KR: 일부 UnityPy/AssetsFile 구현은 packer 인자를 지원하지 않아 기본 save로 폴백합니다.
-                # EN: Some UnityPy/AssetsFile variants do not support 'packer'; fall back to default save.
+                supports_packer = "packer" in inspect.signature(typed_save).parameters
+            except (TypeError, ValueError):
+                supports_packer = False
+
+            if packer is None or not supports_packer:
                 return typed_save()
+            return typed_save(packer=packer)
 
         def _validate_saved_blob(saved_blob: bytes) -> bool:
             """KR: 저장 결과 blob이 Unity bundle로 다시 열리는지 검증합니다.
@@ -1036,9 +1039,11 @@ def replace_fonts_in_file(
                 return True
             except Exception as e:
                 if lang == "ko":
-                    print(f"  저장 방법 {log_label} 실패: {e}")
+                    print(f"  저장 방법 {log_label} 실패 [{type(e).__name__}]: {e!r}")
                 else:
-                    print(f"  Save method {log_label} failed: {e}")
+                    print(f"  Save method {log_label} failed [{type(e).__name__}]: {e!r}")
+                if debug_parse_enabled():
+                    tb_module.print_exc()
                 return False
 
         # KR: 저장 안정성을 위해 original -> lz4 -> safe-none 순서로 저장을 재시도합니다.
@@ -1055,7 +1060,13 @@ def replace_fonts_in_file(
                     print("  비압축 계열 모드로 재시도...")
                 else:
                     print("  Retrying with uncompressed-style packer...")
-                _try_save(safe_none_packer, "3")
+                if not _try_save(safe_none_packer, "3") and dataflags is not None:
+                    legacy_none_packer = ((int(dataflags) & ~0x3F), 0)
+                    if lang == "ko":
+                        print("  레거시 비트마스크 모드로 재시도...")
+                    else:
+                        print("  Retrying with legacy bitmask packer...")
+                    _try_save(legacy_none_packer, "4")
 
         if save_success:
             def _close_reader(obj: Any) -> None:
@@ -1117,7 +1128,7 @@ def replace_fonts_in_file(
     if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
 
-    return modified
+    return save_success if modified else False
 
 
 def create_batch_replacements(
@@ -1482,17 +1493,85 @@ Examples:
                 print(f"\n처리 중: {fn}")
             else:
                 print(f"\nProcessing: {fn}")
-            if replace_fonts_in_file(
-                unity_version,
-                game_path,
-                assets_file,
-                replacements,
-                replace_ttf,
-                replace_sdf,
-                generator=generator,
-                replacement_lookup=replacement_lookup,
-                lang=lang,
-            ):
+            # KR: 대형 SDF Atlas 다건 교체 시 UnityPy 저장 단계에서 메모리 피크가 커질 수 있어 파일 단위로 분할 저장합니다.
+            # EN: Split save per file when many SDF atlas replacements exist to reduce UnityPy memory peak.
+            file_replacements = {
+                key: value
+                for key, value in replacements.items()
+                if isinstance(value, dict)
+                and value.get("File") == fn
+                and value.get("Replace_to")
+            }
+            file_ttf_replacements = {
+                key: value
+                for key, value in file_replacements.items()
+                if value.get("Type") == "TTF"
+            }
+            file_sdf_replacements = {
+                key: value
+                for key, value in file_replacements.items()
+                if value.get("Type") == "SDF"
+            }
+
+            file_modified = False
+            use_split_sdf_save = replace_sdf and len(file_sdf_replacements) > 1
+
+            if use_split_sdf_save:
+                if is_ko:
+                    print(
+                        f"  SDF 대상 {len(file_sdf_replacements)}건 감지: 메모리 안정성을 위해 분할 저장 모드로 진행합니다..."
+                    )
+                else:
+                    print(
+                        f"  Detected {len(file_sdf_replacements)} SDF targets: using split-save mode for memory stability..."
+                    )
+
+                if replace_ttf and file_ttf_replacements:
+                    file_ttf_lookup, _ = build_replacement_lookup(file_ttf_replacements)
+                    if replace_fonts_in_file(
+                        unity_version,
+                        game_path,
+                        assets_file,
+                        file_ttf_replacements,
+                        replace_ttf=True,
+                        replace_sdf=False,
+                        generator=generator,
+                        replacement_lookup=file_ttf_lookup,
+                        lang=lang,
+                    ):
+                        file_modified = True
+
+                if replace_sdf:
+                    for key, value in file_sdf_replacements.items():
+                        single_sdf = {key: value}
+                        single_sdf_lookup, _ = build_replacement_lookup(single_sdf)
+                        if replace_fonts_in_file(
+                            unity_version,
+                            game_path,
+                            assets_file,
+                            single_sdf,
+                            replace_ttf=False,
+                            replace_sdf=True,
+                            generator=generator,
+                            replacement_lookup=single_sdf_lookup,
+                            lang=lang,
+                        ):
+                            file_modified = True
+            else:
+                if replace_fonts_in_file(
+                    unity_version,
+                    game_path,
+                    assets_file,
+                    replacements,
+                    replace_ttf,
+                    replace_sdf,
+                    generator=generator,
+                    replacement_lookup=replacement_lookup,
+                    lang=lang,
+                ):
+                    file_modified = True
+
+            if file_modified:
                 modified_count += 1
 
     if is_ko:
