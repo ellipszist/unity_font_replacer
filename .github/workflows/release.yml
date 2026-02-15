@@ -91,6 +91,7 @@ jobs:
         with:
           tag_name: v${{ inputs.version }}
           name: v${{ inputs.version }}
+          draft: true
           files: |
             Unity_Font_Replacer_v${{ inputs.version }}.zip
             Unity_Font_Replacer_EN_v${{ inputs.version }}.zip
