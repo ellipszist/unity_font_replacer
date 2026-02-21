@@ -1354,6 +1354,7 @@ def main_cli(lang: Language = "ko") -> None:
         ttf_help = "TTF 폰트만 교체"
         list_help = "JSON 파일을 읽어서 폰트 교체"
         game_mat_help = "SDF 교체 시 게임 원본 Material 파라미터를 유지"
+        split_save_help = "대형 SDF 다건 교체 시 저장 실패하면 1개씩 분할 저장으로 폴백"
         verbose_help = "모든 로그를 verbose.txt 파일로 저장"
     else:
         description = "Replace Unity game fonts with Korean fonts."
@@ -1372,6 +1373,7 @@ Examples:
         ttf_help = "Replace TTF fonts only"
         list_help = "Replace fonts using a JSON file"
         game_mat_help = "Keep original in-game Material parameters for SDF replacement"
+        split_save_help = "On save failure for large multi-SDF replacements, fall back to one-by-one split save"
         verbose_help = "Save all logs to verbose.txt"
 
     parser = argparse.ArgumentParser(
@@ -1387,6 +1389,7 @@ Examples:
     parser.add_argument("--ttfonly", action="store_true", help=ttf_help)
     parser.add_argument("--list", type=str, metavar="JSON_FILE", help=list_help)
     parser.add_argument("--use-game-mat", action="store_true", help=game_mat_help)
+    parser.add_argument("--split-save", action="store_true", help=split_save_help)
     parser.add_argument("--verbose", action="store_true", help=verbose_help)
 
     args = parser.parse_args()
@@ -1634,8 +1637,8 @@ Examples:
                 print(f"\n처리 중: {fn}")
             else:
                 print(f"\nProcessing: {fn}")
-            # KR: 대형 SDF Atlas 다건 교체 시 UnityPy 저장 단계에서 메모리 피크가 커질 수 있어 파일 단위로 분할 저장합니다.
-            # EN: Split save per file when many SDF atlas replacements exist to reduce UnityPy memory peak.
+            # KR: --split-save 옵션이 켜진 경우에만, 대형 SDF 다건 교체에서 one-shot 실패 시 분할 저장 폴백을 사용합니다.
+            # EN: Only when --split-save is enabled, use split-save fallback after one-shot save failure for large multi-SDF replacements.
             file_replacements = {
                 key: value
                 for key, value in replacements.items()
@@ -1655,65 +1658,126 @@ Examples:
             }
 
             file_modified = False
-            use_split_sdf_save = replace_sdf and len(file_sdf_replacements) > 1
+            use_split_sdf_save = args.split_save and replace_sdf and len(file_sdf_replacements) > 1
 
             if use_split_sdf_save:
                 if is_ko:
                     print(
-                        f"  SDF 대상 {len(file_sdf_replacements)}건 감지: 메모리 안정성을 위해 분할 저장 모드로 진행합니다..."
+                        f"  SDF 대상 {len(file_sdf_replacements)}건 + --split-save 활성화: one-shot 실패 시 분할 저장으로 폴백합니다..."
                     )
                 else:
                     print(
-                        f"  Detected {len(file_sdf_replacements)} SDF targets: using split-save mode for memory stability..."
+                        f"  {len(file_sdf_replacements)} SDF targets + --split-save enabled: will fall back to split save if one-shot fails..."
                     )
 
-                if replace_ttf and file_ttf_replacements:
-                    file_ttf_lookup, _ = build_replacement_lookup(file_ttf_replacements)
+                # KR: 먼저 한 번에 저장을 시도하고, 실패 시에만 1개씩 분할 저장으로 폴백합니다.
+                # EN: Try one-shot save first, then fall back to one-by-one split save on failure.
+                file_lookup, _ = build_replacement_lookup(file_replacements)
+                one_shot_ok = False
+                try:
+                    one_shot_ok = replace_fonts_in_file(
+                        unity_version,
+                        game_path,
+                        assets_file,
+                        file_replacements,
+                        replace_ttf=replace_ttf,
+                        replace_sdf=replace_sdf,
+                        use_game_mat=args.use_game_mat,
+                        generator=generator,
+                        replacement_lookup=file_lookup,
+                        lang=lang,
+                    )
+                except MemoryError as e:
+                    if is_ko:
+                        print(f"  one-shot 저장 실패 [MemoryError]: {e!r}")
+                        print("  1개씩 분할 저장으로 폴백합니다...")
+                    else:
+                        print(f"  One-shot save failed [MemoryError]: {e!r}")
+                        print("  Falling back to one-by-one split save...")
+                except Exception as e:
+                    if is_ko:
+                        print(f"  one-shot 저장 실패 [{type(e).__name__}]: {e!r}")
+                        print("  1개씩 분할 저장으로 폴백합니다...")
+                    else:
+                        print(f"  One-shot save failed [{type(e).__name__}]: {e!r}")
+                        print("  Falling back to one-by-one split save...")
+
+                if one_shot_ok:
+                    file_modified = True
+                else:
+                    split_stopped = False
+                    if replace_ttf and file_ttf_replacements:
+                        file_ttf_lookup, _ = build_replacement_lookup(file_ttf_replacements)
+                        try:
+                            if replace_fonts_in_file(
+                                unity_version,
+                                game_path,
+                                assets_file,
+                                file_ttf_replacements,
+                                replace_ttf=True,
+                                replace_sdf=False,
+                                use_game_mat=args.use_game_mat,
+                                generator=generator,
+                                replacement_lookup=file_ttf_lookup,
+                                lang=lang,
+                            ):
+                                file_modified = True
+                        except Exception as e:
+                            if is_ko:
+                                print(f"  TTF 분할 저장 실패 [{type(e).__name__}]: {e!r}")
+                            else:
+                                print(f"  TTF split save failed [{type(e).__name__}]: {e!r}")
+                            split_stopped = True
+
+                    if replace_sdf and not split_stopped:
+                        for key, value in file_sdf_replacements.items():
+                            single_sdf = {key: value}
+                            single_sdf_lookup, _ = build_replacement_lookup(single_sdf)
+                            try:
+                                if replace_fonts_in_file(
+                                    unity_version,
+                                    game_path,
+                                    assets_file,
+                                    single_sdf,
+                                    replace_ttf=False,
+                                    replace_sdf=True,
+                                    use_game_mat=args.use_game_mat,
+                                    generator=generator,
+                                    replacement_lookup=single_sdf_lookup,
+                                    lang=lang,
+                                ):
+                                    file_modified = True
+                            except Exception as e:
+                                if is_ko:
+                                    print(f"  SDF 분할 저장 중단 [{type(e).__name__}]: {e!r}")
+                                else:
+                                    print(f"  Stopping SDF split save [{type(e).__name__}]: {e!r}")
+                                break
+            else:
+                if replace_sdf and len(file_sdf_replacements) > 1 and not args.split_save:
+                    if is_ko:
+                        print("  참고: --split-save 옵션을 주면 저장 실패 시 1개씩 분할 저장 폴백을 사용할 수 있습니다.")
+                    else:
+                        print("  Note: use --split-save to enable one-by-one split-save fallback on save failure.")
+                try:
                     if replace_fonts_in_file(
                         unity_version,
                         game_path,
                         assets_file,
-                        file_ttf_replacements,
-                        replace_ttf=True,
-                        replace_sdf=False,
+                        replacements,
+                        replace_ttf,
+                        replace_sdf,
                         use_game_mat=args.use_game_mat,
                         generator=generator,
-                        replacement_lookup=file_ttf_lookup,
+                        replacement_lookup=replacement_lookup,
                         lang=lang,
                     ):
                         file_modified = True
-
-                if replace_sdf:
-                    for key, value in file_sdf_replacements.items():
-                        single_sdf = {key: value}
-                        single_sdf_lookup, _ = build_replacement_lookup(single_sdf)
-                        if replace_fonts_in_file(
-                            unity_version,
-                            game_path,
-                            assets_file,
-                            single_sdf,
-                            replace_ttf=False,
-                            replace_sdf=True,
-                            use_game_mat=args.use_game_mat,
-                            generator=generator,
-                            replacement_lookup=single_sdf_lookup,
-                            lang=lang,
-                        ):
-                            file_modified = True
-            else:
-                if replace_fonts_in_file(
-                    unity_version,
-                    game_path,
-                    assets_file,
-                    replacements,
-                    replace_ttf,
-                    replace_sdf,
-                    use_game_mat=args.use_game_mat,
-                    generator=generator,
-                    replacement_lookup=replacement_lookup,
-                    lang=lang,
-                ):
-                    file_modified = True
+                except Exception as e:
+                    if is_ko:
+                        print(f"  파일 처리 실패 [{type(e).__name__}]: {e!r}")
+                    else:
+                        print(f"  File processing failed [{type(e).__name__}]: {e!r}")
 
             if file_modified:
                 modified_count += 1

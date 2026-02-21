@@ -36,7 +36,8 @@ if not exist "%VENV_PY%" (
 echo [build] Using venv python: %VENV_PY%
 
 "%VENV_PY%" -m pip install --upgrade pip
-"%VENV_PY%" -m pip install pyinstaller UnityPy TypeTreeGeneratorAPI Pillow fmod_toolkit archspec
+"%VENV_PY%" -m pip install pyinstaller TypeTreeGeneratorAPI Pillow fmod_toolkit archspec
+"%VENV_PY%" -m pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
 "%VENV_PY%" -c "import UnityPy,sys; print(sys.version); print(UnityPy.__file__)"
 
 if exist build rmdir /s /q build

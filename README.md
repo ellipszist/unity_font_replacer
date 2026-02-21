@@ -53,6 +53,7 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--ttfonly` | TTF 폰트만 교체 |
 | `--list <JSON파일>` | JSON 파일 기준 개별 폰트 교체 |
 | `--use-game-mat` | SDF 교체 시 게임 원본 Material 파라미터 유지 |
+| `--split-save` | 대형 SDF 다건 교체에서 저장 실패 시 1개씩 분할 저장 폴백 사용 |
 
 ### 사용 예시
 
@@ -68,6 +69,9 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
 
 :: SDF 교체 + 게임 원본 Material 파라미터 유지
 unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-mat
+
+:: 저장 실패 시 분할 저장 폴백 활성화
+unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --split-save
 
 :: JSON 기반 개별 교체
 unity_font_replacer.exe --gamepath "D:\Games\Muck" --list Muck.json
@@ -152,10 +156,11 @@ EXE 대신 Python 소스로 실행하려면:
 ### 요구 사항
 
 - Python 3.12 권장
-- 패키지: `UnityPy`, `TypeTreeGeneratorAPI`, `Pillow`
+- 패키지: `UnityPy(포크)`, `TypeTreeGeneratorAPI`, `Pillow`
 
 ```bash
-pip install UnityPy TypeTreeGeneratorAPI Pillow
+pip install TypeTreeGeneratorAPI Pillow
+pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
 ```
 
 ### 실행 예시
@@ -168,6 +173,7 @@ python export_fonts.py "D:\MyGame"
 ## 주의 사항
 
 - 저장 시 원본 압축 방식 유지를 시도하며, 실패 시 `lz4 -> safe-none` 순으로 폴백합니다.
+- `--split-save`를 주면 대형 SDF 다건 교체에서 one-shot 저장 실패 시 1개씩 분할 저장으로 폴백합니다(기본 비활성).
 - SDF 교체 시 기본은 `KR_ASSETS/* SDF Material.json`의 머티리얼 float를 적용합니다.
   원본 게임 머티리얼 스타일을 유지하려면 `--use-game-mat`을 사용하세요.
 - TMP(FontAsset) 파싱/교체를 위해 `TypeTreeGeneratorAPI`가 필요합니다.

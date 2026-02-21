@@ -55,6 +55,7 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--ttfonly` | Replace TTF fonts only |
 | `--list <JSON>` | Replace fonts from a JSON mapping |
 | `--use-game-mat` | Keep original in-game Material parameters for SDF replacement |
+| `--split-save` | On save failure in large multi-SDF replacements, fall back to one-by-one split save |
 
 ### Examples
 
@@ -70,6 +71,9 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
 
 :: Replace SDF and keep original in-game material parameters
 unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-mat
+
+:: Enable split-save fallback on save failure
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --split-save
 
 :: Replace using JSON mapping
 unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --list Muck.json
@@ -155,10 +159,11 @@ If you prefer Python scripts instead of EXEs:
 ### Requirements
 
 - Python 3.12 recommended
-- Packages: `UnityPy`, `TypeTreeGeneratorAPI`, `Pillow`
+- Packages: `UnityPy (fork)`, `TypeTreeGeneratorAPI`, `Pillow`
 
 ```bash
-pip install UnityPy TypeTreeGeneratorAPI Pillow
+pip install TypeTreeGeneratorAPI Pillow
+pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
 ```
 
 ### Examples
@@ -171,6 +176,7 @@ python export_fonts_en.py "D:\MyGame"
 ## Notes
 
 - Save tries to preserve original compression; fallback order is `lz4 -> safe-none`.
+- `--split-save` enables one-by-one split-save fallback when one-shot save fails in large multi-SDF replacements (disabled by default).
 - For SDF replacement, default behavior applies material floats from `KR_ASSETS/* SDF Material.json`.
   Use `--use-game-mat` to preserve original in-game material style.
 - `TypeTreeGeneratorAPI` is required for TMP(FontAsset) parsing/replacement.
