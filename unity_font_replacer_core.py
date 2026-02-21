@@ -200,6 +200,21 @@ def get_script_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def parse_target_files_arg(target_file_args: list[str] | None) -> set[str]:
+    """KR: --target-file 인자(반복/콤마 구분)를 파일명 집합으로 정규화합니다.
+    EN: Normalize --target-file args (repeatable/comma-separated) into a basename set.
+    """
+    selected_files: set[str] = set()
+    if not target_file_args:
+        return selected_files
+    for entry in target_file_args:
+        for token in str(entry).split(","):
+            name = os.path.basename(token.strip())
+            if name:
+                selected_files.add(name)
+    return selected_files
+
+
 def register_temp_dir_for_cleanup(path: str) -> str:
     """KR: 종료 시 삭제할 임시 디렉터리를 등록하고 정규화 경로를 반환합니다.
     EN: Register a temp directory for cleanup at exit and return normalized path.
@@ -225,6 +240,43 @@ def cleanup_registered_temp_dirs() -> None:
 
 
 atexit.register(cleanup_registered_temp_dirs)
+
+
+def _close_unitypy_reader(obj: Any) -> None:
+    """KR: UnityPy 내부 reader/object를 안전하게 dispose합니다.
+    EN: Safely dispose UnityPy internal reader/object resources.
+    """
+    if obj is None:
+        return
+    reader = getattr(obj, "reader", None)
+    if reader is not None and hasattr(reader, "dispose"):
+        try:
+            reader.dispose()
+        except Exception:
+            pass
+    if hasattr(obj, "dispose"):
+        try:
+            obj.dispose()
+        except Exception:
+            pass
+
+
+def close_unitypy_env(environment: Any) -> None:
+    """KR: Environment에 연결된 UnityPy 파일 리소스를 순회 종료합니다.
+    EN: Walk and close UnityPy file resources attached to environment.
+    """
+    if environment is None:
+        return
+    stack: list[Any] = []
+    files = getattr(environment, "files", None)
+    if isinstance(files, dict):
+        stack.extend(files.values())
+    while stack:
+        item = stack.pop()
+        _close_unitypy_reader(item)
+        sub_files = getattr(item, "files", None)
+        if isinstance(sub_files, dict):
+            stack.extend(sub_files.values())
 
 
 def normalize_font_name(name: str) -> str:
@@ -641,18 +693,28 @@ def normalize_sdf_data(data: JsonDict) -> JsonDict:
     return result
 
 
-def find_assets_files(game_path: str, lang: Language = "ko") -> list[str]:
+def find_assets_files(
+    game_path: str,
+    lang: Language = "ko",
+    target_files: set[str] | None = None,
+) -> list[str]:
     """KR: 게임에서 처리 대상 에셋 파일 목록을 수집합니다.
+    KR: target_files가 있으면 해당 파일명으로 스캔 대상을 제한합니다.
     EN: Collect candidate asset files from the game.
+    EN: If target_files is provided, limit candidates to those basenames.
     """
     data_path = get_data_path(game_path, lang=lang)
     assets_files: list[str] = []
+    normalized_targets = {os.path.basename(name) for name in target_files} if target_files else None
     exclude_exts = {".dll", ".manifest", ".exe", ".txt", ".json", ".xml", ".log", ".ini", ".cfg", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".wav", ".mp3", ".ogg", ".mp4", ".avi", ".mov"}
     for root, _, files in os.walk(data_path):
         for fn in files:
+            if normalized_targets is not None and fn not in normalized_targets:
+                continue
             ext = os.path.splitext(fn)[1].lower()
             if ext not in exclude_exts:
                 assets_files.append(os.path.join(root, fn))
+    assets_files.sort()
     return assets_files
 
 def get_compile_method(datapath: str) -> str:
@@ -700,13 +762,19 @@ def _create_generator(
     return generator
 
 
-def scan_fonts(game_path: str, lang: Language = "ko") -> dict[str, list[JsonDict]]:
+def scan_fonts(
+    game_path: str,
+    lang: Language = "ko",
+    target_files: set[str] | None = None,
+) -> dict[str, list[JsonDict]]:
     """KR: 게임 에셋을 스캔해 TTF/SDF 폰트 목록을 반환합니다.
+    KR: target_files가 있으면 해당 파일만 스캔합니다.
     EN: Scan game assets and return TTF/SDF font entries.
+    EN: If target_files is provided, only scan those files.
     """
     data_path = get_data_path(game_path, lang=lang)
     unity_version = get_unity_version(game_path, lang=lang)
-    assets_files = find_assets_files(game_path, lang=lang)
+    assets_files = find_assets_files(game_path, lang=lang, target_files=target_files)
     compile_method = get_compile_method(data_path)
     generator = _create_generator(unity_version, game_path, data_path, compile_method, lang=lang)
 
@@ -715,7 +783,26 @@ def scan_fonts(game_path: str, lang: Language = "ko") -> dict[str, list[JsonDict
         "sdf": [],
     }
 
-    for assets_file in assets_files:
+    total_files = len(assets_files)
+    if lang == "ko":
+        if target_files:
+            print(f"[scan_fonts] --target-file 기준 스캔 시작: {total_files}개 파일")
+        else:
+            print(f"[scan_fonts] 전체 스캔 시작: {total_files}개 파일")
+    else:
+        if target_files:
+            print(f"[scan_fonts] Starting target-file scan: {total_files} file(s)")
+        else:
+            print(f"[scan_fonts] Starting full scan: {total_files} file(s)")
+
+    for idx, assets_file in enumerate(assets_files, start=1):
+        fn = os.path.basename(assets_file)
+        if lang == "ko":
+            print(f"[scan_fonts] 진행 {idx}/{total_files}: {fn}")
+        else:
+            print(f"[scan_fonts] Progress {idx}/{total_files}: {fn}")
+
+        env = None
         try:
             env = UnityPy.load(assets_file)
             env.typetree_generator = generator
@@ -727,89 +814,100 @@ def scan_fonts(game_path: str, lang: Language = "ko") -> dict[str, list[JsonDict
                 print(f"[scan_fonts] UnityPy.load failed: {assets_file} ({e})")
             continue
 
-        for obj in env.objects:
-            try:
-                if obj.type.name == "Font":
-                    font = obj.parse_as_object()
-                    fonts["ttf"].append({
-                        "file": os.path.basename(assets_file),
-                        "assets_name": obj.assets_file.name,
-                        "name": font.m_Name,
-                        "path_id": obj.path_id
-                    })
-                elif obj.type.name == "MonoBehaviour":
-                    parse_dict = None
-                    is_font = False
-                    try:
-                        parse_obj = obj.parse_as_object()
-                        if hasattr(parse_obj, 'get_type') and parse_obj.get_type() == "TMP_FontAsset":
-                            is_font = True
-                    except Exception:
-                        if lang == "ko":
-                            debug_parse_log(f"[scan_fonts] parse_as_object 실패: {os.path.basename(assets_file)} | PathID {obj.path_id}")
-                        else:
-                            debug_parse_log(f"[scan_fonts] parse_as_object failed: {os.path.basename(assets_file)} | PathID {obj.path_id}")
-                    if not is_font:
+        try:
+            for obj in env.objects:
+                try:
+                    if obj.type.name == "Font":
+                        font = obj.parse_as_object()
+                        fonts["ttf"].append({
+                            "file": fn,
+                            "assets_name": obj.assets_file.name,
+                            "name": font.m_Name,
+                            "path_id": obj.path_id
+                        })
+                    elif obj.type.name == "MonoBehaviour":
+                        parse_dict = None
+                        is_font = False
                         try:
-                            parse_dict = obj.parse_as_dict()
-                            # KR: TMP 스키마 판별: 신형(m_FaceInfo/m_AtlasTextures) 또는 구형(m_fontInfo/atlas)
-                            # EN: Detect TMP schema: new(m_FaceInfo/m_AtlasTextures) or old(m_fontInfo/atlas)
-                            if ("m_AtlasTextures" in parse_dict and "m_FaceInfo" in parse_dict) or \
-                               ("atlas" in parse_dict and "m_fontInfo" in parse_dict):
+                            parse_obj = obj.parse_as_object()
+                            if hasattr(parse_obj, 'get_type') and parse_obj.get_type() == "TMP_FontAsset":
                                 is_font = True
                         except Exception:
                             if lang == "ko":
-                                debug_parse_log(f"[scan_fonts] parse_as_dict 실패: {os.path.basename(assets_file)} | PathID {obj.path_id}")
+                                debug_parse_log(f"[scan_fonts] parse_as_object 실패: {fn} | PathID {obj.path_id}")
                             else:
-                                debug_parse_log(f"[scan_fonts] parse_as_dict failed: {os.path.basename(assets_file)} | PathID {obj.path_id}")
-                    if is_font:
-                        try:
-                            if parse_dict is None:
+                                debug_parse_log(f"[scan_fonts] parse_as_object failed: {fn} | PathID {obj.path_id}")
+                        if not is_font:
+                            try:
                                 parse_dict = obj.parse_as_dict()
-                            # KR: 신형/구형 TMP 모두에서 유효 글리프를 확인합니다.
-                            # EN: Validate effective glyph presence across new/old TMP schemas.
-                            atlas_textures = parse_dict.get("m_AtlasTextures", [])
-                            glyph_count = len(parse_dict.get("m_GlyphTable", []))
-                            if not atlas_textures and "atlas" in parse_dict:
-                                atlas_textures = []
-                            if glyph_count == 0:
-                                glyph_count = len(parse_dict.get("m_glyphInfoList", []))
-                            if atlas_textures:
-                                first_atlas = atlas_textures[0]
-                                file_id = first_atlas.get("m_FileID", 0)
-                                path_id = first_atlas.get("m_PathID", 0)
-                                # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 교체 대상이 아닙니다.
-                                # EN: External stubs (FileID!=0, PathID=0) are not valid replacement targets.
-                                if file_id != 0 and path_id == 0:
+                                # KR: TMP 스키마 판별: 신형(m_FaceInfo/m_AtlasTextures) 또는 구형(m_fontInfo/atlas)
+                                # EN: Detect TMP schema: new(m_FaceInfo/m_AtlasTextures) or old(m_fontInfo/atlas)
+                                if ("m_AtlasTextures" in parse_dict and "m_FaceInfo" in parse_dict) or \
+                                   ("atlas" in parse_dict and "m_fontInfo" in parse_dict):
+                                    is_font = True
+                            except Exception:
+                                if lang == "ko":
+                                    debug_parse_log(f"[scan_fonts] parse_as_dict 실패: {fn} | PathID {obj.path_id}")
+                                else:
+                                    debug_parse_log(f"[scan_fonts] parse_as_dict failed: {fn} | PathID {obj.path_id}")
+                        if is_font:
+                            try:
+                                if parse_dict is None:
+                                    parse_dict = obj.parse_as_dict()
+                                # KR: 신형/구형 TMP 모두에서 유효 글리프를 확인합니다.
+                                # EN: Validate effective glyph presence across new/old TMP schemas.
+                                atlas_textures = parse_dict.get("m_AtlasTextures", [])
+                                glyph_count = len(parse_dict.get("m_GlyphTable", []))
+                                if not atlas_textures and "atlas" in parse_dict:
+                                    atlas_textures = []
+                                if glyph_count == 0:
+                                    glyph_count = len(parse_dict.get("m_glyphInfoList", []))
+                                if atlas_textures:
+                                    first_atlas = atlas_textures[0]
+                                    file_id = first_atlas.get("m_FileID", 0)
+                                    path_id = first_atlas.get("m_PathID", 0)
+                                    # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 교체 대상이 아닙니다.
+                                    # EN: External stubs (FileID!=0, PathID=0) are not valid replacement targets.
+                                    if file_id != 0 and path_id == 0:
+                                        continue
+                                if glyph_count == 0:
                                     continue
-                            if glyph_count == 0:
-                                continue
-                        except Exception:
-                            if lang == "ko":
-                                debug_parse_log(f"[scan_fonts] SDF 필드 검사 실패: {os.path.basename(assets_file)} | PathID {obj.path_id}")
-                            else:
-                                debug_parse_log(f"[scan_fonts] SDF field check failed: {os.path.basename(assets_file)} | PathID {obj.path_id}")
-                        fonts["sdf"].append({
-                            "file": os.path.basename(assets_file),
-                            "assets_name": obj.assets_file.name,
-                            "name": obj.peek_name(),
-                            "path_id": obj.path_id
-                        })
-            except Exception as e:
-                if lang == "ko":
-                    print(f"[scan_fonts] 오브젝트 처리 실패: {os.path.basename(assets_file)} | PathID {obj.path_id} ({e})")
-                else:
-                    print(f"[scan_fonts] Object processing failed: {os.path.basename(assets_file)} | PathID {obj.path_id} ({e})")
-                continue
+                            except Exception:
+                                if lang == "ko":
+                                    debug_parse_log(f"[scan_fonts] SDF 필드 검사 실패: {fn} | PathID {obj.path_id}")
+                                else:
+                                    debug_parse_log(f"[scan_fonts] SDF field check failed: {fn} | PathID {obj.path_id}")
+                            fonts["sdf"].append({
+                                "file": fn,
+                                "assets_name": obj.assets_file.name,
+                                "name": obj.peek_name(),
+                                "path_id": obj.path_id
+                            })
+                except Exception as e:
+                    if lang == "ko":
+                        print(f"[scan_fonts] 오브젝트 처리 실패: {fn} | PathID {obj.path_id} ({e})")
+                    else:
+                        print(f"[scan_fonts] Object processing failed: {fn} | PathID {obj.path_id} ({e})")
+                    continue
+        finally:
+            close_unitypy_env(env)
+            env = None
+            gc.collect()
 
     return fonts
 
 
-def parse_fonts(game_path: str, lang: Language = "ko") -> str:
+def parse_fonts(
+    game_path: str,
+    lang: Language = "ko",
+    target_files: set[str] | None = None,
+) -> str:
     """KR: 스캔한 폰트를 JSON으로 저장하고 결과 파일 경로를 반환합니다.
+    KR: target_files가 있으면 해당 파일만 파싱합니다.
     EN: Save scanned fonts to JSON and return output file path.
+    EN: If target_files is provided, parse only those files.
     """
-    fonts = scan_fonts(game_path, lang=lang)
+    fonts = scan_fonts(game_path, lang=lang, target_files=target_files)
     game_name = os.path.basename(game_path)
     output_file = os.path.join(get_script_dir(), f"{game_name}.json")
 
@@ -1772,12 +1870,15 @@ def create_batch_replacements(
     font_name: str,
     replace_ttf: bool = True,
     replace_sdf: bool = True,
+    target_files: set[str] | None = None,
     lang: Language = "ko",
 ) -> dict[str, JsonDict]:
     """KR: 게임 내 모든 폰트를 지정 폰트로 치환하는 배치 매핑을 생성합니다.
+    KR: target_files가 있으면 해당 파일만 대상으로 매핑을 생성합니다.
     EN: Create batch replacement mapping for all fonts in a game.
+    EN: If target_files is provided, build mapping only for those files.
     """
-    fonts = scan_fonts(game_path, lang=lang)
+    fonts = scan_fonts(game_path, lang=lang, target_files=target_files)
     replacements: dict[str, JsonDict] = {}
 
     if replace_ttf:
@@ -1960,6 +2061,12 @@ Examples:
     args.use_game_line_metrics = bool(
         getattr(args, "use_game_line_metrics", False) or getattr(args, "use_game_line_matrics", False)
     )
+    selected_files = parse_target_files_arg(getattr(args, "target_file", None))
+    if args.target_file and not selected_files:
+        if is_ko:
+            exit_with_error("--target-file 값이 비어 있습니다.", lang=lang)
+        else:
+            exit_with_error("--target-file values are empty.", lang=lang)
 
     if args.split_save_force and args.oneshot_save_force:
         if is_ko:
@@ -2065,6 +2172,13 @@ Examples:
             print(f"Compile method: {compile_method}")
     except FileNotFoundError as e:
         exit_with_error(str(e), lang=lang)
+
+    if selected_files:
+        target_text = ", ".join(sorted(selected_files))
+        if is_ko:
+            print(f"--target-file 적용: {target_text}")
+        else:
+            print(f"Applied --target-file: {target_text}")
 
     default_temp_root = register_temp_dir_for_cleanup(os.path.join(data_path, "temp"))
     if os.path.exists(default_temp_root):
@@ -2190,7 +2304,7 @@ Examples:
                 exit_with_error(f"Exception while running Il2CppDumper: {e}", lang=lang)
 
     if mode == "parse":
-        parse_fonts(game_path, lang=lang)
+        parse_fonts(game_path, lang=lang, target_files=selected_files if selected_files else None)
         if is_ko:
             input("\n엔터를 눌러 종료...")
         else:
@@ -2202,7 +2316,14 @@ Examples:
             print("Mulmaru 폰트로 일괄 교체합니다...")
         else:
             print("Bulk replacing with Mulmaru...")
-        replacements = create_batch_replacements(game_path, "Mulmaru", replace_ttf, replace_sdf, lang=lang)
+        replacements = create_batch_replacements(
+            game_path,
+            "Mulmaru",
+            replace_ttf,
+            replace_sdf,
+            target_files=selected_files if selected_files else None,
+            lang=lang,
+        )
         ttf_count = sum(1 for v in replacements.values() if v["Type"] == "TTF")
         sdf_count = sum(1 for v in replacements.values() if v["Type"] == "SDF")
         if is_ko:
@@ -2214,7 +2335,14 @@ Examples:
             print("NanumGothic 폰트로 일괄 교체합니다...")
         else:
             print("Bulk replacing with NanumGothic...")
-        replacements = create_batch_replacements(game_path, "NanumGothic", replace_ttf, replace_sdf, lang=lang)
+        replacements = create_batch_replacements(
+            game_path,
+            "NanumGothic",
+            replace_ttf,
+            replace_sdf,
+            target_files=selected_files if selected_files else None,
+            lang=lang,
+        )
         ttf_count = sum(1 for v in replacements.values() if v["Type"] == "TTF")
         sdf_count = sum(1 for v in replacements.values() if v["Type"] == "SDF")
         if is_ko:
@@ -2247,20 +2375,7 @@ Examples:
         else:
             exit_with_error("Replacement mapping was not generated.", lang=lang)
 
-    if args.target_file:
-        selected_files: set[str] = set()
-        for entry in args.target_file:
-            for token in str(entry).split(","):
-                name = os.path.basename(token.strip())
-                if name:
-                    selected_files.add(name)
-
-        if not selected_files:
-            if is_ko:
-                exit_with_error("--target-file 값이 비어 있습니다.", lang=lang)
-            else:
-                exit_with_error("--target-file values are empty.", lang=lang)
-
+    if selected_files:
         replacements = {
             key: value
             for key, value in replacements.items()
@@ -2275,16 +2390,14 @@ Examples:
             else:
                 exit_with_error(f"No replacement targets matched --target-file: {target_text}", lang=lang)
 
-        target_text = ", ".join(sorted(selected_files))
-        if is_ko:
-            print(f"--target-file 적용: {target_text}")
-        else:
-            print(f"Applied --target-file: {target_text}")
-
     unity_version = get_unity_version(game_path, lang=lang)
-    assets_files = find_assets_files(game_path, lang=lang)
     generator = _create_generator(unity_version, game_path, data_path, compile_method, lang=lang)
     replacement_lookup, files_to_process = build_replacement_lookup(replacements)
+    assets_files = find_assets_files(
+        game_path,
+        lang=lang,
+        target_files=files_to_process if files_to_process else None,
+    )
 
     modified_count = 0
     for assets_file in assets_files:
