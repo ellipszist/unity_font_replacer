@@ -57,7 +57,7 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--use-game-line-metrics` | SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용, pointSize는 교체값 유지) |
 | `--original-compress` | 저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선) |
 | `--temp-dir <경로>` | 임시 저장 폴더 루트 경로 지정 (빠른 SSD/NVMe 권장) |
-| `--split-save-force` | 대형 SDF 다건 교체에서 one-shot을 건너뛰고 즉시 적응형 분할 저장 시작 |
+| `--split-save-force` | 대형 SDF 다건 교체에서 one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장 |
 | `--oneshot-save-force` | 대형 SDF 다건 교체에서도 분할 저장 폴백 없이 one-shot만 시도 |
 
 ### 사용 예시
@@ -87,7 +87,7 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --original-comp
 :: 임시 저장 폴더를 빠른 SSD/NVMe 경로로 지정
 unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --temp-dir "E:\UFR_TEMP"
 
-:: one-shot 건너뛰고 즉시 분할 저장
+:: one-shot 건너뛰고 SDF 1개씩 강제 분할 저장
 unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --split-save-force
 
 :: 분할 저장 폴백 없이 one-shot만 강제
@@ -197,7 +197,7 @@ python export_fonts.py "D:\MyGame"
 - 저장 속도가 느리면 `--temp-dir`로 임시 저장 폴더를 빠른 SSD/NVMe 경로로 지정해 보세요.
 - 프로그램 종료 시 임시 폴더는 자동 정리됩니다.
 - 대형 SDF 다건 교체에서는 기본적으로 one-shot 실패 시 적응형 분할 저장(배치 크기 자동 조절)으로 폴백합니다.
-  - `--split-save-force`: one-shot을 건너뛰고 즉시 분할 저장
+  - `--split-save-force`: one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장
   - `--oneshot-save-force`: 분할 저장 폴백 비활성화(one-shot만 시도)
 - 파일 단위로 제한하려면 `--target-file`을 사용하세요.
 - 기본 줄 간격 메트릭 모드는 게임 원본 비율을 기준으로 교체 폰트 pointSize에 맞게 보정 적용합니다.

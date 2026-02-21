@@ -59,7 +59,7 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--use-game-line-metrics` | Keep in-game line metrics (LineHeight/Ascender/Descender, etc.) for SDF replacement (pointSize still follows replacement font) |
 | `--original-compress` | Prefer original compression mode on save (default: uncompressed-family first) |
 | `--temp-dir <path>` | Set root path for temporary save files (fast SSD/NVMe recommended) |
-| `--split-save-force` | Skip one-shot and start adaptive split save immediately for large multi-SDF replacements |
+| `--split-save-force` | Skip one-shot and force one-by-one SDF split save for large multi-SDF replacements |
 | `--oneshot-save-force` | Force one-shot only (disable split-save fallback) even for large multi-SDF replacements |
 
 ### Examples
@@ -89,7 +89,7 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --original-c
 :: Use a fast SSD/NVMe path for temporary save files
 unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --temp-dir "E:\UFR_TEMP"
 
-:: Skip one-shot and start split-save immediately
+:: Skip one-shot and force one-by-one SDF split-save
 unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --split-save-force
 
 :: Disable split-save fallback and force one-shot only
@@ -199,7 +199,7 @@ python export_fonts_en.py "D:\MyGame"
 - Use `--original-compress` to prefer original compression mode first.
 - If save is slow, try `--temp-dir` and point it to a fast SSD/NVMe path.
 - For large multi-SDF replacements, split-save fallback is enabled by default when one-shot fails (adaptive batch size).
-  - `--split-save-force`: skip one-shot and start split-save immediately.
+  - `--split-save-force`: skip one-shot and force one-by-one SDF split-save.
   - `--oneshot-save-force`: disable split-save fallback and try one-shot only.
 - Use `--target-file` to restrict replacements to specific files.
 - If line spacing looks too tight or overlapping, try `--use-game-line-metrics`.

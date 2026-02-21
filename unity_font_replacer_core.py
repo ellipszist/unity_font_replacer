@@ -648,13 +648,15 @@ def convert_glyphs_old_to_new(glyph_info_list: list[JsonDict]) -> tuple[list[Jso
     return glyph_table, char_table
 
 
-def normalize_sdf_data(data: JsonDict) -> JsonDict:
+def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
     """KR: SDF 교체 데이터를 신형 TMP 형식으로 정규화해 반환합니다.
+    KR: deep_copy=True면 입력 데이터를 복사해 원본 변형을 방지합니다.
     EN: Normalize SDF replacement data into the new TMP schema.
+    EN: With deep_copy=True, clone input data to avoid mutating the original.
     """
     import copy
 
-    result: JsonDict = copy.deepcopy(data)
+    result: JsonDict = copy.deepcopy(data) if deep_copy else data
     version = detect_tmp_version(result)
 
     if version == "old":
@@ -689,6 +691,70 @@ def normalize_sdf_data(data: JsonDict) -> JsonDict:
         if "m_FontWeightTable" not in result:
             font_weights = result.get("fontWeights", [])
             result["m_FontWeightTable"] = font_weights if font_weights else []
+
+    # KR: 정규화 후 반복 사용을 위해 숫자 타입/기본값을 한 번만 정리합니다.
+    # EN: Canonicalize numeric fields/defaults once for repeated reuse.
+    try:
+        result["m_AtlasWidth"] = int(result.get("m_AtlasWidth", 0) or 0)
+        result["m_AtlasHeight"] = int(result.get("m_AtlasHeight", 0) or 0)
+        result["m_AtlasPadding"] = int(result.get("m_AtlasPadding", 0) or 0)
+    except Exception:
+        pass
+    result.setdefault("m_AtlasRenderMode", 4118)
+    result.setdefault("m_UsedGlyphRects", [])
+    result.setdefault("m_FreeGlyphRects", [])
+    result.setdefault("m_FontWeightTable", [])
+
+    face_info = result.get("m_FaceInfo")
+    if isinstance(face_info, dict):
+        ensure_int(face_info, ["m_PointSize", "m_AtlasWidth", "m_AtlasHeight"])
+
+    # KR: Atlas 참조 목록은 공유 변형을 피하기 위해 독립 딕셔너리로 재구성합니다.
+    # EN: Rebuild atlas references as standalone dicts to avoid shared mutations.
+    atlas_textures_raw = result.get("m_AtlasTextures", [])
+    atlas_textures: list[JsonDict] = []
+    if isinstance(atlas_textures_raw, list):
+        for tex in atlas_textures_raw:
+            if isinstance(tex, dict):
+                atlas_textures.append({
+                    "m_FileID": int(tex.get("m_FileID", 0) or 0),
+                    "m_PathID": int(tex.get("m_PathID", 0) or 0),
+                })
+    if not atlas_textures and isinstance(result.get("atlas"), dict):
+        atlas_ref = cast(JsonDict, result.get("atlas"))
+        atlas_textures.append({
+            "m_FileID": int(atlas_ref.get("m_FileID", 0) or 0),
+            "m_PathID": int(atlas_ref.get("m_PathID", 0) or 0),
+        })
+    result["m_AtlasTextures"] = atlas_textures
+
+    glyph_table = result.get("m_GlyphTable")
+    if isinstance(glyph_table, list):
+        for glyph in glyph_table:
+            if not isinstance(glyph, dict):
+                continue
+            ensure_int(glyph, ["m_Index", "m_AtlasIndex", "m_ClassDefinitionType"])
+            glyph["m_ClassDefinitionType"] = 0
+            rect = glyph.get("m_GlyphRect")
+            if isinstance(rect, dict):
+                ensure_int(rect, ["m_X", "m_Y", "m_Width", "m_Height"])
+
+    char_table = result.get("m_CharacterTable")
+    if isinstance(char_table, list):
+        for char in char_table:
+            if isinstance(char, dict):
+                ensure_int(char, ["m_Unicode", "m_GlyphIndex", "m_ElementType"])
+
+    for rect_list_name in ["m_UsedGlyphRects", "m_FreeGlyphRects"]:
+        rect_list = result.get(rect_list_name)
+        if isinstance(rect_list, list):
+            for rect in rect_list:
+                if isinstance(rect, dict):
+                    ensure_int(rect, ["m_X", "m_Y", "m_Width", "m_Height"])
+
+    creation_settings = result.get("m_CreationSettings")
+    if isinstance(creation_settings, dict):
+        ensure_int(creation_settings, ["pointSize", "atlasWidth", "atlasHeight", "padding"])
 
     return result
 
@@ -964,9 +1030,12 @@ def _load_font_assets_cached(script_dir: str, normalized: str) -> JsonDict:
 
     sdf_json_path = os.path.join(kr_assets, f"{normalized} SDF.json")
     sdf_data = None
+    sdf_data_normalized = None
     if os.path.exists(sdf_json_path):
         with open(sdf_json_path, "r", encoding="utf-8") as f:
             sdf_data = json.load(f)
+        if isinstance(sdf_data, dict):
+            sdf_data_normalized = normalize_sdf_data(sdf_data, deep_copy=True)
 
     sdf_atlas_path = os.path.join(kr_assets, f"{normalized} SDF Atlas.png")
     sdf_atlas = None
@@ -984,6 +1053,7 @@ def _load_font_assets_cached(script_dir: str, normalized: str) -> JsonDict:
     return {
         "ttf_data": ttf_data,
         "sdf_data": sdf_data,
+        "sdf_data_normalized": sdf_data_normalized,
         "sdf_atlas": sdf_atlas,
         "sdf_materials": sdf_material_data
     }
@@ -999,6 +1069,7 @@ def load_font_assets(font_name: str) -> JsonDict:
     return {
         "ttf_data": cached_assets["ttf_data"],
         "sdf_data": cached_assets["sdf_data"],
+        "sdf_data_normalized": cached_assets.get("sdf_data_normalized"),
         # Reuse cached atlas object to avoid per-replacement image duplication.
         "sdf_atlas": atlas,
         "sdf_materials": cached_assets["sdf_materials"],
@@ -1308,7 +1379,9 @@ def replace_fonts_in_file(
 
                         # KR: 입력 JSON이 신형/구형이어도 내부 교체는 신형 TMP 스키마로 통일합니다.
                         # EN: Normalize replacement JSON to the new TMP schema regardless of input format.
-                        replace_data = normalize_sdf_data(assets["sdf_data"])
+                        replace_data = assets.get("sdf_data_normalized")
+                        if not isinstance(replace_data, dict):
+                            replace_data = normalize_sdf_data(assets["sdf_data"])
                         game_padding_for_material = 0.0
 
                         # KR: GameObject/Script/Material/Atlas 참조는 기존 PathID를 유지해야 런타임 연결이 깨지지 않습니다.
@@ -1419,13 +1492,8 @@ def replace_fonts_in_file(
                             except Exception:
                                 game_padding_for_material = 0.0
 
-                            if "m_GlyphTable" in replace_data and isinstance(replace_data["m_GlyphTable"], list):
-                                for glyph in replace_data["m_GlyphTable"]:
-                                    glyph["m_ClassDefinitionType"] = 0
-
-                            target_face_info = replace_data["m_FaceInfo"]
+                            target_face_info = dict(replace_data["m_FaceInfo"])
                             if isinstance(game_face_info, dict):
-                                target_face_info = dict(target_face_info)
                                 if use_game_line_metrics:
                                     metric_scale = 1.0
                                 else:
@@ -1442,10 +1510,24 @@ def replace_fonts_in_file(
                                             except Exception:
                                                 pass
                                         target_face_info[metric_key] = metric_value
+                            ensure_int(target_face_info, ["m_PointSize", "m_AtlasWidth", "m_AtlasHeight"])
                             parse_dict["m_FaceInfo"] = target_face_info
                             parse_dict["m_GlyphTable"] = replace_data["m_GlyphTable"]
                             parse_dict["m_CharacterTable"] = replace_data["m_CharacterTable"]
-                            parse_dict["m_AtlasTextures"] = replace_data["m_AtlasTextures"]
+                            atlas_textures = replace_data.get("m_AtlasTextures", [])
+                            if isinstance(atlas_textures, list):
+                                parse_dict["m_AtlasTextures"] = [
+                                    {
+                                        "m_FileID": int(tex.get("m_FileID", 0) or 0),
+                                        "m_PathID": int(tex.get("m_PathID", 0) or 0),
+                                    }
+                                    for tex in atlas_textures
+                                    if isinstance(tex, dict)
+                                ]
+                            else:
+                                parse_dict["m_AtlasTextures"] = []
+                            if not parse_dict["m_AtlasTextures"]:
+                                parse_dict["m_AtlasTextures"] = [{"m_FileID": 0, "m_PathID": 0}]
                             parse_dict["m_AtlasWidth"] = replace_data["m_AtlasWidth"]
                             parse_dict["m_AtlasHeight"] = replace_data["m_AtlasHeight"]
                             parse_dict["m_AtlasPadding"] = replace_data["m_AtlasPadding"]
@@ -1454,23 +1536,8 @@ def replace_fonts_in_file(
                             parse_dict["m_FreeGlyphRects"] = replace_data.get("m_FreeGlyphRects", [])
                             parse_dict["m_FontWeightTable"] = replace_data.get("m_FontWeightTable", [])
 
-                            ensure_int(parse_dict["m_FaceInfo"], ["m_PointSize", "m_AtlasWidth", "m_AtlasHeight"])
-
                             if "m_CreationSettings" in parse_dict:
                                 ensure_int(parse_dict["m_CreationSettings"], ["pointSize", "atlasWidth", "atlasHeight", "padding"])
-
-                            for glyph in parse_dict["m_GlyphTable"]:
-                                ensure_int(glyph, ["m_Index", "m_AtlasIndex", "m_ClassDefinitionType"])
-                                if "m_GlyphRect" in glyph:
-                                    ensure_int(glyph["m_GlyphRect"], ["m_X", "m_Y", "m_Width", "m_Height"])
-
-                            for char in parse_dict["m_CharacterTable"]:
-                                ensure_int(char, ["m_Unicode", "m_GlyphIndex", "m_ElementType"])
-
-                            for rect_list_name in ["m_UsedGlyphRects", "m_FreeGlyphRects"]:
-                                if rect_list_name in parse_dict:
-                                    for rect in parse_dict[rect_list_name]:
-                                        ensure_int(rect, ["m_X", "m_Y", "m_Width", "m_Height"])
 
                             # KR: 신형 TMP를 쓰더라도 legacy m_fontInfo가 남아 있으면 동기화해 런타임 차이를 줄입니다.
                             # EN: Keep legacy m_fontInfo in sync when present to reduce runtime schema differences.
@@ -1998,7 +2065,7 @@ def main_cli(lang: Language = "ko") -> None:
         game_line_metrics_help = "SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용)"
         original_compress_help = "저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선)"
         temp_dir_help = "임시 저장 폴더 루트 경로 (가능하면 빠른 SSD/NVMe 권장)"
-        split_save_force_help = "대형 SDF 다건 교체에서 one-shot을 건너뛰고 즉시 적응형 분할 저장 시작"
+        split_save_force_help = "대형 SDF 다건 교체에서 one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장"
         oneshot_save_force_help = "대형 SDF 다건 교체에서도 분할 저장 폴백 없이 one-shot 저장만 시도"
         verbose_help = "모든 로그를 verbose.txt 파일로 저장"
     else:
@@ -2022,7 +2089,7 @@ Examples:
         game_line_metrics_help = "Use original in-game line metrics for SDF replacement (default: adjusted replacement font metrics)"
         original_compress_help = "Prefer original compression mode on save (default: uncompressed-family first)"
         temp_dir_help = "Root path for temporary save files (fast SSD/NVMe recommended)"
-        split_save_force_help = "Skip one-shot and start adaptive split save immediately for large multi-SDF replacements"
+        split_save_force_help = "Skip one-shot and force one-by-one SDF split save for large multi-SDF replacements"
         oneshot_save_force_help = "Force one-shot save even for large multi-SDF targets (disable split-save fallback)"
         verbose_help = "Save all logs to verbose.txt"
 
@@ -2446,9 +2513,9 @@ Examples:
                 one_shot_ok = False
                 if args.split_save_force:
                     if is_ko:
-                        print("  --split-save-force 활성화: one-shot을 건너뛰고 즉시 분할 저장을 시작합니다...")
+                        print("  --split-save-force 활성화: one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장을 시작합니다...")
                     else:
-                        print("  --split-save-force enabled: skipping one-shot and starting split save immediately...")
+                        print("  --split-save-force enabled: skipping one-shot and forcing one-by-one SDF split save...")
                 else:
                     try:
                         one_shot_ok = replace_fonts_in_file(
@@ -2518,7 +2585,7 @@ Examples:
                         sdf_total = len(sdf_items)
                         if sdf_total > 0:
                             if args.split_save_force:
-                                batch_size = min(sdf_total, 16)
+                                batch_size = 1
                             else:
                                 batch_size = min(sdf_total, max(1, sdf_total // 2))
 
@@ -2556,13 +2623,19 @@ Examples:
                                     file_modified = True
                                     idx += current_batch
                                     if idx < sdf_total:
-                                        # KR: 성공하면 배치를 키워 쓰기 횟수를 줄입니다.
-                                        # EN: Grow batch size after success to reduce write count.
-                                        batch_size = min(sdf_total - idx, max(current_batch + 1, current_batch * 2))
-                                        if is_ko:
-                                            print(f"  SDF 배치 진행: {idx}/{sdf_total} (다음 배치: {batch_size})")
+                                        if args.split_save_force:
+                                            if is_ko:
+                                                print(f"  SDF 배치 진행: {idx}/{sdf_total} (다음 배치: 1, 강제)")
+                                            else:
+                                                print(f"  SDF batch progress: {idx}/{sdf_total} (next batch: 1, forced)")
                                         else:
-                                            print(f"  SDF batch progress: {idx}/{sdf_total} (next batch: {batch_size})")
+                                            # KR: 성공하면 배치를 키워 쓰기 횟수를 줄입니다.
+                                            # EN: Grow batch size after success to reduce write count.
+                                            batch_size = min(sdf_total - idx, max(current_batch + 1, current_batch * 2))
+                                            if is_ko:
+                                                print(f"  SDF 배치 진행: {idx}/{sdf_total} (다음 배치: {batch_size})")
+                                            else:
+                                                print(f"  SDF batch progress: {idx}/{sdf_total} (next batch: {batch_size})")
                                 else:
                                     if current_batch <= 1:
                                         split_stopped = True
