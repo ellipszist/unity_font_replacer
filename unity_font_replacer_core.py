@@ -20,7 +20,6 @@ from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
-SAVE_VALIDATION_MAX_BYTES = 512 * 1024 * 1024
 
 
 class TeeWriter:
@@ -1163,32 +1162,39 @@ def replace_fonts_in_file(
                 return typed_save()
             return typed_save(packer=packer)
 
-        def _validate_saved_file(saved_path: str, saved_size: int) -> bool:
+        def _validate_saved_file(saved_path: str) -> bool:
             """KR: 저장 결과 파일이 Unity bundle로 다시 열리는지 검증합니다.
             EN: Validate saved output by attempting to reload from file path.
             """
             signature = getattr(env.file, "signature", None)
             if signature not in {"UnityFS", "UnityWeb", "UnityRaw"}:
                 return True
-            if saved_size > SAVE_VALIDATION_MAX_BYTES:
-                if lang == "ko":
-                    print(
-                        f"  저장 검증 생략: 파일이 큼 ({saved_size} bytes > {SAVE_VALIDATION_MAX_BYTES} bytes)"
-                    )
-                else:
-                    print(
-                        f"  Skipping save validation: file is large ({saved_size} bytes > {SAVE_VALIDATION_MAX_BYTES} bytes)"
-                    )
-                return True
             try:
-                UnityPy.load(saved_path)
-                gc.collect()
-                return True
+                if getattr(sys, "frozen", False):
+                    cmd = [sys.executable, "--_validate-bundle", saved_path]
+                else:
+                    cmd = [sys.executable, os.path.abspath(__file__), "--_validate-bundle", saved_path]
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=1800,
+                )
+                if proc.returncode == 0:
+                    return True
+                detail = (proc.stderr or proc.stdout or "").strip()
+                if lang == "ko":
+                    print(f"  저장 검증 실패 [worker exit={proc.returncode}]: {detail}")
+                else:
+                    print(f"  Save validation failed [worker exit={proc.returncode}]: {detail}")
+                return False
             except Exception as e:
                 if lang == "ko":
-                    print(f"  저장 검증 실패: {e}")
+                    print(f"  저장 검증 워커 실행 실패: {e!r}")
                 else:
-                    print(f"  Save validation failed: {e}")
+                    print(f"  Failed to run save validation worker: {e!r}")
                 return False
 
         def _try_save(packer_label: Any, log_label: str) -> bool:
@@ -1203,19 +1209,17 @@ def replace_fonts_in_file(
                 if has_save_to:
                     # KR: save_to()로 파일에 직접 저장 — bytes 중간 변수 없음 (메모리 절약)
                     # EN: save_to() writes directly to file — no intermediate bytes blob (memory-efficient)
-                    result = _save_env_file(packer_label, save_path=tmp_file)
-                    saved_size = result if isinstance(result, int) else os.path.getsize(tmp_file)
+                    _save_env_file(packer_label, save_path=tmp_file)
                 else:
                     # KR: 기존 bytes 반환 방식 폴백
                     # EN: Legacy bytes-returning fallback
                     saved_blob = _save_env_file(packer_label)
-                    saved_size = len(saved_blob)
                     with open(tmp_file, "wb") as f:
                         f.write(saved_blob)
                     # Release large in-memory blob before optional validation to lower peak memory.
                     saved_blob = None
                 gc.collect()
-                if not _validate_saved_file(tmp_file, saved_size):
+                if not _validate_saved_file(tmp_file):
                     try:
                         os.remove(tmp_file)
                     except Exception:
@@ -1387,6 +1391,23 @@ def exit_with_error_en(message: str) -> NoReturn:
     exit_with_error(message, lang="en")
 
 
+def run_validation_worker(bundle_path: str, lang: Language = "ko") -> int:
+    """KR: 저장 검증 전용 워커입니다. bundle_path를 UnityPy로 로드해 성공/실패 코드만 반환합니다.
+    EN: Validation worker that loads bundle_path with UnityPy and returns a status code.
+    """
+    try:
+        UnityPy.load(bundle_path)
+        return 0
+    except Exception as e:
+        if lang == "ko":
+            print(f"[validate] 검증 실패: {e!r}")
+        else:
+            print(f"[validate] Validation failed: {e!r}")
+        if debug_parse_enabled():
+            tb_module.print_exc()
+        return 2
+
+
 def main_cli(lang: Language = "ko") -> None:
     """KR: 언어별 공통 CLI 진입점입니다.
     EN: Shared CLI entrypoint parameterized by language.
@@ -1447,8 +1468,12 @@ Examples:
     parser.add_argument("--use-game-mat", action="store_true", help=game_mat_help)
     parser.add_argument("--split-save", action="store_true", help=split_save_help)
     parser.add_argument("--verbose", action="store_true", help=verbose_help)
+    parser.add_argument("--_validate-bundle", type=str, metavar="BUNDLE_PATH", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    if args._validate_bundle:
+        raise SystemExit(run_validation_worker(args._validate_bundle, lang=lang))
 
     import struct
     py_bits = struct.calcsize("P") * 8
