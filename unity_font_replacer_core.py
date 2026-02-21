@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import inspect
 import io
 import json
@@ -19,6 +20,7 @@ from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
+SAVE_VALIDATION_MAX_BYTES = 512 * 1024 * 1024
 
 
 class TeeWriter:
@@ -1126,10 +1128,26 @@ def replace_fonts_in_file(
 
         save_success = False
 
-        def _save_env_file(packer: Any = None) -> bytes:
-            """KR: 지정 packer로 env.file.save를 호출합니다.
-            EN: Call env.file.save with an optional packer.
+        def _save_env_file(packer: Any = None, save_path: str | None = None) -> bytes | int:
+            """KR: 지정 packer로 env.file.save 또는 save_to를 호출합니다.
+            EN: Call env.file.save or save_to with an optional packer.
+            save_path가 주어지면 save_to()로 파일에 직접 기록하여 메모리를 절약합니다.
+            Returns bytes (legacy) or int file size (save_to).
             """
+            # KR: save_to()가 존재하면 파일에 직접 저장 (메모리 절약)
+            # EN: If save_to() exists, save directly to file (memory-efficient)
+            save_to_fn = getattr(env.file, "save_to", None)
+            if save_path and callable(save_to_fn):
+                try:
+                    supports_packer = "packer" in inspect.signature(save_to_fn).parameters
+                except (TypeError, ValueError):
+                    supports_packer = False
+                if packer is None or not supports_packer:
+                    return save_to_fn(save_path)
+                return save_to_fn(save_path, packer=packer)
+
+            # KR: 기존 bytes 반환 방식 폴백
+            # EN: Fallback to legacy bytes-returning save()
             save_fn = getattr(env.file, "save", None)
             if not callable(save_fn):
                 raise AttributeError("UnityPy environment file object has no callable save().")
@@ -1145,15 +1163,26 @@ def replace_fonts_in_file(
                 return typed_save()
             return typed_save(packer=packer)
 
-        def _validate_saved_blob(saved_blob: bytes) -> bool:
-            """KR: 저장 결과 blob이 Unity bundle로 다시 열리는지 검증합니다.
-            EN: Validate saved blob by attempting to reload with UnityPy.
+        def _validate_saved_file(saved_path: str, saved_size: int) -> bool:
+            """KR: 저장 결과 파일이 Unity bundle로 다시 열리는지 검증합니다.
+            EN: Validate saved output by attempting to reload from file path.
             """
             signature = getattr(env.file, "signature", None)
             if signature not in {"UnityFS", "UnityWeb", "UnityRaw"}:
                 return True
+            if saved_size > SAVE_VALIDATION_MAX_BYTES:
+                if lang == "ko":
+                    print(
+                        f"  저장 검증 생략: 파일이 큼 ({saved_size} bytes > {SAVE_VALIDATION_MAX_BYTES} bytes)"
+                    )
+                else:
+                    print(
+                        f"  Skipping save validation: file is large ({saved_size} bytes > {SAVE_VALIDATION_MAX_BYTES} bytes)"
+                    )
+                return True
             try:
-                UnityPy.load(saved_blob)
+                UnityPy.load(saved_path)
+                gc.collect()
                 return True
             except Exception as e:
                 if lang == "ko":
@@ -1167,12 +1196,31 @@ def replace_fonts_in_file(
             EN: Try one save strategy and return success status.
             """
             nonlocal save_success
+            tmp_file = os.path.join(tmp_path, fn_without_path)
+            has_save_to = callable(getattr(env.file, "save_to", None))
+            saved_blob: bytes | None = None
             try:
-                sf = _save_env_file(packer_label)
-                if not _validate_saved_blob(sf):
+                if has_save_to:
+                    # KR: save_to()로 파일에 직접 저장 — bytes 중간 변수 없음 (메모리 절약)
+                    # EN: save_to() writes directly to file — no intermediate bytes blob (memory-efficient)
+                    result = _save_env_file(packer_label, save_path=tmp_file)
+                    saved_size = result if isinstance(result, int) else os.path.getsize(tmp_file)
+                else:
+                    # KR: 기존 bytes 반환 방식 폴백
+                    # EN: Legacy bytes-returning fallback
+                    saved_blob = _save_env_file(packer_label)
+                    saved_size = len(saved_blob)
+                    with open(tmp_file, "wb") as f:
+                        f.write(saved_blob)
+                    # Release large in-memory blob before optional validation to lower peak memory.
+                    saved_blob = None
+                gc.collect()
+                if not _validate_saved_file(tmp_file, saved_size):
+                    try:
+                        os.remove(tmp_file)
+                    except Exception:
+                        pass
                     return False
-                with open(f"{tmp_path}/{fn_without_path}", "wb") as f:
-                    f.write(sf)
                 save_success = True
                 return True
             except Exception as e:
@@ -1182,7 +1230,15 @@ def replace_fonts_in_file(
                     print(f"  Save method {log_label} failed [{type(e).__name__}]: {e!r}")
                 if debug_parse_enabled():
                     tb_module.print_exc()
+                try:
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
+                except Exception:
+                    pass
                 return False
+            finally:
+                saved_blob = None
+                gc.collect()
 
         # KR: 저장 안정성을 위해 original -> lz4 -> safe-none 순서로 저장을 재시도합니다.
         # EN: For save stability, retry packers in order: original -> lz4 -> safe-none.
@@ -1393,6 +1449,11 @@ Examples:
     parser.add_argument("--verbose", action="store_true", help=verbose_help)
 
     args = parser.parse_args()
+
+    import struct
+    py_bits = struct.calcsize("P") * 8
+    print(f"Python {sys.version} ({py_bits}-bit)")
+
     warn_unitypy_version(lang=lang)
 
     verbose_file = None
