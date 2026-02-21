@@ -54,8 +54,13 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--sdfonly` | Replace SDF fonts only |
 | `--ttfonly` | Replace TTF fonts only |
 | `--list <JSON>` | Replace fonts from a JSON mapping |
+| `--target-file <name>` | Limit replacement targets to specific file name(s) (repeatable/comma-separated) |
 | `--use-game-mat` | Keep original in-game Material parameters for SDF replacement |
-| `--split-save` | On save failure in large multi-SDF replacements, fall back to one-by-one split save |
+| `--use-game-line-metrics` | Keep in-game line metrics (LineHeight/Ascender/Descender, etc.) for SDF replacement (pointSize still follows replacement font) |
+| `--original-compress` | Prefer original compression mode on save (default: uncompressed-family first) |
+| `--temp-dir <path>` | Set root path for temporary save files (fast SSD/NVMe recommended) |
+| `--split-save-force` | Skip one-shot and start adaptive split save immediately for large multi-SDF replacements |
+| `--oneshot-save-force` | Force one-shot only (disable split-save fallback) even for large multi-SDF replacements |
 
 ### Examples
 
@@ -72,8 +77,23 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
 :: Replace SDF and keep original in-game material parameters
 unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-mat
 
-:: Enable split-save fallback on save failure
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --split-save
+:: Keep in-game line metrics for SDF (pointSize still follows replacement font)
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-line-metrics
+
+:: Limit replacement to a specific file
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --target-file "sharedassets0.assets"
+
+:: Prefer original compression on save
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --original-compress
+
+:: Use a fast SSD/NVMe path for temporary save files
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --temp-dir "E:\UFR_TEMP"
+
+:: Skip one-shot and start split-save immediately
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --split-save-force
+
+:: Disable split-save fallback and force one-shot only
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --oneshot-save-force
 
 :: Replace using JSON mapping
 unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --list Muck.json
@@ -175,8 +195,15 @@ python export_fonts_en.py "D:\MyGame"
 
 ## Notes
 
-- Save tries to preserve original compression; fallback order is `lz4 -> safe-none`.
-- `--split-save` enables one-by-one split-save fallback when one-shot save fails in large multi-SDF replacements (disabled by default).
+- Default save order prefers uncompressed-family modes (`safe-none -> legacy-none`), then falls back to `original -> lz4`.
+- Use `--original-compress` to prefer original compression mode first.
+- If save is slow, try `--temp-dir` and point it to a fast SSD/NVMe path.
+- For large multi-SDF replacements, split-save fallback is enabled by default when one-shot fails (adaptive batch size).
+  - `--split-save-force`: skip one-shot and start split-save immediately.
+  - `--oneshot-save-force`: disable split-save fallback and try one-shot only.
+- Use `--target-file` to restrict replacements to specific files.
+- If line spacing looks too tight or overlapping, try `--use-game-line-metrics`.
+  This option still keeps pointSize from the replacement font.
 - For SDF replacement, default behavior applies material floats from `KR_ASSETS/* SDF Material.json`.
   Use `--use-game-mat` to preserve original in-game material style.
 - `TypeTreeGeneratorAPI` is required for TMP(FontAsset) parsing/replacement.

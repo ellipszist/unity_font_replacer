@@ -71,12 +71,13 @@ def find_ggm_file(data_path: str) -> str | None:
     candidates = ["globalgamemanagers", "globalgamemanagers.assets", "data.unity3d"]
     candidates_resources = ["unity default resources", "unity_builtin_extra"]
     fls: list[str] = []
-    for candidate in candidates_resources:
-        ggm_path = os.path.join(data_path, "Resources", candidate)
-        if os.path.exists(ggm_path):
-            fls.append(ggm_path)
+    # Prefer core globalgamemanagers files first.
     for candidate in candidates:
         ggm_path = os.path.join(data_path, candidate)
+        if os.path.exists(ggm_path):
+            fls.append(ggm_path)
+    for candidate in candidates_resources:
+        ggm_path = os.path.join(data_path, "Resources", candidate)
         if os.path.exists(ggm_path):
             fls.append(ggm_path)
     if fls:
@@ -134,8 +135,13 @@ def get_unity_version(game_path: str, lang: Language = "ko") -> str:
     EN: Read and return Unity version from the game path.
     """
     data_path = get_data_path(game_path, lang=lang)
-    ggm_path = find_ggm_file(data_path)
-    if not ggm_path:
+    candidates = [
+        os.path.join(data_path, "globalgamemanagers"),
+        os.path.join(data_path, "globalgamemanagers.assets"),
+        os.path.join(data_path, "data.unity3d"),
+    ]
+    existing_candidates = [p for p in candidates if os.path.exists(p)]
+    if not existing_candidates:
         if lang == "ko":
             raise FileNotFoundError(
                 f"'{data_path}'에서 globalgamemanagers 파일을 찾을 수 없습니다.\n올바른 Unity 게임 폴더인지 확인해주세요."
@@ -143,7 +149,44 @@ def get_unity_version(game_path: str, lang: Language = "ko") -> str:
         raise FileNotFoundError(
             f"Could not find a globalgamemanagers file in '{data_path}'.\nPlease verify this is a valid Unity game folder."
         )
-    return str(UnityPy.load(ggm_path).objects[0].assets_file.unity_version)
+
+    for candidate in existing_candidates:
+        env = None
+        try:
+            env = UnityPy.load(candidate)
+
+            # 1) Fast path: top-level file may already expose unity_version.
+            top_file = getattr(env, "file", None)
+            top_version = getattr(top_file, "unity_version", None)
+            if top_version:
+                return str(top_version)
+
+            # 2) Check loaded files.
+            env_files = getattr(env, "files", None)
+            if isinstance(env_files, dict):
+                for loaded in env_files.values():
+                    uv = getattr(loaded, "unity_version", None)
+                    if uv:
+                        return str(uv)
+
+            # 3) Fallback: inspect parsed objects only when present.
+            objs = getattr(env, "objects", None)
+            if objs:
+                first_obj = objs[0]
+                assets_file = getattr(first_obj, "assets_file", None)
+                uv = getattr(assets_file, "unity_version", None)
+                if uv:
+                    return str(uv)
+        except Exception:
+            continue
+        finally:
+            env = None
+            gc.collect()
+
+    tried = ", ".join(os.path.basename(p) for p in existing_candidates)
+    if lang == "ko":
+        raise RuntimeError(f"Unity 버전 감지에 실패했습니다. 시도한 파일: {tried}")
+    raise RuntimeError(f"Failed to detect Unity version. Tried files: {tried}")
 
 
 def get_script_dir() -> str:
@@ -409,6 +452,9 @@ def detect_new_glyph_y_flip(
     atlas_w, atlas_h = alpha.size
 
     def _score(flip_y: bool) -> tuple[int, float, int]:
+        """KR: 후보 좌표계(flip 여부)에서 글리프 영역 유효도를 계산합니다.
+        EN: Score glyph-region validity for a candidate coordinate space (flipped or not).
+        """
         non_zero_count = 0
         mean_sum = 0.0
         valid_rects = 0
@@ -826,7 +872,8 @@ def load_font_assets(font_name: str) -> JsonDict:
     return {
         "ttf_data": cached_assets["ttf_data"],
         "sdf_data": cached_assets["sdf_data"],
-        "sdf_atlas": atlas.copy() if atlas is not None else None,
+        # Reuse cached atlas object to avoid per-replacement image duplication.
+        "sdf_atlas": atlas,
         "sdf_materials": cached_assets["sdf_materials"],
     }
 
@@ -839,30 +886,146 @@ def replace_fonts_in_file(
     replace_ttf: bool = True,
     replace_sdf: bool = True,
     use_game_mat: bool = False,
+    use_game_line_metrics: bool = False,
+    prefer_original_compress: bool = False,
+    temp_root_dir: str | None = None,
     generator: TypeTreeGenerator | None = None,
     replacement_lookup: dict[tuple[str, str, str, int], str] | None = None,
     lang: Language = "ko",
 ) -> bool:
     """KR: 단일 assets 파일의 TTF/SDF 폰트를 교체하고 저장합니다.
+    KR: use_game_line_metrics=True면 줄 간격 관련 메트릭(LineHeight/Ascender/Descender 등)은 게임 원본을 유지합니다.
+    KR: pointSize는 옵션과 무관하게 교체 폰트 값을 유지합니다.
+    KR: prefer_original_compress=True면 원본 압축 우선, False면 무압축 계열 우선 저장 전략을 사용합니다.
+    KR: temp_root_dir가 지정되면 임시 저장 디렉터리 루트로 사용합니다.
     EN: Replace TTF/SDF fonts in one assets file and save changes.
+    EN: With use_game_line_metrics=True, line-related metrics (LineHeight/Ascender/Descender, etc.) are kept from game data.
+    EN: pointSize still follows replacement font data regardless of this option.
+    EN: When prefer_original_compress=True, original compression is tried first; otherwise uncompressed-family is preferred.
+    EN: If temp_root_dir is set, it is used as the root directory for temporary save files.
     """
     fn_without_path = os.path.basename(assets_file)
     data_path = get_data_path(game_path, lang=lang)
-    tmp_path = os.path.join(data_path, "temp")
+    tmp_root = os.path.abspath(temp_root_dir) if temp_root_dir else os.path.join(data_path, "temp")
+    tmp_path = os.path.join(tmp_root, "unity_font_replacer_temp")
+    bundle_signatures = {"UnityFS", "UnityWeb", "UnityRaw"}
 
-    if not os.path.exists(tmp_path):
-        os.makedirs(tmp_path)
-    else:
+    def _read_bundle_signature(path: str) -> str | None:
+        """KR: 파일 헤더에서 Unity 번들 시그니처를 읽습니다.
+        EN: Read Unity bundle signature from file header.
+        """
+        try:
+            with open(path, "rb") as f:
+                header = f.read(16)
+        except Exception:
+            return None
+
+        for sig in bundle_signatures:
+            token = (sig + "\x00").encode("ascii")
+            if header.startswith(token):
+                return sig
+        return None
+
+    source_bundle_signature = _read_bundle_signature(assets_file)
+
+    if not os.path.exists(tmp_root):
+        os.makedirs(tmp_root, exist_ok=True)
+
+    if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
-        os.makedirs(tmp_path)
+    os.makedirs(tmp_path, exist_ok=True)
 
     env = UnityPy.load(assets_file)
+    env_file = getattr(env, "file", None)
+    if env_file is None:
+        files = getattr(env, "files", None)
+        if isinstance(files, dict) and len(files) == 1:
+            env_file = next(iter(files.values()))
+    if env_file is None:
+        raise RuntimeError("Could not determine primary UnityPy file object for saving.")
     if generator is None:
         compile_method = get_compile_method(data_path)
         generator = _create_generator(unity_version, game_path, data_path, compile_method, lang=lang)
     env.typetree_generator = generator
     if replacement_lookup is None:
         replacement_lookup, _ = build_replacement_lookup(replacements)
+
+    target_sdf_pathids: set[int] = set()
+    target_sdf_font_by_pathid: dict[int, str] = {}
+    old_line_metric_keys = (
+        "LineHeight",
+        "Baseline",
+        "Ascender",
+        "CapHeight",
+        "Descender",
+        "CenterLine",
+        "Scale",
+        "SuperscriptOffset",
+        "SubscriptOffset",
+        "SubSize",
+        "Underline",
+        "UnderlineThickness",
+        "strikethrough",
+        "strikethroughThickness",
+    )
+    new_line_metric_keys = (
+        "m_LineHeight",
+        "m_AscentLine",
+        "m_CapLine",
+        "m_MeanLine",
+        "m_Baseline",
+        "m_DescentLine",
+        "m_Scale",
+        "m_SuperscriptOffset",
+        "m_SuperscriptSize",
+        "m_SubscriptOffset",
+        "m_SubscriptSize",
+        "m_UnderlineOffset",
+        "m_UnderlineThickness",
+        "m_StrikethroughOffset",
+        "m_StrikethroughThickness",
+    )
+    if replace_sdf:
+        for key, value in replacement_lookup.items():
+            if len(key) == 4 and key[0] == "SDF" and key[1] == fn_without_path:
+                path_id = key[3]
+                target_sdf_pathids.add(path_id)
+                target_sdf_font_by_pathid.setdefault(path_id, value)
+    matched_sdf_targets = 0
+    patched_sdf_targets = 0
+
+    def _close_reader(obj: Any) -> None:
+        """KR: UnityPy 내부 reader/객체를 안전하게 dispose합니다.
+        EN: Safely dispose UnityPy internal reader/object resources.
+        """
+        reader = getattr(obj, "reader", None)
+        if reader is not None and hasattr(reader, "dispose"):
+            try:
+                reader.dispose()
+            except Exception:
+                pass
+        if hasattr(obj, "dispose"):
+            try:
+                obj.dispose()
+            except Exception:
+                pass
+
+    def _close_env(environment: Any) -> None:
+        """KR: Environment에 연결된 파일 리소스를 순회 종료합니다.
+        EN: Walk and close file resources attached to environment.
+        """
+        if not environment:
+            return
+        stack: list[Any] = []
+        files = getattr(environment, "files", None)
+        if isinstance(files, dict):
+            stack.extend(files.values())
+        while stack:
+            item = stack.pop()
+            _close_reader(item)
+            sub_files = getattr(item, "files", None)
+            if isinstance(sub_files, dict):
+                stack.extend(sub_files.values())
 
     texture_replacements: dict[str, Any] = {}
     material_replacements: dict[str, JsonDict] = {}
@@ -887,6 +1050,9 @@ def replace_fonts_in_file(
                     modified = True
 
         if obj.type.name == "MonoBehaviour" and replace_sdf:
+            pathid = obj.path_id
+            if target_sdf_pathids and pathid not in target_sdf_pathids:
+                continue
             try:
                 parse_dict = obj.parse_as_dict()
             except Exception:
@@ -917,10 +1083,12 @@ def replace_fonts_in_file(
                     continue
 
                 objname = obj.peek_name()
-                pathid = obj.path_id
                 replacement_font = replacement_lookup.get(("SDF", fn_without_path, assets_name, pathid))
+                if replacement_font is None:
+                    replacement_font = target_sdf_font_by_pathid.get(pathid)
 
                 if replacement_font:
+                    matched_sdf_targets += 1
                     assets = load_font_assets(replacement_font)
                     if assets["sdf_data"] and assets["sdf_atlas"]:
                         if lang == "ko":
@@ -952,6 +1120,7 @@ def replace_fonts_in_file(
                             atlas_ref = parse_dict["atlas"]
                             m_AtlasTextures_FileID = atlas_ref["m_FileID"]
                             m_AtlasTextures_PathID = atlas_ref["m_PathID"]
+                            game_font_info = parse_dict.get("m_fontInfo", {})
 
                             old_font_info = convert_face_info_new_to_old(
                                 replace_data["m_FaceInfo"],
@@ -959,6 +1128,10 @@ def replace_fonts_in_file(
                                 replace_data.get("m_AtlasWidth", 0),
                                 replace_data.get("m_AtlasHeight", 0)
                             )
+                            if use_game_line_metrics and isinstance(game_font_info, dict):
+                                for metric_key in old_line_metric_keys:
+                                    if metric_key in game_font_info:
+                                        old_font_info[metric_key] = game_font_info[metric_key]
                             replacement_atlas = assets.get("sdf_atlas")
                             atlas_height = int(
                                 replace_data.get(
@@ -990,8 +1163,9 @@ def replace_fonts_in_file(
                                 cs = parse_dict["m_CreationSettings"]
                                 cs["atlasWidth"] = int(replace_data.get("m_AtlasWidth", cs.get("atlasWidth", 0)))
                                 cs["atlasHeight"] = int(replace_data.get("m_AtlasHeight", cs.get("atlasHeight", 0)))
-                                cs["pointSize"] = int(old_font_info["PointSize"])
-                                cs["padding"] = int(old_font_info["Padding"])
+                                if not use_game_line_metrics:
+                                    cs["pointSize"] = int(old_font_info["PointSize"])
+                                    cs["padding"] = int(old_font_info["Padding"])
                                 cs["characterSequence"] = ""
 
                         else:
@@ -1001,12 +1175,19 @@ def replace_fonts_in_file(
                             m_SourceFontFile_PathID = parse_dict["m_SourceFontFile"]["m_PathID"]
                             m_AtlasTextures_FileID = parse_dict["m_AtlasTextures"][0]["m_FileID"]
                             m_AtlasTextures_PathID = parse_dict["m_AtlasTextures"][0]["m_PathID"]
+                            game_face_info = parse_dict.get("m_FaceInfo", {})
 
                             if "m_GlyphTable" in replace_data and isinstance(replace_data["m_GlyphTable"], list):
                                 for glyph in replace_data["m_GlyphTable"]:
                                     glyph["m_ClassDefinitionType"] = 0
 
-                            parse_dict["m_FaceInfo"] = replace_data["m_FaceInfo"]
+                            target_face_info = replace_data["m_FaceInfo"]
+                            if use_game_line_metrics and isinstance(game_face_info, dict):
+                                target_face_info = dict(target_face_info)
+                                for metric_key in new_line_metric_keys:
+                                    if metric_key in game_face_info:
+                                        target_face_info[metric_key] = game_face_info[metric_key]
+                            parse_dict["m_FaceInfo"] = target_face_info
                             parse_dict["m_GlyphTable"] = replace_data["m_GlyphTable"]
                             parse_dict["m_CharacterTable"] = replace_data["m_CharacterTable"]
                             parse_dict["m_AtlasTextures"] = replace_data["m_AtlasTextures"]
@@ -1087,6 +1268,7 @@ def replace_fonts_in_file(
                                 "float_overrides": float_overrides,
                             }
                         obj.patch(parse_dict)
+                        patched_sdf_targets += 1
                         modified = True
 
     for obj in env.objects:
@@ -1127,16 +1309,22 @@ def replace_fonts_in_file(
 
         save_success = False
 
-        def _save_env_file(packer: Any = None, save_path: str | None = None) -> bytes | int:
-            """KR: 지정 packer로 env.file.save 또는 save_to를 호출합니다.
-            EN: Call env.file.save or save_to with an optional packer.
-            save_path가 주어지면 save_to()로 파일에 직접 기록하여 메모리를 절약합니다.
-            Returns bytes (legacy) or int file size (save_to).
+        def _save_env_file(
+            packer: Any = None,
+            save_path: str | None = None,
+            use_save_to: bool = False,
+        ) -> bytes | int:
+            """KR: 지정 packer로 기본 파일 객체의 save/save_to를 호출합니다.
+            KR: save_path가 주어지면 save_to()로 파일에 직접 기록하여 메모리를 절약합니다.
+            KR: 반환값은 bytes(legacy) 또는 저장된 파일 크기(int)입니다.
+            EN: Call save/save_to on the primary file object with an optional packer.
+            EN: If save_path is provided, it writes via save_to() to reduce memory usage.
+            EN: Returns bytes (legacy path) or written file size as int (save_to path).
             """
-            # KR: save_to()가 존재하면 파일에 직접 저장 (메모리 절약)
-            # EN: If save_to() exists, save directly to file (memory-efficient)
-            save_to_fn = getattr(env.file, "save_to", None)
-            if save_path and callable(save_to_fn):
+            # KR: use_save_to=True 이고 save_to()가 존재하면 파일에 직접 저장합니다.
+            # EN: When use_save_to=True and save_to() exists, save directly to file.
+            save_to_fn = getattr(env_file, "save_to", None)
+            if use_save_to and save_path and callable(save_to_fn):
                 try:
                     supports_packer = "packer" in inspect.signature(save_to_fn).parameters
                 except (TypeError, ValueError):
@@ -1147,7 +1335,7 @@ def replace_fonts_in_file(
 
             # KR: 기존 bytes 반환 방식 폴백
             # EN: Fallback to legacy bytes-returning save()
-            save_fn = getattr(env.file, "save", None)
+            save_fn = getattr(env_file, "save", None)
             if not callable(save_fn):
                 raise AttributeError("UnityPy environment file object has no callable save().")
             typed_save = cast(Callable[..., bytes], save_fn)
@@ -1166,9 +1354,20 @@ def replace_fonts_in_file(
             """KR: 저장 결과 파일이 Unity bundle로 다시 열리는지 검증합니다.
             EN: Validate saved output by attempting to reload from file path.
             """
-            signature = getattr(env.file, "signature", None)
-            if signature not in {"UnityFS", "UnityWeb", "UnityRaw"}:
+            signature = source_bundle_signature or getattr(env_file, "signature", None)
+            if signature not in bundle_signatures:
                 return True
+            saved_signature = _read_bundle_signature(saved_path)
+            if saved_signature != signature:
+                if lang == "ko":
+                    print(
+                        f"  저장 검증 실패: 번들 시그니처 불일치 (기대: {signature}, 결과: {saved_signature or 'None'})"
+                    )
+                else:
+                    print(
+                        f"  Save validation failed: bundle signature mismatch (expected: {signature}, got: {saved_signature or 'None'})"
+                    )
+                return False
             try:
                 if getattr(sys, "frozen", False):
                     cmd = [sys.executable, "--_validate-bundle", saved_path]
@@ -1203,19 +1402,38 @@ def replace_fonts_in_file(
             """
             nonlocal save_success
             tmp_file = os.path.join(tmp_path, fn_without_path)
-            has_save_to = callable(getattr(env.file, "save_to", None))
+            has_save_to = callable(getattr(env_file, "save_to", None))
             saved_blob: bytes | None = None
             try:
-                if has_save_to:
+                use_stream_fallback = False
+                if has_save_to and source_bundle_signature in bundle_signatures:
+                    # KR: 번들은 안정성을 위해 legacy save()를 우선 시도하고, 메모리 부족 시에만 save_to로 폴백합니다.
+                    # EN: For bundles, prefer legacy save() for stability; fall back to save_to on MemoryError.
+                    try:
+                        saved_blob = _save_env_file(packer_label, use_save_to=False)
+                    except MemoryError:
+                        use_stream_fallback = True
+                        if lang == "ko":
+                            print("  메모리 부족으로 스트리밍 저장(save_to)으로 폴백합니다...")
+                        else:
+                            print("  Falling back to streaming save_to due to MemoryError...")
+
+                    if not use_stream_fallback:
+                        with open(tmp_file, "wb") as f:
+                            f.write(cast(bytes, saved_blob))
+                        saved_blob = None
+                    else:
+                        _save_env_file(packer_label, save_path=tmp_file, use_save_to=True)
+                elif has_save_to:
                     # KR: save_to()로 파일에 직접 저장 — bytes 중간 변수 없음 (메모리 절약)
                     # EN: save_to() writes directly to file — no intermediate bytes blob (memory-efficient)
-                    _save_env_file(packer_label, save_path=tmp_file)
+                    _save_env_file(packer_label, save_path=tmp_file, use_save_to=True)
                 else:
                     # KR: 기존 bytes 반환 방식 폴백
                     # EN: Legacy bytes-returning fallback
-                    saved_blob = _save_env_file(packer_label)
+                    saved_blob = _save_env_file(packer_label, use_save_to=False)
                     with open(tmp_file, "wb") as f:
-                        f.write(saved_blob)
+                        f.write(cast(bytes, saved_blob))
                     # Release large in-memory blob before optional validation to lower peak memory.
                     saved_blob = None
                 gc.collect()
@@ -1244,64 +1462,67 @@ def replace_fonts_in_file(
                 saved_blob = None
                 gc.collect()
 
-        # KR: 저장 안정성을 위해 original -> lz4 -> safe-none 순서로 저장을 재시도합니다.
-        # EN: For save stability, retry packers in order: original -> lz4 -> safe-none.
-        if not _try_save("original", "1"):
-            if lang == "ko":
-                print("  lz4 압축 모드로 재시도...")
-            else:
-                print("  Retrying with lz4 packer...")
-            if not _try_save("lz4", "2"):
-                dataflags = getattr(env.file, "dataflags", None)
-                safe_none_packer = (int(dataflags), 0) if dataflags is not None else "none"
+        dataflags = getattr(env_file, "dataflags", None)
+        safe_none_packer = (int(dataflags), 0) if dataflags is not None else "none"
+        legacy_none_packer = ((int(dataflags) & ~0x3F), 0) if dataflags is not None else None
+
+        if prefer_original_compress:
+            # KR: 옵션이 있으면 원본 압축 우선으로 저장합니다.
+            # EN: With option enabled, keep original compression as first choice.
+            if not _try_save("original", "1"):
                 if lang == "ko":
-                    print("  비압축 계열 모드로 재시도...")
+                    print("  lz4 압축 모드로 재시도...")
                 else:
-                    print("  Retrying with uncompressed-style packer...")
-                if not _try_save(safe_none_packer, "3") and dataflags is not None:
-                    legacy_none_packer = ((int(dataflags) & ~0x3F), 0)
+                    print("  Retrying with lz4 packer...")
+                if not _try_save("lz4", "2"):
                     if lang == "ko":
-                        print("  레거시 비트마스크 모드로 재시도...")
+                        print("  비압축 계열 모드로 재시도...")
                     else:
-                        print("  Retrying with legacy bitmask packer...")
-                    _try_save(legacy_none_packer, "4")
+                        print("  Retrying with uncompressed-style packer...")
+                    if not _try_save(safe_none_packer, "3") and legacy_none_packer is not None:
+                        if lang == "ko":
+                            print("  레거시 비트마스크 모드로 재시도...")
+                        else:
+                            print("  Retrying with legacy bitmask packer...")
+                        _try_save(legacy_none_packer, "4")
+        else:
+            # KR: 기본은 무압축 계열 우선으로 저장해 시간을 줄이고, 실패 시 압축 모드로 폴백합니다.
+            # EN: Default prefers uncompressed-family save for speed, then falls back to compressed modes.
+            if not _try_save(safe_none_packer, "1"):
+                if legacy_none_packer is not None:
+                    if lang == "ko":
+                        print("  레거시 비트마스크 무압축 모드로 재시도...")
+                    else:
+                        print("  Retrying with legacy bitmask uncompressed packer...")
+                    if _try_save(legacy_none_packer, "2"):
+                        pass
+                    else:
+                        if lang == "ko":
+                            print("  원본 압축 모드로 재시도...")
+                        else:
+                            print("  Retrying with original compression...")
+                        if not _try_save("original", "3"):
+                            if lang == "ko":
+                                print("  lz4 압축 모드로 재시도...")
+                            else:
+                                print("  Retrying with lz4 packer...")
+                            _try_save("lz4", "4")
+                else:
+                    if lang == "ko":
+                        print("  원본 압축 모드로 재시도...")
+                    else:
+                        print("  Retrying with original compression...")
+                    if not _try_save("original", "2"):
+                        if lang == "ko":
+                            print("  lz4 압축 모드로 재시도...")
+                        else:
+                            print("  Retrying with lz4 packer...")
+                        _try_save("lz4", "3")
+
+        _close_env(env)
+        gc.collect()
 
         if save_success:
-            def _close_reader(obj: Any) -> None:
-                """KR: UnityPy 내부 reader/객체를 안전하게 dispose합니다.
-                EN: Safely dispose UnityPy internal reader/object resources.
-                """
-                reader = getattr(obj, "reader", None)
-                if reader is not None and hasattr(reader, "dispose"):
-                    try:
-                        reader.dispose()
-                    except Exception:
-                        pass
-                if hasattr(obj, "dispose"):
-                    try:
-                        obj.dispose()
-                    except Exception:
-                        pass
-
-            def _close_env(environment: Any) -> None:
-                """KR: Environment에 연결된 파일 리소스를 순회 종료합니다.
-                EN: Walk and close file resources attached to environment.
-                """
-                if not environment:
-                    return
-                stack: list[Any] = []
-                files = getattr(environment, "files", None)
-                if isinstance(files, dict):
-                    stack.extend(files.values())
-                while stack:
-                    item = stack.pop()
-                    _close_reader(item)
-                    sub_files = getattr(item, "files", None)
-                    if isinstance(sub_files, dict):
-                        stack.extend(sub_files.values())
-
-            _close_env(env)
-
             saved_file_path = os.path.join(tmp_path, fn_without_path)
             if os.path.exists(saved_file_path):
                 saved_size = os.path.getsize(saved_file_path)
@@ -1322,6 +1543,15 @@ def replace_fonts_in_file(
                 print("  오류: 파일 저장에 실패했습니다.")
             else:
                 print("  Error: failed to save file.")
+    elif replace_sdf and target_sdf_pathids:
+        if lang == "ko":
+            print(
+                f"  경고: SDF 대상 {len(target_sdf_pathids)}건 중 매칭 {matched_sdf_targets}건, 적용 {patched_sdf_targets}건"
+            )
+        else:
+            print(
+                f"  Warning: SDF targets={len(target_sdf_pathids)}, matched={matched_sdf_targets}, patched={patched_sdf_targets}"
+            )
 
     if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
@@ -1396,7 +1626,31 @@ def run_validation_worker(bundle_path: str, lang: Language = "ko") -> int:
     EN: Validation worker that loads bundle_path with UnityPy and returns a status code.
     """
     try:
-        UnityPy.load(bundle_path)
+        if not os.path.exists(bundle_path):
+            if lang == "ko":
+                print("[validate] 검증 실패: 저장 파일이 존재하지 않습니다.")
+            else:
+                print("[validate] Validation failed: saved file does not exist.")
+            return 2
+
+        env = UnityPy.load(bundle_path)
+        files = getattr(env, "files", None)
+        if not isinstance(files, dict) or len(files) == 0:
+            if lang == "ko":
+                print("[validate] 검증 실패: UnityPy.load 결과에 파일이 없습니다.")
+            else:
+                print("[validate] Validation failed: UnityPy.load returned no files.")
+            return 2
+
+        # KR: 실제 오브젝트가 없으면 저장 결과가 비정상일 가능성이 높습니다.
+        # EN: Empty object list usually indicates an invalid or incomplete save result.
+        if not getattr(env, "objects", None):
+            if lang == "ko":
+                print("[validate] 검증 실패: 로드된 오브젝트가 없습니다.")
+            else:
+                print("[validate] Validation failed: loaded object list is empty.")
+            return 2
+
         return 0
     except Exception as e:
         if lang == "ko":
@@ -1430,8 +1684,13 @@ def main_cli(lang: Language = "ko") -> None:
         sdf_help = "SDF 폰트만 교체"
         ttf_help = "TTF 폰트만 교체"
         list_help = "JSON 파일을 읽어서 폰트 교체"
+        target_file_help = "지정한 파일명만 교체 대상에 포함 (여러 번 사용 가능)"
         game_mat_help = "SDF 교체 시 게임 원본 Material 파라미터를 유지"
-        split_save_help = "대형 SDF 다건 교체 시 저장 실패하면 1개씩 분할 저장으로 폴백"
+        game_line_metrics_help = "SDF 교체 시 줄 간격 메트릭(LineHeight/Ascender/Descender 등)은 게임 원본 유지 (pointSize는 교체값 유지)"
+        original_compress_help = "저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선)"
+        temp_dir_help = "임시 저장 폴더 루트 경로 (가능하면 빠른 SSD/NVMe 권장)"
+        split_save_force_help = "대형 SDF 다건 교체에서 one-shot을 건너뛰고 즉시 적응형 분할 저장 시작"
+        oneshot_save_force_help = "대형 SDF 다건 교체에서도 분할 저장 폴백 없이 one-shot 저장만 시도"
         verbose_help = "모든 로그를 verbose.txt 파일로 저장"
     else:
         description = "Replace Unity game fonts with Korean fonts."
@@ -1449,8 +1708,13 @@ Examples:
         sdf_help = "Replace SDF fonts only"
         ttf_help = "Replace TTF fonts only"
         list_help = "Replace fonts using a JSON file"
+        target_file_help = "Limit replacement targets to specific file name(s) (repeatable)"
         game_mat_help = "Keep original in-game Material parameters for SDF replacement"
-        split_save_help = "On save failure for large multi-SDF replacements, fall back to one-by-one split save"
+        game_line_metrics_help = "Keep in-game line metrics (LineHeight/Ascender/Descender, etc.) for SDF replacement (pointSize still follows replacement font)"
+        original_compress_help = "Prefer original compression mode on save (default: uncompressed-family first)"
+        temp_dir_help = "Root path for temporary save files (fast SSD/NVMe recommended)"
+        split_save_force_help = "Skip one-shot and start adaptive split save immediately for large multi-SDF replacements"
+        oneshot_save_force_help = "Force one-shot save even for large multi-SDF targets (disable split-save fallback)"
         verbose_help = "Save all logs to verbose.txt"
 
     parser = argparse.ArgumentParser(
@@ -1465,12 +1729,47 @@ Examples:
     parser.add_argument("--sdfonly", action="store_true", help=sdf_help)
     parser.add_argument("--ttfonly", action="store_true", help=ttf_help)
     parser.add_argument("--list", type=str, metavar="JSON_FILE", help=list_help)
+    parser.add_argument("--target-file", action="append", metavar="FILE_NAME", help=target_file_help)
     parser.add_argument("--use-game-mat", action="store_true", help=game_mat_help)
-    parser.add_argument("--split-save", action="store_true", help=split_save_help)
+    parser.add_argument("--use-game-line-metrics", action="store_true", help=game_line_metrics_help)
+    parser.add_argument("--original-compress", action="store_true", help=original_compress_help)
+    parser.add_argument("--temp-dir", type=str, metavar="PATH", help=temp_dir_help)
+    parser.add_argument("--split-save-force", action="store_true", help=split_save_force_help)
+    parser.add_argument("--oneshot-save-force", action="store_true", help=oneshot_save_force_help)
     parser.add_argument("--verbose", action="store_true", help=verbose_help)
     parser.add_argument("--_validate-bundle", type=str, metavar="BUNDLE_PATH", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    if args.split_save_force and args.oneshot_save_force:
+        if is_ko:
+            exit_with_error("--split-save-force와 --oneshot-save-force를 동시에 사용할 수 없습니다.", lang=lang)
+        else:
+            exit_with_error("Cannot use --split-save-force and --oneshot-save-force at the same time.", lang=lang)
+
+    # KR: 기본은 split-save 폴백을 활성화합니다.
+    # EN: Split-save fallback is enabled by default.
+    args.split_save = not args.oneshot_save_force
+
+    if args.temp_dir:
+        args.temp_dir = os.path.abspath(str(args.temp_dir))
+        try:
+            os.makedirs(args.temp_dir, exist_ok=True)
+        except Exception as e:
+            if is_ko:
+                exit_with_error(f"임시 폴더를 만들 수 없습니다: {args.temp_dir} ({e})", lang=lang)
+            else:
+                exit_with_error(f"Failed to create temp directory: {args.temp_dir} ({e})", lang=lang)
+        if is_ko:
+            print(f"임시 저장 경로: {args.temp_dir}")
+        else:
+            print(f"Temp save path: {args.temp_dir}")
+
+    if args.use_game_line_metrics:
+        if is_ko:
+            print("줄 간격 메트릭 유지 모드: LineHeight/Ascender/Descender 등은 게임 원본을 사용합니다.")
+        else:
+            print("Line metrics mode: keeping in-game LineHeight/Ascender/Descender values.")
 
     if args._validate_bundle:
         raise SystemExit(run_validation_worker(args._validate_bundle, lang=lang))
@@ -1710,6 +2009,40 @@ Examples:
         else:
             exit_with_error("Replacement mapping was not generated.", lang=lang)
 
+    if args.target_file:
+        selected_files: set[str] = set()
+        for entry in args.target_file:
+            for token in str(entry).split(","):
+                name = os.path.basename(token.strip())
+                if name:
+                    selected_files.add(name)
+
+        if not selected_files:
+            if is_ko:
+                exit_with_error("--target-file 값이 비어 있습니다.", lang=lang)
+            else:
+                exit_with_error("--target-file values are empty.", lang=lang)
+
+        replacements = {
+            key: value
+            for key, value in replacements.items()
+            if isinstance(value, dict)
+            and os.path.basename(str(value.get("File", ""))) in selected_files
+        }
+
+        if not replacements:
+            target_text = ", ".join(sorted(selected_files))
+            if is_ko:
+                exit_with_error(f"--target-file 조건에 맞는 교체 대상이 없습니다: {target_text}", lang=lang)
+            else:
+                exit_with_error(f"No replacement targets matched --target-file: {target_text}", lang=lang)
+
+        target_text = ", ".join(sorted(selected_files))
+        if is_ko:
+            print(f"--target-file 적용: {target_text}")
+        else:
+            print(f"Applied --target-file: {target_text}")
+
     unity_version = get_unity_version(game_path, lang=lang)
     assets_files = find_assets_files(game_path, lang=lang)
     generator = _create_generator(unity_version, game_path, data_path, compile_method, lang=lang)
@@ -1723,8 +2056,8 @@ Examples:
                 print(f"\n처리 중: {fn}")
             else:
                 print(f"\nProcessing: {fn}")
-            # KR: --split-save 옵션이 켜진 경우에만, 대형 SDF 다건 교체에서 one-shot 실패 시 분할 저장 폴백을 사용합니다.
-            # EN: Only when --split-save is enabled, use split-save fallback after one-shot save failure for large multi-SDF replacements.
+            # KR: 기본은 split-save 폴백을 사용하고, --oneshot-save-force일 때만 비활성화합니다.
+            # EN: Split-save fallback is enabled by default and disabled only by --oneshot-save-force.
             file_replacements = {
                 key: value
                 for key, value in replacements.items()
@@ -1749,44 +2082,53 @@ Examples:
             if use_split_sdf_save:
                 if is_ko:
                     print(
-                        f"  SDF 대상 {len(file_sdf_replacements)}건 + --split-save 활성화: one-shot 실패 시 분할 저장으로 폴백합니다..."
+                        f"  SDF 대상 {len(file_sdf_replacements)}건: one-shot 실패 시 적응형 분할 저장으로 폴백합니다..."
                     )
                 else:
                     print(
-                        f"  {len(file_sdf_replacements)} SDF targets + --split-save enabled: will fall back to split save if one-shot fails..."
+                        f"  {len(file_sdf_replacements)} SDF targets: will fall back to adaptive split save if one-shot fails..."
                     )
 
-                # KR: 먼저 한 번에 저장을 시도하고, 실패 시에만 1개씩 분할 저장으로 폴백합니다.
-                # EN: Try one-shot save first, then fall back to one-by-one split save on failure.
+                # KR: 먼저 한 번에 저장을 시도하고, 실패 시에만 적응형 분할 저장으로 폴백합니다.
+                # EN: Try one-shot save first, then fall back to adaptive split save on failure.
                 file_lookup, _ = build_replacement_lookup(file_replacements)
                 one_shot_ok = False
-                try:
-                    one_shot_ok = replace_fonts_in_file(
-                        unity_version,
-                        game_path,
-                        assets_file,
-                        file_replacements,
-                        replace_ttf=replace_ttf,
-                        replace_sdf=replace_sdf,
-                        use_game_mat=args.use_game_mat,
-                        generator=generator,
-                        replacement_lookup=file_lookup,
-                        lang=lang,
-                    )
-                except MemoryError as e:
+                if args.split_save_force:
                     if is_ko:
-                        print(f"  one-shot 저장 실패 [MemoryError]: {e!r}")
-                        print("  1개씩 분할 저장으로 폴백합니다...")
+                        print("  --split-save-force 활성화: one-shot을 건너뛰고 즉시 분할 저장을 시작합니다...")
                     else:
-                        print(f"  One-shot save failed [MemoryError]: {e!r}")
-                        print("  Falling back to one-by-one split save...")
-                except Exception as e:
-                    if is_ko:
-                        print(f"  one-shot 저장 실패 [{type(e).__name__}]: {e!r}")
-                        print("  1개씩 분할 저장으로 폴백합니다...")
-                    else:
-                        print(f"  One-shot save failed [{type(e).__name__}]: {e!r}")
-                        print("  Falling back to one-by-one split save...")
+                        print("  --split-save-force enabled: skipping one-shot and starting split save immediately...")
+                else:
+                    try:
+                        one_shot_ok = replace_fonts_in_file(
+                            unity_version,
+                            game_path,
+                            assets_file,
+                            file_replacements,
+                            replace_ttf=replace_ttf,
+                            replace_sdf=replace_sdf,
+                            use_game_mat=args.use_game_mat,
+                            use_game_line_metrics=args.use_game_line_metrics,
+                            prefer_original_compress=args.original_compress,
+                            temp_root_dir=args.temp_dir,
+                            generator=generator,
+                            replacement_lookup=file_lookup,
+                            lang=lang,
+                        )
+                    except MemoryError as e:
+                        if is_ko:
+                            print(f"  one-shot 저장 실패 [MemoryError]: {e!r}")
+                            print("  적응형 분할 저장으로 폴백합니다...")
+                        else:
+                            print(f"  One-shot save failed [MemoryError]: {e!r}")
+                            print("  Falling back to adaptive split save...")
+                    except Exception as e:
+                        if is_ko:
+                            print(f"  one-shot 저장 실패 [{type(e).__name__}]: {e!r}")
+                            print("  적응형 분할 저장으로 폴백합니다...")
+                        else:
+                            print(f"  One-shot save failed [{type(e).__name__}]: {e!r}")
+                            print("  Falling back to adaptive split save...")
 
                 if one_shot_ok:
                     file_modified = True
@@ -1803,6 +2145,9 @@ Examples:
                                 replace_ttf=True,
                                 replace_sdf=False,
                                 use_game_mat=args.use_game_mat,
+                                use_game_line_metrics=args.use_game_line_metrics,
+                                prefer_original_compress=args.original_compress,
+                                temp_root_dir=args.temp_dir,
                                 generator=generator,
                                 replacement_lookup=file_ttf_lookup,
                                 lang=lang,
@@ -1816,35 +2161,75 @@ Examples:
                             split_stopped = True
 
                     if replace_sdf and not split_stopped:
-                        for key, value in file_sdf_replacements.items():
-                            single_sdf = {key: value}
-                            single_sdf_lookup, _ = build_replacement_lookup(single_sdf)
-                            try:
-                                if replace_fonts_in_file(
-                                    unity_version,
-                                    game_path,
-                                    assets_file,
-                                    single_sdf,
-                                    replace_ttf=False,
-                                    replace_sdf=True,
-                                    use_game_mat=args.use_game_mat,
-                                    generator=generator,
-                                    replacement_lookup=single_sdf_lookup,
-                                    lang=lang,
-                                ):
+                        sdf_items = list(file_sdf_replacements.items())
+                        sdf_total = len(sdf_items)
+                        if sdf_total > 0:
+                            if args.split_save_force:
+                                batch_size = min(sdf_total, 16)
+                            else:
+                                batch_size = min(sdf_total, max(1, sdf_total // 2))
+
+                            idx = 0
+                            while idx < sdf_total:
+                                current_batch = min(batch_size, sdf_total - idx)
+                                batch_dict = dict(sdf_items[idx : idx + current_batch])
+                                batch_lookup, _ = build_replacement_lookup(batch_dict)
+
+                                try:
+                                    ok = replace_fonts_in_file(
+                                        unity_version,
+                                        game_path,
+                                        assets_file,
+                                        batch_dict,
+                                        replace_ttf=False,
+                                        replace_sdf=True,
+                                        use_game_mat=args.use_game_mat,
+                                        use_game_line_metrics=args.use_game_line_metrics,
+                                        prefer_original_compress=args.original_compress,
+                                        temp_root_dir=args.temp_dir,
+                                        generator=generator,
+                                        replacement_lookup=batch_lookup,
+                                        lang=lang,
+                                    )
+                                except Exception as e:
+                                    ok = False
+                                    if is_ko:
+                                        print(f"  SDF 배치 저장 실패 [{type(e).__name__}]: {e!r}")
+                                    else:
+                                        print(f"  SDF batch save failed [{type(e).__name__}]: {e!r}")
+
+                                if ok:
                                     file_modified = True
-                            except Exception as e:
-                                if is_ko:
-                                    print(f"  SDF 분할 저장 중단 [{type(e).__name__}]: {e!r}")
+                                    idx += current_batch
+                                    if idx < sdf_total:
+                                        # KR: 성공하면 배치를 키워 쓰기 횟수를 줄입니다.
+                                        # EN: Grow batch size after success to reduce write count.
+                                        batch_size = min(sdf_total - idx, max(current_batch + 1, current_batch * 2))
+                                        if is_ko:
+                                            print(f"  SDF 배치 진행: {idx}/{sdf_total} (다음 배치: {batch_size})")
+                                        else:
+                                            print(f"  SDF batch progress: {idx}/{sdf_total} (next batch: {batch_size})")
                                 else:
-                                    print(f"  Stopping SDF split save [{type(e).__name__}]: {e!r}")
-                                break
+                                    if current_batch <= 1:
+                                        split_stopped = True
+                                        if is_ko:
+                                            print("  SDF 분할 저장 중단: 배치 1개에서도 저장 실패")
+                                        else:
+                                            print("  Stopping SDF split save: failed even with batch size 1")
+                                        break
+
+                                    batch_size = max(1, current_batch // 2)
+                                    gc.collect()
+                                    if is_ko:
+                                        print(f"  SDF 배치 크기를 {batch_size}로 줄여 재시도합니다...")
+                                    else:
+                                        print(f"  Reducing SDF batch size to {batch_size} and retrying...")
             else:
                 if replace_sdf and len(file_sdf_replacements) > 1 and not args.split_save:
                     if is_ko:
-                        print("  참고: --split-save 옵션을 주면 저장 실패 시 1개씩 분할 저장 폴백을 사용할 수 있습니다.")
+                        print("  참고: --oneshot-save-force로 split-save 폴백이 비활성화되어 메모리 피크가 증가할 수 있습니다.")
                     else:
-                        print("  Note: use --split-save to enable one-by-one split-save fallback on save failure.")
+                        print("  Note: --oneshot-save-force disables split-save fallback and may increase memory peak.")
                 try:
                     if replace_fonts_in_file(
                         unity_version,
@@ -1854,6 +2239,9 @@ Examples:
                         replace_ttf,
                         replace_sdf,
                         use_game_mat=args.use_game_mat,
+                        use_game_line_metrics=args.use_game_line_metrics,
+                        prefer_original_compress=args.original_compress,
+                        temp_root_dir=args.temp_dir,
                         generator=generator,
                         replacement_lookup=replacement_lookup,
                         lang=lang,
