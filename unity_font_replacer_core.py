@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import gc
 import inspect
 import io
@@ -20,6 +21,7 @@ from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
+_REGISTERED_TEMP_DIRS: set[str] = set()
 
 
 class TeeWriter:
@@ -196,6 +198,33 @@ def get_script_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def register_temp_dir_for_cleanup(path: str) -> str:
+    """KR: 종료 시 삭제할 임시 디렉터리를 등록하고 정규화 경로를 반환합니다.
+    EN: Register a temp directory for cleanup at exit and return normalized path.
+    """
+    normalized = os.path.abspath(path)
+    _REGISTERED_TEMP_DIRS.add(normalized)
+    return normalized
+
+
+def cleanup_registered_temp_dirs() -> None:
+    """KR: 등록된 임시 디렉터리를 깊은 경로부터 안전하게 삭제합니다.
+    EN: Safely remove registered temp directories from deepest paths first.
+    """
+    if not _REGISTERED_TEMP_DIRS:
+        return
+    for temp_dir in sorted(_REGISTERED_TEMP_DIRS, key=len, reverse=True):
+        try:
+            if os.path.isdir(temp_dir):
+                shutil.rmtree(temp_dir)
+        except Exception:
+            pass
+    _REGISTERED_TEMP_DIRS.clear()
+
+
+atexit.register(cleanup_registered_temp_dirs)
 
 
 def normalize_font_name(name: str) -> str:
@@ -887,6 +916,7 @@ def replace_fonts_in_file(
     replace_sdf: bool = True,
     use_game_mat: bool = False,
     use_game_line_metrics: bool = False,
+    material_scale_by_padding: bool = True,
     prefer_original_compress: bool = False,
     temp_root_dir: str | None = None,
     generator: TypeTreeGenerator | None = None,
@@ -894,20 +924,31 @@ def replace_fonts_in_file(
     lang: Language = "ko",
 ) -> bool:
     """KR: 단일 assets 파일의 TTF/SDF 폰트를 교체하고 저장합니다.
-    KR: use_game_line_metrics=True면 줄 간격 관련 메트릭(LineHeight/Ascender/Descender 등)은 게임 원본을 유지합니다.
+    KR: 기본 모드는 줄 간격 관련 메트릭(LineHeight/Ascender/Descender 등)을 게임 원본 비율로 보정해
+    KR: 교체 pointSize에 맞춰 적용합니다.
+    KR: use_game_line_metrics=True면 게임 원본 줄 간격 메트릭을 그대로 사용합니다.
     KR: pointSize는 옵션과 무관하게 교체 폰트 값을 유지합니다.
+    KR: material_scale_by_padding=True면 SDF 머티리얼 float를 (게임 padding / 교체 padding) 비율로 보정합니다.
     KR: prefer_original_compress=True면 원본 압축 우선, False면 무압축 계열 우선 저장 전략을 사용합니다.
     KR: temp_root_dir가 지정되면 임시 저장 디렉터리 루트로 사용합니다.
     EN: Replace TTF/SDF fonts in one assets file and save changes.
-    EN: With use_game_line_metrics=True, line-related metrics (LineHeight/Ascender/Descender, etc.) are kept from game data.
+    EN: By default, line-related metrics (LineHeight/Ascender/Descender, etc.) are adjusted from in-game ratios
+    EN: and scaled to match replacement pointSize.
+    EN: With use_game_line_metrics=True, original in-game line metrics are used directly.
     EN: pointSize still follows replacement font data regardless of this option.
+    EN: If material_scale_by_padding=True, SDF material floats are adjusted by (game padding / replacement padding).
     EN: When prefer_original_compress=True, original compression is tried first; otherwise uncompressed-family is preferred.
     EN: If temp_root_dir is set, it is used as the root directory for temporary save files.
     """
     fn_without_path = os.path.basename(assets_file)
     data_path = get_data_path(game_path, lang=lang)
-    tmp_root = os.path.abspath(temp_root_dir) if temp_root_dir else os.path.join(data_path, "temp")
+    using_custom_temp_root = temp_root_dir is not None
+    tmp_root = os.path.abspath(temp_root_dir) if using_custom_temp_root else os.path.join(data_path, "temp")
     tmp_path = os.path.join(tmp_root, "unity_font_replacer_temp")
+    if using_custom_temp_root:
+        register_temp_dir_for_cleanup(tmp_path)
+    else:
+        register_temp_dir_for_cleanup(tmp_root)
     bundle_signatures = {"UnityFS", "UnityWeb", "UnityRaw"}
 
     def _read_bundle_signature(path: str) -> str | None:
@@ -967,6 +1008,22 @@ def replace_fonts_in_file(
         "UnderlineThickness",
         "strikethrough",
         "strikethroughThickness",
+        "TabWidth",
+    )
+    old_line_metric_scale_keys = (
+        "LineHeight",
+        "Baseline",
+        "Ascender",
+        "CapHeight",
+        "Descender",
+        "CenterLine",
+        "SuperscriptOffset",
+        "SubscriptOffset",
+        "Underline",
+        "UnderlineThickness",
+        "strikethrough",
+        "strikethroughThickness",
+        "TabWidth",
     )
     new_line_metric_keys = (
         "m_LineHeight",
@@ -984,7 +1041,49 @@ def replace_fonts_in_file(
         "m_UnderlineThickness",
         "m_StrikethroughOffset",
         "m_StrikethroughThickness",
+        "m_TabWidth",
     )
+    new_line_metric_scale_keys = (
+        "m_LineHeight",
+        "m_AscentLine",
+        "m_CapLine",
+        "m_MeanLine",
+        "m_Baseline",
+        "m_DescentLine",
+        "m_SuperscriptOffset",
+        "m_SubscriptOffset",
+        "m_UnderlineOffset",
+        "m_UnderlineThickness",
+        "m_StrikethroughOffset",
+        "m_StrikethroughThickness",
+        "m_TabWidth",
+    )
+    material_padding_scale_keys = (
+        "_GradientScale",
+        "_FaceDilate",
+        "_OutlineWidth",
+        "_OutlineSoftness",
+        "_UnderlayDilate",
+        "_UnderlaySoftness",
+        "_UnderlayOffsetX",
+        "_UnderlayOffsetY",
+        "_GlowOffset",
+        "_GlowInner",
+        "_GlowOuter",
+    )
+
+    def _safe_metric_scale(game_point_size: Any, replacement_point_size: Any) -> float:
+        """KR: 게임 pointSize 대비 교체 pointSize 비율을 계산합니다.
+        EN: Compute scaling ratio from game pointSize to replacement pointSize.
+        """
+        try:
+            game_ps = float(game_point_size)
+            repl_ps = float(replacement_point_size)
+            if game_ps > 0 and repl_ps > 0:
+                return repl_ps / game_ps
+        except Exception:
+            pass
+        return 1.0
     if replace_sdf:
         for key, value in replacement_lookup.items():
             if len(key) == 4 and key[0] == "SDF" and key[1] == fn_without_path:
@@ -1041,6 +1140,19 @@ def replace_fonts_in_file(
                 assets = load_font_assets(replacement_font)
                 if assets["ttf_data"]:
                     font = obj.parse_as_object()
+                    current_ttf_data = bytes(getattr(font, "m_FontData", b""))
+                    if current_ttf_data == assets["ttf_data"]:
+                        if lang == "ko":
+                            print(
+                                f"TTF 폰트 동일(건너뜀): {assets_name} | {font.m_Name} | "
+                                f"(PathID: {font_pathid} == {replacement_font})"
+                            )
+                        else:
+                            print(
+                                f"TTF already same (skip): {assets_name} | {font.m_Name} | "
+                                f"(PathID: {font_pathid} == {replacement_font})"
+                            )
+                        continue
                     if lang == "ko":
                         print(f"TTF 폰트 교체: {assets_name} | {font.m_Name} | (PathID: {font_pathid} -> {replacement_font})")
                     else:
@@ -1099,6 +1211,7 @@ def replace_fonts_in_file(
                         # KR: 입력 JSON이 신형/구형이어도 내부 교체는 신형 TMP 스키마로 통일합니다.
                         # EN: Normalize replacement JSON to the new TMP schema regardless of input format.
                         replace_data = normalize_sdf_data(assets["sdf_data"])
+                        game_padding_for_material = 0.0
 
                         # KR: GameObject/Script/Material/Atlas 참조는 기존 PathID를 유지해야 런타임 연결이 깨지지 않습니다.
                         # EN: Preserve original GameObject/Script/Material/Atlas references to keep runtime links intact.
@@ -1121,6 +1234,15 @@ def replace_fonts_in_file(
                             m_AtlasTextures_FileID = atlas_ref["m_FileID"]
                             m_AtlasTextures_PathID = atlas_ref["m_PathID"]
                             game_font_info = parse_dict.get("m_fontInfo", {})
+                            try:
+                                game_padding_for_material = float(
+                                    game_font_info.get(
+                                        "Padding",
+                                        parse_dict.get("m_CreationSettings", {}).get("padding", 0),
+                                    )
+                                )
+                            except Exception:
+                                game_padding_for_material = 0.0
 
                             old_font_info = convert_face_info_new_to_old(
                                 replace_data["m_FaceInfo"],
@@ -1128,10 +1250,23 @@ def replace_fonts_in_file(
                                 replace_data.get("m_AtlasWidth", 0),
                                 replace_data.get("m_AtlasHeight", 0)
                             )
-                            if use_game_line_metrics and isinstance(game_font_info, dict):
+                            if isinstance(game_font_info, dict):
+                                if use_game_line_metrics:
+                                    metric_scale = 1.0
+                                else:
+                                    metric_scale = _safe_metric_scale(
+                                        game_font_info.get("PointSize", 0),
+                                        old_font_info.get("PointSize", 0),
+                                    )
                                 for metric_key in old_line_metric_keys:
                                     if metric_key in game_font_info:
-                                        old_font_info[metric_key] = game_font_info[metric_key]
+                                        metric_value = game_font_info[metric_key]
+                                        if metric_key in old_line_metric_scale_keys and metric_scale != 1.0:
+                                            try:
+                                                metric_value = float(metric_value) * metric_scale
+                                            except Exception:
+                                                pass
+                                        old_font_info[metric_key] = metric_value
                             replacement_atlas = assets.get("sdf_atlas")
                             atlas_height = int(
                                 replace_data.get(
@@ -1163,8 +1298,8 @@ def replace_fonts_in_file(
                                 cs = parse_dict["m_CreationSettings"]
                                 cs["atlasWidth"] = int(replace_data.get("m_AtlasWidth", cs.get("atlasWidth", 0)))
                                 cs["atlasHeight"] = int(replace_data.get("m_AtlasHeight", cs.get("atlasHeight", 0)))
+                                cs["pointSize"] = int(old_font_info["PointSize"])
                                 if not use_game_line_metrics:
-                                    cs["pointSize"] = int(old_font_info["PointSize"])
                                     cs["padding"] = int(old_font_info["Padding"])
                                 cs["characterSequence"] = ""
 
@@ -1176,17 +1311,39 @@ def replace_fonts_in_file(
                             m_AtlasTextures_FileID = parse_dict["m_AtlasTextures"][0]["m_FileID"]
                             m_AtlasTextures_PathID = parse_dict["m_AtlasTextures"][0]["m_PathID"]
                             game_face_info = parse_dict.get("m_FaceInfo", {})
+                            try:
+                                game_padding_for_material = float(
+                                    parse_dict.get(
+                                        "m_AtlasPadding",
+                                        parse_dict.get("m_CreationSettings", {}).get("padding", 0),
+                                    )
+                                )
+                            except Exception:
+                                game_padding_for_material = 0.0
 
                             if "m_GlyphTable" in replace_data and isinstance(replace_data["m_GlyphTable"], list):
                                 for glyph in replace_data["m_GlyphTable"]:
                                     glyph["m_ClassDefinitionType"] = 0
 
                             target_face_info = replace_data["m_FaceInfo"]
-                            if use_game_line_metrics and isinstance(game_face_info, dict):
+                            if isinstance(game_face_info, dict):
                                 target_face_info = dict(target_face_info)
+                                if use_game_line_metrics:
+                                    metric_scale = 1.0
+                                else:
+                                    metric_scale = _safe_metric_scale(
+                                        game_face_info.get("m_PointSize", 0),
+                                        target_face_info.get("m_PointSize", 0),
+                                    )
                                 for metric_key in new_line_metric_keys:
                                     if metric_key in game_face_info:
-                                        target_face_info[metric_key] = game_face_info[metric_key]
+                                        metric_value = game_face_info[metric_key]
+                                        if metric_key in new_line_metric_scale_keys and metric_scale != 1.0:
+                                            try:
+                                                metric_value = float(metric_value) * metric_scale
+                                            except Exception:
+                                                pass
+                                        target_face_info[metric_key] = metric_value
                             parse_dict["m_FaceInfo"] = target_face_info
                             parse_dict["m_GlyphTable"] = replace_data["m_GlyphTable"]
                             parse_dict["m_CharacterTable"] = replace_data["m_CharacterTable"]
@@ -1217,11 +1374,29 @@ def replace_fonts_in_file(
                                     for rect in parse_dict[rect_list_name]:
                                         ensure_int(rect, ["m_X", "m_Y", "m_Width", "m_Height"])
 
+                            # KR: 신형 TMP를 쓰더라도 legacy m_fontInfo가 남아 있으면 동기화해 런타임 차이를 줄입니다.
+                            # EN: Keep legacy m_fontInfo in sync when present to reduce runtime schema differences.
+                            if "m_fontInfo" in parse_dict and isinstance(parse_dict["m_fontInfo"], dict):
+                                parse_dict["m_fontInfo"] = convert_face_info_new_to_old(
+                                    parse_dict["m_FaceInfo"],
+                                    int(parse_dict.get("m_AtlasPadding", 0)),
+                                    int(parse_dict.get("m_AtlasWidth", 0)),
+                                    int(parse_dict.get("m_AtlasHeight", 0)),
+                                )
+
                             parse_dict["m_SourceFontFile"]["m_FileID"] = m_SourceFontFile_FileID
                             parse_dict["m_SourceFontFile"]["m_PathID"] = m_SourceFontFile_PathID
                             parse_dict["m_AtlasTextures"][0]["m_FileID"] = m_AtlasTextures_FileID
                             parse_dict["m_AtlasTextures"][0]["m_PathID"] = m_AtlasTextures_PathID
                             if "m_CreationSettings" in parse_dict:
+                                # KR: creation settings를 현재 atlas/face 값에 맞춰 동기화합니다.
+                                # EN: Align creation settings with the current atlas/face values.
+                                parse_dict["m_CreationSettings"]["atlasWidth"] = int(parse_dict.get("m_AtlasWidth", 0))
+                                parse_dict["m_CreationSettings"]["atlasHeight"] = int(parse_dict.get("m_AtlasHeight", 0))
+                                parse_dict["m_CreationSettings"]["padding"] = int(parse_dict.get("m_AtlasPadding", 0))
+                                parse_dict["m_CreationSettings"]["pointSize"] = int(
+                                    parse_dict["m_FaceInfo"].get("m_PointSize", parse_dict["m_CreationSettings"].get("pointSize", 0))
+                                )
                                 parse_dict["m_CreationSettings"]["characterSequence"] = ""
 
                         # KR: 포맷 분기 후 공통 참조를 원래 값으로 되돌립니다.
@@ -1247,7 +1422,20 @@ def replace_fonts_in_file(
                             gradient_scale = None
                             apply_replacement_material = not use_game_mat
                             float_overrides: dict[str, float] = {}
+                            material_padding_ratio = 1.0
                             material_data = assets.get("sdf_materials")
+                            try:
+                                replacement_padding = float(replace_data.get("m_AtlasPadding", 0))
+                            except Exception:
+                                replacement_padding = 0.0
+                            if (
+                                material_scale_by_padding
+                                and game_padding_for_material > 0
+                                and replacement_padding > 0
+                            ):
+                                material_padding_ratio = game_padding_for_material / replacement_padding
+                                if material_padding_ratio <= 0:
+                                    material_padding_ratio = 1.0
                             if material_data and apply_replacement_material:
                                 material_props = material_data.get("m_SavedProperties", {})
                                 float_properties = material_props.get("m_Floats", [])
@@ -1260,7 +1448,22 @@ def replace_fonts_in_file(
                                     except (TypeError, ValueError):
                                         continue
                                     float_overrides[key] = value
+                                if material_padding_ratio != 1.0:
+                                    for key in material_padding_scale_keys:
+                                        if key in float_overrides:
+                                            float_overrides[key] = float(float_overrides[key] * material_padding_ratio)
                                 gradient_scale = float_overrides.get("_GradientScale")
+                            if material_scale_by_padding and apply_replacement_material and material_padding_ratio != 1.0:
+                                if lang == "ko":
+                                    print(
+                                        f"  Material padding 비율 보정 적용: {game_padding_for_material:.2f}/{replacement_padding:.2f} "
+                                        f"(x{material_padding_ratio:.3f})"
+                                    )
+                                else:
+                                    print(
+                                        f"  Applied material padding ratio: {game_padding_for_material:.2f}/{replacement_padding:.2f} "
+                                        f"(x{material_padding_ratio:.3f})"
+                                    )
                             material_replacements[f"{assets_name}|{m_Material_PathID}"] = {
                                 "w": assets["sdf_atlas"].width,
                                 "h": assets["sdf_atlas"].height,
@@ -1555,6 +1758,11 @@ def replace_fonts_in_file(
 
     if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
+    if not using_custom_temp_root and os.path.isdir(tmp_root):
+        try:
+            os.rmdir(tmp_root)
+        except OSError:
+            pass
 
     return save_success if modified else False
 
@@ -1685,8 +1893,8 @@ def main_cli(lang: Language = "ko") -> None:
         ttf_help = "TTF 폰트만 교체"
         list_help = "JSON 파일을 읽어서 폰트 교체"
         target_file_help = "지정한 파일명만 교체 대상에 포함 (여러 번 사용 가능)"
-        game_mat_help = "SDF 교체 시 게임 원본 Material 파라미터를 유지"
-        game_line_metrics_help = "SDF 교체 시 줄 간격 메트릭(LineHeight/Ascender/Descender 등)은 게임 원본 유지 (pointSize는 교체값 유지)"
+        game_mat_help = "SDF 교체 시 게임 원본 Material 파라미터를 유지 (기본: 교체 Material 보정 적용)"
+        game_line_metrics_help = "SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용)"
         original_compress_help = "저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선)"
         temp_dir_help = "임시 저장 폴더 루트 경로 (가능하면 빠른 SSD/NVMe 권장)"
         split_save_force_help = "대형 SDF 다건 교체에서 one-shot을 건너뛰고 즉시 적응형 분할 저장 시작"
@@ -1709,8 +1917,8 @@ Examples:
         ttf_help = "Replace TTF fonts only"
         list_help = "Replace fonts using a JSON file"
         target_file_help = "Limit replacement targets to specific file name(s) (repeatable)"
-        game_mat_help = "Keep original in-game Material parameters for SDF replacement"
-        game_line_metrics_help = "Keep in-game line metrics (LineHeight/Ascender/Descender, etc.) for SDF replacement (pointSize still follows replacement font)"
+        game_mat_help = "Use original in-game Material parameters for SDF replacement (default: adjusted replacement material)"
+        game_line_metrics_help = "Use original in-game line metrics for SDF replacement (default: adjusted replacement font metrics)"
         original_compress_help = "Prefer original compression mode on save (default: uncompressed-family first)"
         temp_dir_help = "Root path for temporary save files (fast SSD/NVMe recommended)"
         split_save_force_help = "Skip one-shot and start adaptive split save immediately for large multi-SDF replacements"
@@ -1730,8 +1938,11 @@ Examples:
     parser.add_argument("--ttfonly", action="store_true", help=ttf_help)
     parser.add_argument("--list", type=str, metavar="JSON_FILE", help=list_help)
     parser.add_argument("--target-file", action="append", metavar="FILE_NAME", help=target_file_help)
-    parser.add_argument("--use-game-mat", action="store_true", help=game_mat_help)
+    parser.add_argument("--use-game-material", action="store_true", help=game_mat_help)
+    parser.add_argument("--use-game-mat", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--use-game-line-metrics", action="store_true", help=game_line_metrics_help)
+    parser.add_argument("--use-game-line-matrics", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--material-scale-by-padding", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--original-compress", action="store_true", help=original_compress_help)
     parser.add_argument("--temp-dir", type=str, metavar="PATH", help=temp_dir_help)
     parser.add_argument("--split-save-force", action="store_true", help=split_save_force_help)
@@ -1740,6 +1951,15 @@ Examples:
     parser.add_argument("--_validate-bundle", type=str, metavar="BUNDLE_PATH", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    # KR: 이전 옵션(--use-game-mat) 호환을 위해 새 옵션에 병합합니다.
+    # EN: Merge legacy flag (--use-game-mat) into the new option for compatibility.
+    args.use_game_material = bool(getattr(args, "use_game_material", False) or getattr(args, "use_game_mat", False))
+    # KR: 오타/레거시 옵션(--use-game-line-matrics)도 동일 동작으로 병합합니다.
+    # EN: Merge typo/legacy option (--use-game-line-matrics) into the canonical flag.
+    args.use_game_line_metrics = bool(
+        getattr(args, "use_game_line_metrics", False) or getattr(args, "use_game_line_matrics", False)
+    )
 
     if args.split_save_force and args.oneshot_save_force:
         if is_ko:
@@ -1764,12 +1984,29 @@ Examples:
             print(f"임시 저장 경로: {args.temp_dir}")
         else:
             print(f"Temp save path: {args.temp_dir}")
+        register_temp_dir_for_cleanup(os.path.join(args.temp_dir, "unity_font_replacer_temp"))
 
     if args.use_game_line_metrics:
         if is_ko:
-            print("줄 간격 메트릭 유지 모드: LineHeight/Ascender/Descender 등은 게임 원본을 사용합니다.")
+            print("줄 간격 메트릭 모드: 게임 원본 줄 간격 메트릭을 사용합니다.")
         else:
-            print("Line metrics mode: keeping in-game LineHeight/Ascender/Descender values.")
+            print("Line metrics mode: using original in-game line metrics.")
+    else:
+        if is_ko:
+            print("줄 간격 메트릭 모드: 교체 폰트 메트릭 보정을 기본 적용합니다.")
+        else:
+            print("Line metrics mode: using adjusted replacement font metrics by default.")
+
+    if args.use_game_material:
+        if is_ko:
+            print("Material 모드: 게임 원본 Material 파라미터를 사용합니다.")
+        else:
+            print("Material mode: using original in-game Material parameters.")
+    else:
+        if is_ko:
+            print("Material 모드: 교체 Material 보정(패딩 비율)을 기본 적용합니다.")
+        else:
+            print("Material mode: using adjusted replacement material by default (padding ratio).")
 
     if args._validate_bundle:
         raise SystemExit(run_validation_worker(args._validate_bundle, lang=lang))
@@ -1829,8 +2066,9 @@ Examples:
     except FileNotFoundError as e:
         exit_with_error(str(e), lang=lang)
 
-    if os.path.exists(os.path.join(data_path, "temp")):
-        shutil.rmtree(os.path.join(data_path, "temp"))
+    default_temp_root = register_temp_dir_for_cleanup(os.path.join(data_path, "temp"))
+    if os.path.exists(default_temp_root):
+        shutil.rmtree(default_temp_root)
 
     replace_ttf = not args.sdfonly
     replace_sdf = not args.ttfonly
@@ -2107,8 +2345,9 @@ Examples:
                             file_replacements,
                             replace_ttf=replace_ttf,
                             replace_sdf=replace_sdf,
-                            use_game_mat=args.use_game_mat,
+                            use_game_mat=args.use_game_material,
                             use_game_line_metrics=args.use_game_line_metrics,
+                            material_scale_by_padding=not args.use_game_material,
                             prefer_original_compress=args.original_compress,
                             temp_root_dir=args.temp_dir,
                             generator=generator,
@@ -2144,8 +2383,9 @@ Examples:
                                 file_ttf_replacements,
                                 replace_ttf=True,
                                 replace_sdf=False,
-                                use_game_mat=args.use_game_mat,
+                                use_game_mat=args.use_game_material,
                                 use_game_line_metrics=args.use_game_line_metrics,
+                                material_scale_by_padding=not args.use_game_material,
                                 prefer_original_compress=args.original_compress,
                                 temp_root_dir=args.temp_dir,
                                 generator=generator,
@@ -2183,8 +2423,9 @@ Examples:
                                         batch_dict,
                                         replace_ttf=False,
                                         replace_sdf=True,
-                                        use_game_mat=args.use_game_mat,
+                                        use_game_mat=args.use_game_material,
                                         use_game_line_metrics=args.use_game_line_metrics,
+                                        material_scale_by_padding=not args.use_game_material,
                                         prefer_original_compress=args.original_compress,
                                         temp_root_dir=args.temp_dir,
                                         generator=generator,
@@ -2238,8 +2479,9 @@ Examples:
                         replacements,
                         replace_ttf,
                         replace_sdf,
-                        use_game_mat=args.use_game_mat,
+                        use_game_mat=args.use_game_material,
                         use_game_line_metrics=args.use_game_line_metrics,
+                        material_scale_by_padding=not args.use_game_material,
                         prefer_original_compress=args.original_compress,
                         temp_root_dir=args.temp_dir,
                         generator=generator,
@@ -2303,6 +2545,7 @@ def run_main_ko() -> None:
         sys.exit(1)
     finally:
         _restore_tee_streams()
+        cleanup_registered_temp_dirs()
 
 
 def run_main_en() -> None:
@@ -2318,6 +2561,7 @@ def run_main_en() -> None:
         sys.exit(1)
     finally:
         _restore_tee_streams()
+        cleanup_registered_temp_dirs()
 
 
 if __name__ == "__main__":

@@ -53,8 +53,8 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--ttfonly` | TTF 폰트만 교체 |
 | `--list <JSON파일>` | JSON 파일 기준 개별 폰트 교체 |
 | `--target-file <파일명>` | 지정한 파일명만 교체 대상에 포함 (여러 번/콤마로 지정 가능) |
-| `--use-game-mat` | SDF 교체 시 게임 원본 Material 파라미터 유지 |
-| `--use-game-line-metrics` | SDF 교체 시 줄 간격 메트릭(LineHeight/Ascender/Descender 등)은 게임 원본 유지 (pointSize는 교체값 유지) |
+| `--use-game-material` | SDF 교체 시 게임 원본 Material 파라미터 유지 (기본: 교체 Material 보정 적용) |
+| `--use-game-line-metrics` | SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용, pointSize는 교체값 유지) |
 | `--original-compress` | 저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선) |
 | `--temp-dir <경로>` | 임시 저장 폴더 루트 경로 지정 (빠른 SSD/NVMe 권장) |
 | `--split-save-force` | 대형 SDF 다건 교체에서 one-shot을 건너뛰고 즉시 적응형 분할 저장 시작 |
@@ -73,7 +73,7 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
 unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
 
 :: SDF 교체 + 게임 원본 Material 파라미터 유지
-unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-mat
+unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-material
 
 :: SDF 줄 간격 메트릭은 게임 원본 유지 (pointSize는 교체값 유지)
 unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-line-metrics
@@ -195,14 +195,15 @@ python export_fonts.py "D:\MyGame"
 - 저장 기본 모드는 무압축 계열 우선(`safe-none -> legacy-none`)이며, 실패 시 `original -> lz4` 순으로 폴백합니다.
 - 저장 시 원본 압축 우선이 필요하면 `--original-compress`를 사용하세요.
 - 저장 속도가 느리면 `--temp-dir`로 임시 저장 폴더를 빠른 SSD/NVMe 경로로 지정해 보세요.
+- 프로그램 종료 시 임시 폴더는 자동 정리됩니다.
 - 대형 SDF 다건 교체에서는 기본적으로 one-shot 실패 시 적응형 분할 저장(배치 크기 자동 조절)으로 폴백합니다.
   - `--split-save-force`: one-shot을 건너뛰고 즉시 분할 저장
   - `--oneshot-save-force`: 분할 저장 폴백 비활성화(one-shot만 시도)
 - 파일 단위로 제한하려면 `--target-file`을 사용하세요.
-- 줄 간격이 좁거나 겹치면 `--use-game-line-metrics`로 line metrics를 게임 원본으로 유지해 보세요.
-  이 옵션을 써도 pointSize는 교체 폰트 값을 사용합니다.
-- SDF 교체 시 기본은 `KR_ASSETS/* SDF Material.json`의 머티리얼 float를 적용합니다.
-  원본 게임 머티리얼 스타일을 유지하려면 `--use-game-mat`을 사용하세요.
+- 기본 줄 간격 메트릭 모드는 게임 원본 비율을 기준으로 교체 폰트 pointSize에 맞게 보정 적용합니다.
+- 게임 원본 줄 간격 메트릭을 그대로 쓰려면 `--use-game-line-metrics`를 사용하세요. pointSize는 항상 교체 폰트 값을 사용합니다.
+- SDF 교체 시 기본은 `KR_ASSETS/* SDF Material.json` 머티리얼 float를 적용하며, padding 비율 기준 보정도 함께 적용합니다.
+- 원본 게임 머티리얼 스타일을 유지하려면 `--use-game-material`을 사용하세요.
 - TMP(FontAsset) 파싱/교체를 위해 `TypeTreeGeneratorAPI`가 필요합니다.
 - 게임 파일 수정 전 백업을 권장합니다.
 - 일부 게임은 무결성 검사로 수정 파일이 원복될 수 있습니다.
