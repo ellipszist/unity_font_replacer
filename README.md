@@ -46,14 +46,14 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
 | 옵션 | 설명 |
 |------|------|
 | `--gamepath <경로>` | 게임 루트 경로 또는 `_Data` 폴더 경로 |
-| `--parse` | 게임 폰트 정보를 JSON 파일로 출력 |
+| `--parse` | 게임 폰트 정보를 JSON 파일로 출력 (파일 단위 워커 스캔으로 크래시 격리) |
 | `--mulmaru` | 모든 폰트를 Mulmaru로 일괄 교체 |
 | `--nanumgothic` | 모든 폰트를 NanumGothic으로 일괄 교체 |
 | `--sdfonly` | SDF 폰트만 교체 |
 | `--ttfonly` | TTF 폰트만 교체 |
 | `--list <JSON파일>` | JSON 파일 기준 개별 폰트 교체 |
 | `--target-file <파일명>` | 지정한 파일명만 교체 대상에 포함 (여러 번/콤마로 지정 가능) |
-| `--use-game-material` | SDF 교체 시 게임 원본 Material 파라미터 유지 (기본: 교체 Material 보정 적용) |
+| `--use-game-material` | SDF 교체 시 게임 원본 Material 파라미터 유지 (기본: 교체 Material 보정 적용, Raster 입력 시 박스 아티팩트 가능) |
 | `--use-game-line-metrics` | SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용, pointSize는 교체값 유지) |
 | `--original-compress` | 저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선) |
 | `--temp-dir <경로>` | 임시 저장 폴더 루트 경로 지정 (빠른 SSD/NVMe 권장) |
@@ -131,6 +131,8 @@ JSON 예시:
   - `Mulmaru` 또는 `Mulmaru.ttf`
   - `NanumGothic` 또는 `NanumGothic.ttf`
   - `Mulmaru SDF` 또는 `Mulmaru SDF.json` 또는 `Mulmaru SDF Atlas.png`
+  - `Mulmaru Raster` 또는 `Mulmaru Raster.json` 또는 `Mulmaru Raster Atlas.png`
+  - `NGothic` 또는 `NGothic.json` 또는 `NGothic Atlas.png` 또는 `NGothic Material.json`
 
 ## 폰트 추출 (export_fonts.exe)
 
@@ -163,11 +165,32 @@ export_fonts.exe
 
 `KR_ASSETS` 폴더에 아래 파일을 추가하면 됩니다.
 
-- `폰트이름.ttf`
-- `폰트이름 SDF.json`
-- `폰트이름 SDF Atlas.png`
+- `폰트이름.ttf` (필수)
+- `폰트이름.otf` (선택, `.ttf` 대체 가능)
+- `폰트이름 SDF.json` 또는 `폰트이름 Raster.json` 또는 `폰트이름.json` (선택, SDF 교체 시 필요)
+- `폰트이름 SDF Atlas.png` 또는 `폰트이름 Raster Atlas.png` 또는 `폰트이름 Atlas.png` (선택, SDF 교체 시 필요)
+- `폰트이름 SDF Material.json` 또는 `폰트이름 Raster Material.json` 또는 `폰트이름 Material.json` (선택)
 
-SDF 데이터는 `export_fonts.exe`로 추출할 수 있습니다.
+SDF 데이터가 없으면 아래 `make_sdf.py`로 먼저 생성하거나 `export_fonts.exe`로 추출할 수 있습니다.
+
+## SDF 생성 도구 (make_sdf.py)
+
+TTF에서 TMP 호환 JSON/Atlas를 직접 생성할 수 있습니다.
+
+```bash
+python make_sdf.py --ttf Mulmaru.ttf
+```
+
+지원 인자:
+
+| 인자 | 설명 | 기본값 |
+|------|------|--------|
+| `--ttf <ttfname>` | TTF 파일 경로/이름 | (필수) |
+| `--atlas-size <w,h>` | 아틀라스 해상도 | `4096,4096` |
+| `--point-size <int or auto>` | 샘플링 포인트 크기 | `auto` |
+| `--padding <int>` | 아틀라스 패딩 | `7` |
+| `--charset <txtpath or characters>` | 문자셋 파일 경로 또는 직접 문자열 | `./CharList_3911.txt` |
+| `--rendermode <sdf,raster>` | 출력 렌더 모드 | `sdf` |
 
 ## 소스 실행 (선택)
 
@@ -176,10 +199,10 @@ EXE 대신 Python 소스로 실행하려면:
 ### 요구 사항
 
 - Python 3.12 권장
-- 패키지: `UnityPy(포크)`, `TypeTreeGeneratorAPI`, `Pillow`
+- 패키지: `UnityPy(포크)`, `TypeTreeGeneratorAPI`, `Pillow`, `numpy`, `scipy`
 
 ```bash
-pip install TypeTreeGeneratorAPI Pillow
+pip install TypeTreeGeneratorAPI Pillow numpy scipy
 pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
 ```
 
@@ -196,6 +219,8 @@ python export_fonts.py "D:\MyGame"
 - 저장 시 원본 압축 우선이 필요하면 `--original-compress`를 사용하세요.
 - 저장 속도가 느리면 `--temp-dir`로 임시 저장 폴더를 빠른 SSD/NVMe 경로로 지정해 보세요.
 - 프로그램 종료 시 임시 폴더는 자동 정리됩니다.
+- `--parse`는 파일 단위 워커 프로세스로 스캔해 단일 파일 크래시가 전체 작업 중단으로 이어지지 않도록 격리합니다.
+- 스캔은 블랙리스트 기반 제외를 사용합니다 (`*.bak`, `.info`, `.config` 등 제외).
 - 대형 SDF 다건 교체에서는 기본적으로 one-shot 실패 시 적응형 분할 저장(배치 크기 자동 조절)으로 폴백합니다.
   - `--split-save-force`: one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장
   - `--oneshot-save-force`: 분할 저장 폴백 비활성화(one-shot만 시도)
@@ -204,6 +229,7 @@ python export_fonts.py "D:\MyGame"
 - 게임 원본 줄 간격 메트릭을 그대로 쓰려면 `--use-game-line-metrics`를 사용하세요. pointSize는 항상 교체 폰트 값을 사용합니다.
 - SDF 교체 시 기본은 `KR_ASSETS/* SDF Material.json` 머티리얼 float를 적용하며, padding 비율 기준 보정도 함께 적용합니다.
 - 원본 게임 머티리얼 스타일을 유지하려면 `--use-game-material`을 사용하세요.
+- Raster 입력을 SDF 슬롯에 교체할 때는 SDF 머티리얼 효과값(Outline/Underlay/Glow 등)을 자동으로 0에 가깝게 보정해 박스 아티팩트를 줄입니다.
 - TMP(FontAsset) 파싱/교체를 위해 `TypeTreeGeneratorAPI`가 필요합니다.
 - 게임 파일 수정 전 백업을 권장합니다.
 - 일부 게임은 무결성 검사로 수정 파일이 원복될 수 있습니다.

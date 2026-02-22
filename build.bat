@@ -36,7 +36,7 @@ if not exist "%VENV_PY%" (
 echo [build] Using venv python: %VENV_PY%
 
 "%VENV_PY%" -m pip install --upgrade pip
-"%VENV_PY%" -m pip install pyinstaller TypeTreeGeneratorAPI Pillow fmod_toolkit archspec
+"%VENV_PY%" -m pip install pyinstaller TypeTreeGeneratorAPI Pillow fmod_toolkit archspec numpy scipy fonttools
 "%VENV_PY%" -m pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
 "%VENV_PY%" -c "import UnityPy,sys; print(sys.version); print(UnityPy.__file__)"
 
@@ -44,6 +44,7 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist unity_font_replacer.spec del unity_font_replacer.spec
 if exist export_fonts.spec del export_fonts.spec
+if exist make_sdf.spec del make_sdf.spec
 
 "%VENV_PY%" -m PyInstaller --onefile --name unity_font_replacer ^
   --clean ^
@@ -63,13 +64,23 @@ if exist export_fonts.spec del export_fonts.spec
   --collect-all archspec ^
   export_fonts.py
 
+"%VENV_PY%" -m PyInstaller --onefile --name make_sdf ^
+  --clean ^
+  --noconfirm ^
+  --collect-all numpy ^
+  --collect-all scipy ^
+  --collect-all fontTools ^
+  make_sdf.py
+
 if exist release rmdir /s /q release
 mkdir release
 copy dist\unity_font_replacer.exe release\ >nul
 copy dist\export_fonts.exe release\ >nul
+copy dist\make_sdf.exe release\ >nul
 xcopy KR_ASSETS release\KR_ASSETS\ /E /I >nul
 xcopy Il2CppDumper release\Il2CppDumper\ /E /I >nul
 copy README.md release\ >nul
+if exist CharList_3911.txt copy CharList_3911.txt release\ >nul
 
 set ZIP_NAME=Unity_Font_Replacer_%VERSION%.zip
 if exist "%ZIP_NAME%" del "%ZIP_NAME%"

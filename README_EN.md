@@ -48,14 +48,14 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 | Option | Description |
 |------|------|
 | `--gamepath <path>` | Game root path or `_Data` folder path |
-| `--parse` | Export font info to JSON |
+| `--parse` | Export font info to JSON (file-level worker scan to isolate crashes) |
 | `--mulmaru` | Bulk replace all fonts with Mulmaru |
 | `--nanumgothic` | Bulk replace all fonts with NanumGothic |
 | `--sdfonly` | Replace SDF fonts only |
 | `--ttfonly` | Replace TTF fonts only |
 | `--list <JSON>` | Replace fonts from a JSON mapping |
 | `--target-file <name>` | Limit replacement targets to specific file name(s) (repeatable/comma-separated) |
-| `--use-game-mat` | Keep original in-game Material parameters for SDF replacement |
+| `--use-game-mat` | Keep original in-game Material parameters for SDF replacement (box artifacts may appear with Raster inputs) |
 | `--use-game-line-metrics` | Keep in-game line metrics (LineHeight/Ascender/Descender, etc.) for SDF replacement (pointSize still follows replacement font) |
 | `--original-compress` | Prefer original compression mode on save (default: uncompressed-family first) |
 | `--temp-dir <path>` | Set root path for temporary save files (fast SSD/NVMe recommended) |
@@ -133,6 +133,8 @@ JSON example:
   - `Mulmaru` or `Mulmaru.ttf`
   - `NanumGothic` or `NanumGothic.ttf`
   - `Mulmaru SDF` or `Mulmaru SDF.json` or `Mulmaru SDF Atlas.png`
+  - `Mulmaru Raster` or `Mulmaru Raster.json` or `Mulmaru Raster Atlas.png`
+  - `NGothic` or `NGothic.json` or `NGothic Atlas.png` or `NGothic Material.json`
 
 ## Font Export (export_fonts_en.exe)
 
@@ -166,11 +168,32 @@ Output files are created in the current working directory:
 
 Add these files under `KR_ASSETS`:
 
-- `FontName.ttf`
-- `FontName SDF.json`
-- `FontName SDF Atlas.png`
+- `FontName.ttf` (required)
+- `FontName.otf` (optional, can replace `.ttf`)
+- `FontName SDF.json` or `FontName Raster.json` or `FontName.json` (optional, required for SDF replacement)
+- `FontName SDF Atlas.png` or `FontName Raster Atlas.png` or `FontName Atlas.png` (optional, required for SDF replacement)
+- `FontName SDF Material.json` or `FontName Raster Material.json` or `FontName Material.json` (optional)
 
-You can generate SDF font data with `export_fonts_en.exe`.
+If SDF data is missing, generate it first with `make_sdf.py` below or extract it with `export_fonts_en.exe`.
+
+## SDF Generator (make_sdf.py)
+
+You can generate TMP-compatible JSON/atlas directly from a TTF:
+
+```bash
+python make_sdf.py --ttf Mulmaru.ttf
+```
+
+Supported options:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--ttf <ttfname>` | TTF file path/name | (required) |
+| `--atlas-size <w,h>` | Atlas resolution | `4096,4096` |
+| `--point-size <int or auto>` | Sampling point size | `auto` |
+| `--padding <int>` | Atlas padding | `7` |
+| `--charset <txtpath or characters>` | Charset file path or literal characters | `./CharList_3911.txt` |
+| `--rendermode <sdf,raster>` | Output render mode | `sdf` |
 
 ## Run from Source (Optional)
 
@@ -179,10 +202,10 @@ If you prefer Python scripts instead of EXEs:
 ### Requirements
 
 - Python 3.12 recommended
-- Packages: `UnityPy (fork)`, `TypeTreeGeneratorAPI`, `Pillow`
+- Packages: `UnityPy (fork)`, `TypeTreeGeneratorAPI`, `Pillow`, `numpy`, `scipy`
 
 ```bash
-pip install TypeTreeGeneratorAPI Pillow
+pip install TypeTreeGeneratorAPI Pillow numpy scipy
 pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
 ```
 
@@ -198,6 +221,8 @@ python export_fonts_en.py "D:\MyGame"
 - Default save order prefers uncompressed-family modes (`safe-none -> legacy-none`), then falls back to `original -> lz4`.
 - Use `--original-compress` to prefer original compression mode first.
 - If save is slow, try `--temp-dir` and point it to a fast SSD/NVMe path.
+- `--parse` scans via per-file worker processes so a crash in one file does not terminate the whole scan.
+- Scanning uses blacklist-based exclusion (`*.bak`, `.info`, `.config`, etc.).
 - For large multi-SDF replacements, split-save fallback is enabled by default when one-shot fails (adaptive batch size).
   - `--split-save-force`: skip one-shot and force one-by-one SDF split-save.
   - `--oneshot-save-force`: disable split-save fallback and try one-shot only.
@@ -206,6 +231,7 @@ python export_fonts_en.py "D:\MyGame"
   This option still keeps pointSize from the replacement font.
 - For SDF replacement, default behavior applies material floats from `KR_ASSETS/* SDF Material.json`.
   Use `--use-game-mat` to preserve original in-game material style.
+- When a Raster asset is injected into an SDF slot, SDF material effect floats (outline/underlay/glow) are automatically neutralized to reduce box artifacts.
 - `TypeTreeGeneratorAPI` is required for TMP(FontAsset) parsing/replacement.
 - Back up game files before modification.
 - Some games may restore modified files by integrity checks.

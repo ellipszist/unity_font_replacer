@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import traceback as tb_module
 from functools import lru_cache
 from typing import Any, Callable, Iterable, Literal, NoReturn, cast
@@ -283,13 +284,22 @@ def normalize_font_name(name: str) -> str:
     """KR: 확장자/SDF 접미사를 제거해 폰트 기본 이름으로 정규화합니다.
     EN: Normalize font name by removing extension and SDF suffixes.
     """
-    for ext in [".ttf", ".json", ".png"]:
+    for ext in [".ttf", ".otf", ".json", ".png"]:
         if name.lower().endswith(ext):
             name = name[:-len(ext)]
-    if name.endswith(" SDF Atlas"):
-        name = name[:-len(" SDF Atlas")]
-    elif name.endswith(" SDF"):
-        name = name[:-len(" SDF")]
+    for suffix in (
+        " SDF Atlas",
+        " Raster Atlas",
+        " Atlas",
+        " SDF Material",
+        " Raster Material",
+        " Material",
+        " SDF",
+        " Raster",
+    ):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
     return name
 
 
@@ -772,14 +782,21 @@ def find_assets_files(
     data_path = get_data_path(game_path, lang=lang)
     assets_files: list[str] = []
     normalized_targets = {os.path.basename(name) for name in target_files} if target_files else None
-    exclude_exts = {".dll", ".manifest", ".exe", ".txt", ".json", ".xml", ".log", ".ini", ".cfg", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".wav", ".mp3", ".ogg", ".mp4", ".avi", ".mov"}
+    blacklist_exts = {
+        ".dll", ".manifest", ".exe", ".txt", ".json", ".xml", ".log", ".ini", ".cfg",
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".wav", ".mp3", ".ogg", ".mp4",
+        ".avi", ".mov",
+        ".bak", ".info", ".config",
+    }
+
     for root, _, files in os.walk(data_path):
         for fn in files:
             if normalized_targets is not None and fn not in normalized_targets:
                 continue
             ext = os.path.splitext(fn)[1].lower()
-            if ext not in exclude_exts:
-                assets_files.append(os.path.join(root, fn))
+            if ext in blacklist_exts:
+                continue
+            assets_files.append(os.path.join(root, fn))
     assets_files.sort()
     return assets_files
 
@@ -828,15 +845,213 @@ def _create_generator(
     return generator
 
 
+def _scan_fonts_from_env(env: Any, file_name: str, lang: Language = "ko") -> dict[str, list[JsonDict]]:
+    """KR: 로드된 UnityPy env에서 TTF/SDF 폰트 정보를 추출합니다.
+    EN: Extract TTF/SDF font entries from a loaded UnityPy env.
+    """
+    scanned: dict[str, list[JsonDict]] = {"ttf": [], "sdf": []}
+
+    for obj in env.objects:
+        try:
+            if obj.type.name == "Font":
+                font_name = obj.peek_name()
+                if not font_name:
+                    try:
+                        font = obj.parse_as_object()
+                        font_name = getattr(font, "m_Name", "") or ""
+                    except Exception:
+                        font_name = ""
+                scanned["ttf"].append({
+                    "file": file_name,
+                    "assets_name": obj.assets_file.name,
+                    "name": font_name,
+                    "path_id": obj.path_id,
+                })
+            elif obj.type.name == "MonoBehaviour":
+                parse_dict = None
+                is_font = False
+                try:
+                    parse_dict = obj.parse_as_dict()
+                    # KR: TMP 스키마 판별: 신형(m_FaceInfo/m_AtlasTextures) 또는 구형(m_fontInfo/atlas)
+                    # EN: Detect TMP schema: new(m_FaceInfo/m_AtlasTextures) or old(m_fontInfo/atlas)
+                    if ("m_AtlasTextures" in parse_dict and "m_FaceInfo" in parse_dict) or \
+                       ("atlas" in parse_dict and "m_fontInfo" in parse_dict):
+                        is_font = True
+                except Exception:
+                    if lang == "ko":
+                        debug_parse_log(f"[scan_fonts] parse_as_dict 실패: {file_name} | PathID {obj.path_id}")
+                    else:
+                        debug_parse_log(f"[scan_fonts] parse_as_dict failed: {file_name} | PathID {obj.path_id}")
+
+                if not is_font:
+                    continue
+
+                try:
+                    if parse_dict is None:
+                        parse_dict = obj.parse_as_dict()
+                    atlas_textures = parse_dict.get("m_AtlasTextures", [])
+                    glyph_count = len(parse_dict.get("m_GlyphTable", []))
+                    if not atlas_textures and "atlas" in parse_dict:
+                        atlas_textures = []
+                    if glyph_count == 0:
+                        glyph_count = len(parse_dict.get("m_glyphInfoList", []))
+                    if atlas_textures:
+                        first_atlas = atlas_textures[0]
+                        file_id = first_atlas.get("m_FileID", 0)
+                        path_id = first_atlas.get("m_PathID", 0)
+                        # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 교체 대상이 아닙니다.
+                        # EN: External stubs (FileID!=0, PathID=0) are not valid replacement targets.
+                        if file_id != 0 and path_id == 0:
+                            continue
+                    if glyph_count == 0:
+                        continue
+                except Exception:
+                    if lang == "ko":
+                        debug_parse_log(f"[scan_fonts] SDF 필드 검사 실패: {file_name} | PathID {obj.path_id}")
+                    else:
+                        debug_parse_log(f"[scan_fonts] SDF field check failed: {file_name} | PathID {obj.path_id}")
+                    continue
+
+                scanned["sdf"].append({
+                    "file": file_name,
+                    "assets_name": obj.assets_file.name,
+                    "name": obj.peek_name(),
+                    "path_id": obj.path_id,
+                })
+        except Exception as e:
+            if lang == "ko":
+                print(f"[scan_fonts] 오브젝트 처리 실패: {file_name} | PathID {obj.path_id} ({e})")
+            else:
+                print(f"[scan_fonts] Object processing failed: {file_name} | PathID {obj.path_id} ({e})")
+            continue
+
+    return scanned
+
+
+def _scan_fonts_in_asset_file(
+    assets_file: str,
+    generator: TypeTreeGenerator,
+    lang: Language = "ko",
+) -> tuple[dict[str, list[JsonDict]], str | None]:
+    """KR: 단일 에셋 파일을 로드해 폰트 정보를 추출합니다.
+    EN: Load one asset file and extract font entries.
+    """
+    file_name = os.path.basename(assets_file)
+    scanned: dict[str, list[JsonDict]] = {"ttf": [], "sdf": []}
+
+    env = None
+    try:
+        env = UnityPy.load(assets_file)
+        env.typetree_generator = generator
+    except Exception as e:
+        if lang == "ko":
+            return scanned, f"UnityPy.load 실패: {assets_file} ({e})"
+        return scanned, f"UnityPy.load failed: {assets_file} ({e})"
+
+    try:
+        scanned = _scan_fonts_from_env(env, file_name, lang=lang)
+    finally:
+        close_unitypy_env(env)
+        env = None
+        gc.collect()
+
+    return scanned, None
+
+
+def _scan_fonts_via_worker(
+    game_path: str,
+    assets_file: str,
+    lang: Language = "ko",
+) -> tuple[dict[str, list[JsonDict]], str | None]:
+    """KR: 파일 단위 서브프로세스 워커로 스캔해 크래시를 격리합니다.
+    EN: Scan using a per-file subprocess worker to isolate hard crashes.
+    """
+    fd, output_path = tempfile.mkstemp(prefix="scan_worker_", suffix=".json")
+    os.close(fd)
+    worker_exit_hints = {
+        -1073741819: "ACCESS_VIOLATION(0xC0000005)",
+        3221225477: "ACCESS_VIOLATION(0xC0000005)",
+    }
+    try:
+        if getattr(sys, "frozen", False):
+            cmd = [
+                sys.executable,
+                "--gamepath",
+                game_path,
+                "--_scan-file-worker",
+                assets_file,
+                "--_scan-file-worker-output",
+                output_path,
+            ]
+        else:
+            cmd = [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--gamepath",
+                game_path,
+                "--_scan-file-worker",
+                assets_file,
+                "--_scan-file-worker-output",
+                output_path,
+            ]
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1800,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            hint = worker_exit_hints.get(int(proc.returncode))
+            hint_text = f" [{hint}]" if hint else ""
+            if lang == "ko":
+                return {"ttf": [], "sdf": []}, f"scan worker 실패 (exit={proc.returncode}{hint_text}): {detail}"
+            return {"ttf": [], "sdf": []}, f"scan worker failed (exit={proc.returncode}{hint_text}): {detail}"
+
+        if not os.path.exists(output_path):
+            if lang == "ko":
+                return {"ttf": [], "sdf": []}, "scan worker 결과 파일이 없습니다."
+            return {"ttf": [], "sdf": []}, "scan worker output file is missing."
+
+        with open(output_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        scanned = {
+            "ttf": list(payload.get("ttf", [])) if isinstance(payload, dict) else [],
+            "sdf": list(payload.get("sdf", [])) if isinstance(payload, dict) else [],
+        }
+        worker_error = None
+        if isinstance(payload, dict):
+            worker_error = payload.get("error")
+            if not isinstance(worker_error, str):
+                worker_error = None
+        return scanned, worker_error
+    except Exception as e:
+        if lang == "ko":
+            return {"ttf": [], "sdf": []}, f"scan worker 실행 실패: {e!r}"
+        return {"ttf": [], "sdf": []}, f"failed to run scan worker: {e!r}"
+    finally:
+        try:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except Exception:
+            pass
+
+
 def scan_fonts(
     game_path: str,
     lang: Language = "ko",
     target_files: set[str] | None = None,
+    isolate_files: bool = True,
 ) -> dict[str, list[JsonDict]]:
     """KR: 게임 에셋을 스캔해 TTF/SDF 폰트 목록을 반환합니다.
     KR: target_files가 있으면 해당 파일만 스캔합니다.
+    KR: isolate_files=True면 파일 단위 워커 프로세스로 스캔해 크래시를 격리합니다.
     EN: Scan game assets and return TTF/SDF font entries.
     EN: If target_files is provided, only scan those files.
+    EN: If isolate_files=True, scan each file via worker subprocess to isolate hard crashes.
     """
     data_path = get_data_path(game_path, lang=lang)
     unity_version = get_unity_version(game_path, lang=lang)
@@ -868,97 +1083,23 @@ def scan_fonts(
         else:
             print(f"[scan_fonts] Progress {idx}/{total_files}: {fn}")
 
-        env = None
-        try:
-            env = UnityPy.load(assets_file)
-            env.typetree_generator = generator
-
-        except Exception as e:
-            if lang == "ko":
-                print(f"[scan_fonts] UnityPy.load 실패: {assets_file} ({e})")
-            else:
-                print(f"[scan_fonts] UnityPy.load failed: {assets_file} ({e})")
+        if isolate_files:
+            scanned, worker_error = _scan_fonts_via_worker(game_path, assets_file, lang=lang)
+            if worker_error:
+                if lang == "ko":
+                    print(f"[scan_fonts] 워커 경고: {worker_error}")
+                else:
+                    print(f"[scan_fonts] Worker warning: {worker_error}")
+            fonts["ttf"].extend(scanned.get("ttf", []))
+            fonts["sdf"].extend(scanned.get("sdf", []))
             continue
 
-        try:
-            for obj in env.objects:
-                try:
-                    if obj.type.name == "Font":
-                        font = obj.parse_as_object()
-                        fonts["ttf"].append({
-                            "file": fn,
-                            "assets_name": obj.assets_file.name,
-                            "name": font.m_Name,
-                            "path_id": obj.path_id
-                        })
-                    elif obj.type.name == "MonoBehaviour":
-                        parse_dict = None
-                        is_font = False
-                        try:
-                            parse_obj = obj.parse_as_object()
-                            if hasattr(parse_obj, 'get_type') and parse_obj.get_type() == "TMP_FontAsset":
-                                is_font = True
-                        except Exception:
-                            if lang == "ko":
-                                debug_parse_log(f"[scan_fonts] parse_as_object 실패: {fn} | PathID {obj.path_id}")
-                            else:
-                                debug_parse_log(f"[scan_fonts] parse_as_object failed: {fn} | PathID {obj.path_id}")
-                        if not is_font:
-                            try:
-                                parse_dict = obj.parse_as_dict()
-                                # KR: TMP 스키마 판별: 신형(m_FaceInfo/m_AtlasTextures) 또는 구형(m_fontInfo/atlas)
-                                # EN: Detect TMP schema: new(m_FaceInfo/m_AtlasTextures) or old(m_fontInfo/atlas)
-                                if ("m_AtlasTextures" in parse_dict and "m_FaceInfo" in parse_dict) or \
-                                   ("atlas" in parse_dict and "m_fontInfo" in parse_dict):
-                                    is_font = True
-                            except Exception:
-                                if lang == "ko":
-                                    debug_parse_log(f"[scan_fonts] parse_as_dict 실패: {fn} | PathID {obj.path_id}")
-                                else:
-                                    debug_parse_log(f"[scan_fonts] parse_as_dict failed: {fn} | PathID {obj.path_id}")
-                        if is_font:
-                            try:
-                                if parse_dict is None:
-                                    parse_dict = obj.parse_as_dict()
-                                # KR: 신형/구형 TMP 모두에서 유효 글리프를 확인합니다.
-                                # EN: Validate effective glyph presence across new/old TMP schemas.
-                                atlas_textures = parse_dict.get("m_AtlasTextures", [])
-                                glyph_count = len(parse_dict.get("m_GlyphTable", []))
-                                if not atlas_textures and "atlas" in parse_dict:
-                                    atlas_textures = []
-                                if glyph_count == 0:
-                                    glyph_count = len(parse_dict.get("m_glyphInfoList", []))
-                                if atlas_textures:
-                                    first_atlas = atlas_textures[0]
-                                    file_id = first_atlas.get("m_FileID", 0)
-                                    path_id = first_atlas.get("m_PathID", 0)
-                                    # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 교체 대상이 아닙니다.
-                                    # EN: External stubs (FileID!=0, PathID=0) are not valid replacement targets.
-                                    if file_id != 0 and path_id == 0:
-                                        continue
-                                if glyph_count == 0:
-                                    continue
-                            except Exception:
-                                if lang == "ko":
-                                    debug_parse_log(f"[scan_fonts] SDF 필드 검사 실패: {fn} | PathID {obj.path_id}")
-                                else:
-                                    debug_parse_log(f"[scan_fonts] SDF field check failed: {fn} | PathID {obj.path_id}")
-                            fonts["sdf"].append({
-                                "file": fn,
-                                "assets_name": obj.assets_file.name,
-                                "name": obj.peek_name(),
-                                "path_id": obj.path_id
-                            })
-                except Exception as e:
-                    if lang == "ko":
-                        print(f"[scan_fonts] 오브젝트 처리 실패: {fn} | PathID {obj.path_id} ({e})")
-                    else:
-                        print(f"[scan_fonts] Object processing failed: {fn} | PathID {obj.path_id} ({e})")
-                    continue
-        finally:
-            close_unitypy_env(env)
-            env = None
-            gc.collect()
+        scanned, load_error = _scan_fonts_in_asset_file(assets_file, generator, lang=lang)
+        if load_error:
+            print(f"[scan_fonts] {load_error}")
+            continue
+        fonts["ttf"].extend(scanned.get("ttf", []))
+        fonts["sdf"].extend(scanned.get("sdf", []))
 
     return fonts
 
@@ -973,7 +1114,9 @@ def parse_fonts(
     EN: Save scanned fonts to JSON and return output file path.
     EN: If target_files is provided, parse only those files.
     """
-    fonts = scan_fonts(game_path, lang=lang, target_files=target_files)
+    # KR: parse 모드는 파일 단위 워커로 스캔해 UnityPy 하드 크래시를 격리합니다.
+    # EN: Parse mode scans via per-file workers to isolate hard UnityPy crashes.
+    fonts = scan_fonts(game_path, lang=lang, target_files=target_files, isolate_files=True)
     game_name = os.path.basename(game_path)
     output_file = os.path.join(get_script_dir(), f"{game_name}.json")
 
@@ -1021,34 +1164,84 @@ def _load_font_assets_cached(script_dir: str, normalized: str) -> JsonDict:
     EN: Load and cache font resources from KR_ASSETS.
     """
     kr_assets = os.path.join(script_dir, "KR_ASSETS")
+    raw_name = str(normalized).strip()
 
-    ttf_path = os.path.join(kr_assets, f"{normalized}.ttf")
+    def _dedupe_preserve_order(names: list[str]) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for item in names:
+            key = item.strip()
+            if not key:
+                continue
+            lowered = key.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            ordered.append(key)
+        return ordered
+
+    def _strip_render_suffix(name: str) -> str:
+        if name.endswith(" SDF"):
+            return name[:-len(" SDF")]
+        if name.endswith(" Raster"):
+            return name[:-len(" Raster")]
+        return name
+
+    base_name = _strip_render_suffix(raw_name)
+    has_explicit_variant = raw_name.endswith(" SDF") or raw_name.endswith(" Raster")
+    if has_explicit_variant:
+        explicit_candidates = [raw_name, base_name]
+        if raw_name.endswith(" Raster"):
+            explicit_candidates.append(f"{base_name} SDF")
+        elif raw_name.endswith(" SDF"):
+            explicit_candidates.append(f"{base_name} Raster")
+        name_candidates = _dedupe_preserve_order(explicit_candidates)
+    else:
+        name_candidates = _dedupe_preserve_order([raw_name, f"{base_name} SDF", f"{base_name} Raster"])
+
+    font_name_candidates = _dedupe_preserve_order([raw_name, base_name] + name_candidates)
+
     ttf_data = None
-    if os.path.exists(ttf_path):
-        with open(ttf_path, "rb") as f:
-            ttf_data = f.read()
+    for font_name in font_name_candidates:
+        for ext in (".ttf", ".otf"):
+            font_path = os.path.join(kr_assets, f"{font_name}{ext}")
+            if os.path.exists(font_path):
+                with open(font_path, "rb") as f:
+                    ttf_data = f.read()
+                break
+        if ttf_data is not None:
+            break
 
-    sdf_json_path = os.path.join(kr_assets, f"{normalized} SDF.json")
     sdf_data = None
     sdf_data_normalized = None
-    if os.path.exists(sdf_json_path):
+    for name_candidate in name_candidates:
+        sdf_json_path = os.path.join(kr_assets, f"{name_candidate}.json")
+        if not os.path.exists(sdf_json_path):
+            continue
         with open(sdf_json_path, "r", encoding="utf-8") as f:
             sdf_data = json.load(f)
         if isinstance(sdf_data, dict):
             sdf_data_normalized = normalize_sdf_data(sdf_data, deep_copy=True)
+        break
 
-    sdf_atlas_path = os.path.join(kr_assets, f"{normalized} SDF Atlas.png")
     sdf_atlas = None
-    if os.path.exists(sdf_atlas_path):
+    for name_candidate in name_candidates:
+        sdf_atlas_path = os.path.join(kr_assets, f"{name_candidate} Atlas.png")
+        if not os.path.exists(sdf_atlas_path):
+            continue
         with open(sdf_atlas_path, "rb") as f:
             sdf_atlas = Image.open(f)
             sdf_atlas.load()
+        break
 
-    sdf_material_path = os.path.join(kr_assets, f"{normalized} SDF Material.json")
     sdf_material_data = None
-    if os.path.exists(sdf_material_path):
+    for name_candidate in name_candidates:
+        sdf_material_path = os.path.join(kr_assets, f"{name_candidate} Material.json")
+        if not os.path.exists(sdf_material_path):
+            continue
         with open(sdf_material_path, "r", encoding="utf-8") as f:
             sdf_material_data = json.load(f)
+        break
 
     return {
         "ttf_data": ttf_data,
@@ -1261,6 +1454,7 @@ def replace_fonts_in_file(
                 target_sdf_font_by_pathid.setdefault(path_id, value)
     matched_sdf_targets = 0
     patched_sdf_targets = 0
+    sdf_parse_failure_reasons: list[str] = []
 
     def _close_reader(obj: Any) -> None:
         """KR: UnityPy 내부 reader/객체를 안전하게 dispose합니다.
@@ -1336,11 +1530,15 @@ def replace_fonts_in_file(
                 continue
             try:
                 parse_dict = obj.parse_as_dict()
-            except Exception:
+            except Exception as e:
+                reason = f"PathID {obj.path_id} parse_as_dict 실패 [{type(e).__name__}]: {e!r}"
+                sdf_parse_failure_reasons.append(reason)
                 if lang == "ko":
-                    debug_parse_log(f"[replace_fonts] MonoBehaviour parse_as_dict 실패: {fn_without_path} | PathID {obj.path_id}")
+                    print(f"  경고: {reason}")
+                    debug_parse_log(f"[replace_fonts] MonoBehaviour parse_as_dict 실패: {fn_without_path} | {reason}")
                 else:
-                    debug_parse_log(f"[replace_fonts] MonoBehaviour parse_as_dict failed: {fn_without_path} | PathID {obj.path_id}")
+                    print(f"  Warning: PathID {obj.path_id} parse_as_dict failed [{type(e).__name__}]: {e!r}")
+                    debug_parse_log(f"[replace_fonts] MonoBehaviour parse_as_dict failed: {fn_without_path} | {reason}")
                 continue
             has_new_keys = "m_FaceInfo" in parse_dict and "m_AtlasTextures" in parse_dict
             has_old_keys = "m_fontInfo" in parse_dict and "atlas" in parse_dict
@@ -1382,6 +1580,11 @@ def replace_fonts_in_file(
                         replace_data = assets.get("sdf_data_normalized")
                         if not isinstance(replace_data, dict):
                             replace_data = normalize_sdf_data(assets["sdf_data"])
+                        try:
+                            replacement_render_mode = int(replace_data.get("m_AtlasRenderMode", 4118) or 0)
+                        except Exception:
+                            replacement_render_mode = 4118
+                        replacement_is_sdf = (replacement_render_mode & 0x1000) != 0
                         game_padding_for_material = 0.0
 
                         # KR: GameObject/Script/Material/Atlas 참조는 기존 PathID를 유지해야 런타임 연결이 깨지지 않습니다.
@@ -1589,11 +1792,18 @@ def replace_fonts_in_file(
                             float_overrides: dict[str, float] = {}
                             material_padding_ratio = 1.0
                             material_data = assets.get("sdf_materials")
+                            if (not replacement_is_sdf) and use_game_mat:
+                                if lang == "ko":
+                                    print("  경고: Raster 폰트에 --use-game-material 사용 시 박스 아티팩트가 생길 수 있습니다.")
+                                else:
+                                    print("  Warning: using --use-game-material with Raster fonts may cause box artifacts.")
                             try:
                                 replacement_padding = float(replace_data.get("m_AtlasPadding", 0))
                             except Exception:
                                 replacement_padding = 0.0
                             if (
+                                replacement_is_sdf
+                                and
                                 material_scale_by_padding
                                 and game_padding_for_material > 0
                                 and replacement_padding > 0
@@ -1618,6 +1828,21 @@ def replace_fonts_in_file(
                                         if key in float_overrides:
                                             float_overrides[key] = float(float_overrides[key] * material_padding_ratio)
                                 gradient_scale = float_overrides.get("_GradientScale")
+                            if apply_replacement_material and not replacement_is_sdf:
+                                # KR: Raster atlas를 SDF 머티리얼로 렌더링할 때 박스 아티팩트를 줄이기 위해
+                                # KR: dilate/outline/underlay/glow 계열을 0으로 리셋합니다.
+                                # EN: Reduce box artifacts when raster atlases are sampled by SDF materials by
+                                # EN: resetting dilate/outline/underlay/glow-like params to 0.
+                                float_overrides["_GradientScale"] = 1.0
+                                for key in material_padding_scale_keys:
+                                    if key == "_GradientScale":
+                                        continue
+                                    float_overrides[key] = 0.0
+                                gradient_scale = 1.0
+                                if lang == "ko":
+                                    print("  Raster 모드 감지: Material SDF 효과값을 0으로 보정합니다.")
+                                else:
+                                    print("  Raster mode detected: neutralizing SDF material effect floats.")
                             if material_scale_by_padding and apply_replacement_material and material_padding_ratio != 1.0:
                                 if lang == "ko":
                                     print(
@@ -1638,6 +1863,22 @@ def replace_fonts_in_file(
                         obj.patch(parse_dict)
                         patched_sdf_targets += 1
                         modified = True
+                    else:
+                        missing_parts: list[str] = []
+                        if assets.get("sdf_data") is None:
+                            missing_parts.append("json")
+                        if assets.get("sdf_atlas") is None:
+                            missing_parts.append("atlas")
+                        if lang == "ko":
+                            print(
+                                f"  경고: 교체 리소스 누락으로 SDF 적용 건너뜀: {replacement_font} "
+                                f"(누락: {', '.join(missing_parts) if missing_parts else 'unknown'})"
+                            )
+                        else:
+                            print(
+                                f"  Warning: skipping SDF patch due to missing replacement assets: {replacement_font} "
+                                f"(missing: {', '.join(missing_parts) if missing_parts else 'unknown'})"
+                            )
 
     for obj in env.objects:
         assets_name = obj.assets_file.name
@@ -1676,6 +1917,7 @@ def replace_fonts_in_file(
             print(f"Saving '{fn_without_path}'...")
 
         save_success = False
+        last_save_failure_reason: str | None = None
 
         def _save_env_file(
             packer: Any = None,
@@ -1718,24 +1960,25 @@ def replace_fonts_in_file(
                 return typed_save()
             return typed_save(packer=packer)
 
-        def _validate_saved_file(saved_path: str) -> bool:
+        def _validate_saved_file(saved_path: str) -> tuple[bool, str | None]:
             """KR: 저장 결과 파일이 Unity bundle로 다시 열리는지 검증합니다.
             EN: Validate saved output by attempting to reload from file path.
             """
             signature = source_bundle_signature or getattr(env_file, "signature", None)
             if signature not in bundle_signatures:
-                return True
+                return True, None
             saved_signature = _read_bundle_signature(saved_path)
             if saved_signature != signature:
+                reason = (
+                    f"번들 시그니처 불일치 (기대: {signature}, 결과: {saved_signature or 'None'})"
+                    if lang == "ko"
+                    else f"bundle signature mismatch (expected: {signature}, got: {saved_signature or 'None'})"
+                )
                 if lang == "ko":
-                    print(
-                        f"  저장 검증 실패: 번들 시그니처 불일치 (기대: {signature}, 결과: {saved_signature or 'None'})"
-                    )
+                    print(f"  저장 검증 실패: {reason}")
                 else:
-                    print(
-                        f"  Save validation failed: bundle signature mismatch (expected: {signature}, got: {saved_signature or 'None'})"
-                    )
-                return False
+                    print(f"  Save validation failed: {reason}")
+                return False, reason
             try:
                 if getattr(sys, "frozen", False):
                     cmd = [sys.executable, "--_validate-bundle", saved_path]
@@ -1750,25 +1993,31 @@ def replace_fonts_in_file(
                     timeout=1800,
                 )
                 if proc.returncode == 0:
-                    return True
+                    return True, None
                 detail = (proc.stderr or proc.stdout or "").strip()
+                reason = (
+                    f"worker exit={proc.returncode}: {detail}"
+                    if detail
+                    else f"worker exit={proc.returncode}"
+                )
                 if lang == "ko":
-                    print(f"  저장 검증 실패 [worker exit={proc.returncode}]: {detail}")
+                    print(f"  저장 검증 실패 [{reason}]")
                 else:
-                    print(f"  Save validation failed [worker exit={proc.returncode}]: {detail}")
-                return False
+                    print(f"  Save validation failed [{reason}]")
+                return False, reason
             except Exception as e:
+                reason = f"검증 워커 실행 실패: {e!r}" if lang == "ko" else f"failed to run validation worker: {e!r}"
                 if lang == "ko":
                     print(f"  저장 검증 워커 실행 실패: {e!r}")
                 else:
                     print(f"  Failed to run save validation worker: {e!r}")
-                return False
+                return False, reason
 
         def _try_save(packer_label: Any, log_label: str) -> bool:
             """KR: 단일 저장 전략을 시도하고 성공 여부를 반환합니다.
             EN: Try one save strategy and return success status.
             """
-            nonlocal save_success
+            nonlocal save_success, last_save_failure_reason
             tmp_file = os.path.join(tmp_path, fn_without_path)
             has_save_to = callable(getattr(env_file, "save_to", None))
             saved_blob: bytes | None = None
@@ -1805,15 +2054,34 @@ def replace_fonts_in_file(
                     # Release large in-memory blob before optional validation to lower peak memory.
                     saved_blob = None
                 gc.collect()
-                if not _validate_saved_file(tmp_file):
+                is_valid, validation_reason = _validate_saved_file(tmp_file)
+                if not is_valid:
                     try:
-                        os.remove(tmp_file)
+                        saved_size = os.path.getsize(tmp_file)
+                    except Exception:
+                        saved_size = 0
+                    if saved_size > 0:
+                        if lang == "ko":
+                            print("  경고: 저장 검증에 실패했지만 무검증 저장으로 계속 진행합니다.")
+                            if validation_reason:
+                                print(f"  검증 실패 원인: {validation_reason}")
+                        else:
+                            print("  Warning: save validation failed, continuing with unvalidated save.")
+                            if validation_reason:
+                                print(f"  Validation failure reason: {validation_reason}")
+                        save_success = True
+                        return True
+                    last_save_failure_reason = validation_reason or "validation failed (empty output file)"
+                    try:
+                        if os.path.exists(tmp_file):
+                            os.remove(tmp_file)
                     except Exception:
                         pass
                     return False
                 save_success = True
                 return True
             except Exception as e:
+                last_save_failure_reason = f"method {log_label} [{type(e).__name__}]: {e!r}"
                 if lang == "ko":
                     print(f"  저장 방법 {log_label} 실패 [{type(e).__name__}]: {e!r}")
                 else:
@@ -1904,22 +2172,31 @@ def replace_fonts_in_file(
                     print("  경고: 저장된 파일을 찾을 수 없습니다")
                 else:
                     print("  Warning: saved file was not found")
+                last_save_failure_reason = "saved file was not found after save phase"
                 save_success = False
 
         if not save_success:
             if lang == "ko":
                 print("  오류: 파일 저장에 실패했습니다.")
+                if last_save_failure_reason:
+                    print(f"  실패 원인: {last_save_failure_reason}")
             else:
                 print("  Error: failed to save file.")
+                if last_save_failure_reason:
+                    print(f"  Failure reason: {last_save_failure_reason}")
     elif replace_sdf and target_sdf_pathids:
         if lang == "ko":
             print(
                 f"  경고: SDF 대상 {len(target_sdf_pathids)}건 중 매칭 {matched_sdf_targets}건, 적용 {patched_sdf_targets}건"
             )
+            if sdf_parse_failure_reasons:
+                print(f"  파싱 오류: {sdf_parse_failure_reasons[-1]}")
         else:
             print(
                 f"  Warning: SDF targets={len(target_sdf_pathids)}, matched={matched_sdf_targets}, patched={patched_sdf_targets}"
             )
+            if sdf_parse_failure_reasons:
+                print(f"  Parse error: {sdf_parse_failure_reasons[-1]}")
 
     if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
@@ -2038,6 +2315,39 @@ def run_validation_worker(bundle_path: str, lang: Language = "ko") -> int:
         return 2
 
 
+def run_scan_file_worker(
+    game_path: str,
+    assets_file: str,
+    output_path: str,
+    lang: Language = "ko",
+) -> int:
+    """KR: 단일 파일 파싱 워커입니다. 결과를 JSON 파일로 저장합니다.
+    EN: Single-file scan worker. Writes results to a JSON file.
+    """
+    try:
+        game_path, data_path = resolve_game_path(game_path, lang=lang)
+        unity_version = get_unity_version(game_path, lang=lang)
+        compile_method = get_compile_method(data_path)
+        generator = _create_generator(unity_version, game_path, data_path, compile_method, lang=lang)
+        scanned, load_error = _scan_fonts_in_asset_file(assets_file, generator, lang=lang)
+        payload: JsonDict = {
+            "ttf": scanned.get("ttf", []),
+            "sdf": scanned.get("sdf", []),
+            "error": load_error,
+        }
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        return 0
+    except Exception as e:
+        if lang == "ko":
+            print(f"[scan_worker] 실패: {e!r}")
+        else:
+            print(f"[scan_worker] failed: {e!r}")
+        if debug_parse_enabled():
+            tb_module.print_exc()
+        return 2
+
+
 def main_cli(lang: Language = "ko") -> None:
     """KR: 언어별 공통 CLI 진입점입니다.
     EN: Shared CLI entrypoint parameterized by language.
@@ -2117,6 +2427,8 @@ Examples:
     parser.add_argument("--oneshot-save-force", action="store_true", help=oneshot_save_force_help)
     parser.add_argument("--verbose", action="store_true", help=verbose_help)
     parser.add_argument("--_validate-bundle", type=str, metavar="BUNDLE_PATH", help=argparse.SUPPRESS)
+    parser.add_argument("--_scan-file-worker", type=str, metavar="ASSET_FILE_PATH", help=argparse.SUPPRESS)
+    parser.add_argument("--_scan-file-worker-output", type=str, metavar="OUTPUT_JSON_PATH", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -2144,6 +2456,28 @@ Examples:
     # KR: 기본은 split-save 폴백을 활성화합니다.
     # EN: Split-save fallback is enabled by default.
     args.split_save = not args.oneshot_save_force
+
+    if args._scan_file_worker:
+        if not args.gamepath:
+            if is_ko:
+                print("[scan_worker] 오류: --gamepath가 필요합니다.")
+            else:
+                print("[scan_worker] Error: --gamepath is required.")
+            raise SystemExit(2)
+        if not args._scan_file_worker_output:
+            if is_ko:
+                print("[scan_worker] 오류: --_scan-file-worker-output 경로가 필요합니다.")
+            else:
+                print("[scan_worker] Error: --_scan-file-worker-output path is required.")
+            raise SystemExit(2)
+        raise SystemExit(
+            run_scan_file_worker(
+                args.gamepath,
+                args._scan_file_worker,
+                args._scan_file_worker_output,
+                lang=lang,
+            )
+        )
 
     if args.temp_dir:
         args.temp_dir = os.path.abspath(str(args.temp_dir))
@@ -2637,6 +2971,10 @@ Examples:
                                             else:
                                                 print(f"  SDF batch progress: {idx}/{sdf_total} (next batch: {batch_size})")
                                 else:
+                                    if is_ko:
+                                        print("  SDF 배치 저장 실패: 내부 저장 단계가 False를 반환했습니다. 위 오류 로그를 확인하세요.")
+                                    else:
+                                        print("  SDF batch save failed: internal save stage returned False. Check previous error logs.")
                                     if current_batch <= 1:
                                         split_stopped = True
                                         if is_ko:
