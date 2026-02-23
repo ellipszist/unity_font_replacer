@@ -10,6 +10,46 @@ from PIL import Image, ImageDraw
 PS5_SWIZZLE_MASK_X = 0x385F0
 PS5_SWIZZLE_MASK_Y = 0x07A0F
 PS5_SWIZZLE_ROTATE = 90
+_PS5_MICRO_X_BITS = 5   # 32-pixel wide micro-tile (8bpp)
+_PS5_MICRO_Y_BITS = 4   # 16-pixel tall micro-tile (8bpp)
+
+
+@lru_cache(maxsize=64)
+def compute_ps5_swizzle_masks(width: int, height: int) -> tuple[int, int]:
+    """Compute PS5 swizzle bit-masks for the given power-of-two dimensions.
+
+    8bpp micro-tile is 32x16.  Macro-tile bits are interleaved as:
+    first-Y, first-X, remaining-Y..., remaining-X... above the micro bits.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid dimensions for PS5 swizzle masks: {width}x{height}")
+    if width & (width - 1) or height & (height - 1):
+        raise ValueError(f"PS5 swizzle requires power-of-two dimensions: {width}x{height}")
+    micro_w = 1 << _PS5_MICRO_X_BITS
+    micro_h = 1 << _PS5_MICRO_Y_BITS
+    if width < micro_w or height < micro_h:
+        raise ValueError(
+            f"Texture too small for PS5 swizzle micro-tile ({micro_w}x{micro_h}): {width}x{height}"
+        )
+    total_x = width.bit_length() - 1
+    total_y = height.bit_length() - 1
+    macro_x = total_x - _PS5_MICRO_X_BITS
+    macro_y = total_y - _PS5_MICRO_Y_BITS
+    mask_x = 0; mask_y = 0; pos = 0
+    for _ in range(_PS5_MICRO_Y_BITS):
+        mask_y |= 1 << pos; pos += 1
+    for _ in range(_PS5_MICRO_X_BITS):
+        mask_x |= 1 << pos; pos += 1
+    mx_rem = macro_x; my_rem = macro_y
+    if my_rem > 0:
+        mask_y |= 1 << pos; pos += 1; my_rem -= 1
+    if mx_rem > 0:
+        mask_x |= 1 << pos; pos += 1; mx_rem -= 1
+    for _ in range(my_rem):
+        mask_y |= 1 << pos; pos += 1
+    for _ in range(mx_rem):
+        mask_x |= 1 << pos; pos += 1
+    return mask_x, mask_y
 
 
 @lru_cache(maxsize=128)
@@ -251,8 +291,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=None)
     p.add_argument("--height", type=int, default=None)
     p.add_argument("--bytes-per-element", type=int, default=None)
-    p.add_argument("--mask-x", type=lambda s: int(s, 0), default=PS5_SWIZZLE_MASK_X)
-    p.add_argument("--mask-y", type=lambda s: int(s, 0), default=PS5_SWIZZLE_MASK_Y)
+    p.add_argument("--mask-x", type=lambda s: int(s, 0), default=None,
+                   help="X-axis swizzle mask (auto-computed from dimensions if omitted)")
+    p.add_argument("--mask-y", type=lambda s: int(s, 0), default=None,
+                   help="Y-axis swizzle mask (auto-computed from dimensions if omitted)")
     p.add_argument("--output-bin", default=None)
     p.add_argument("--output-png", default=None)
     p.add_argument("--skip-bin", action="store_true")
@@ -308,6 +350,10 @@ def main() -> None:
                 f"BIN size mismatch: expected {expected}, got {len(data)} "
                 f"(w={width}, h={height}, bpe={bytes_per_element})"
             )
+
+    # Auto-compute masks from dimensions when not explicitly provided
+    if args.mask_x is None or args.mask_y is None:
+        args.mask_x, args.mask_y = compute_ps5_swizzle_masks(width, height)
 
     if args.mode == "detect":
         verdict, raw_score, unsw_score, swz_score, unsw_data, swz_data = detect_swizzle_state(

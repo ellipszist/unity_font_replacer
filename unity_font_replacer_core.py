@@ -27,6 +27,61 @@ _REGISTERED_TEMP_DIRS: set[str] = set()
 PS5_SWIZZLE_MASK_X = 0x385F0
 PS5_SWIZZLE_MASK_Y = 0x07A0F
 PS5_SWIZZLE_ROTATE = 90
+_PS5_MICRO_X_BITS = 5   # 32-pixel wide micro-tile (8bpp)
+_PS5_MICRO_Y_BITS = 4   # 16-pixel tall micro-tile (8bpp)
+
+
+@lru_cache(maxsize=64)
+def compute_ps5_swizzle_masks(width: int, height: int) -> tuple[int, int]:
+    """KR: 텍스처 크기에 맞는 PS5 swizzle 마스크를 계산합니다.
+    EN: Compute PS5 swizzle bit-masks for the given texture dimensions.
+
+    8bpp micro-tile is 32×16.  Macro-tile bits are interleaved as:
+    first-Y, first-X, remaining-Y…, remaining-X… above the micro-tile bits.
+    Dimensions must be powers of two and >= micro-tile size (32×16).
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid dimensions for PS5 swizzle masks: {width}x{height}")
+    if width & (width - 1) or height & (height - 1):
+        raise ValueError(
+            f"PS5 swizzle requires power-of-two dimensions: {width}x{height}"
+        )
+    micro_w = 1 << _PS5_MICRO_X_BITS   # 32
+    micro_h = 1 << _PS5_MICRO_Y_BITS   # 16
+    if width < micro_w or height < micro_h:
+        raise ValueError(
+            f"Texture too small for PS5 swizzle micro-tile ({micro_w}x{micro_h}): "
+            f"{width}x{height}"
+        )
+    total_x = width.bit_length() - 1    # log2(width)
+    total_y = height.bit_length() - 1   # log2(height)
+    macro_x = total_x - _PS5_MICRO_X_BITS
+    macro_y = total_y - _PS5_MICRO_Y_BITS
+
+    mask_x = 0
+    mask_y = 0
+    pos = 0
+    # micro-tile Y bits (bottom)
+    for _ in range(_PS5_MICRO_Y_BITS):
+        mask_y |= 1 << pos; pos += 1
+    # micro-tile X bits
+    for _ in range(_PS5_MICRO_X_BITS):
+        mask_x |= 1 << pos; pos += 1
+    # macro: first Y
+    mx_rem = macro_x
+    my_rem = macro_y
+    if my_rem > 0:
+        mask_y |= 1 << pos; pos += 1; my_rem -= 1
+    # macro: first X
+    if mx_rem > 0:
+        mask_x |= 1 << pos; pos += 1; mx_rem -= 1
+    # macro: remaining Y
+    for _ in range(my_rem):
+        mask_y |= 1 << pos; pos += 1
+    # macro: remaining X
+    for _ in range(mx_rem):
+        mask_x |= 1 << pos; pos += 1
+    return mask_x, mask_y
 
 
 class TeeWriter:
@@ -412,12 +467,16 @@ def ps5_unswizzle_bytes(
     width: int,
     height: int,
     bytes_per_element: int,
-    mask_x: int = PS5_SWIZZLE_MASK_X,
-    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    mask_x: int | None = None,
+    mask_y: int | None = None,
 ) -> bytes:
     """KR: PS5 swizzled 바이트 배열을 선형 순서로 변환합니다.
     EN: Convert PS5-swizzled bytes into linear row-major bytes.
+    mask_x/mask_y가 None이면 width/height에서 자동 계산합니다.
+    When mask_x/mask_y are None they are computed from width/height.
     """
+    if mask_x is None or mask_y is None:
+        mask_x, mask_y = compute_ps5_swizzle_masks(width, height)
     total_elements = _ps5_validate_texture_shape(data, width, height, bytes_per_element)
     src = memoryview(data)
     dst = bytearray(len(data))
@@ -455,12 +514,16 @@ def ps5_swizzle_bytes(
     width: int,
     height: int,
     bytes_per_element: int,
-    mask_x: int = PS5_SWIZZLE_MASK_X,
-    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    mask_x: int | None = None,
+    mask_y: int | None = None,
 ) -> bytes:
     """KR: 선형 순서 바이트 배열을 PS5 swizzle 순서로 변환합니다.
     EN: Convert linear row-major bytes into PS5-swizzled order.
+    mask_x/mask_y가 None이면 width/height에서 자동 계산합니다.
+    When mask_x/mask_y are None they are computed from width/height.
     """
+    if mask_x is None or mask_y is None:
+        mask_x, mask_y = compute_ps5_swizzle_masks(width, height)
     total_elements = _ps5_validate_texture_shape(data, width, height, bytes_per_element)
     src = memoryview(data)
     dst = bytearray(len(data))
@@ -581,12 +644,14 @@ def detect_ps5_swizzle_state(
     width: int,
     height: int,
     bytes_per_element: int,
-    mask_x: int = PS5_SWIZZLE_MASK_X,
-    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    mask_x: int | None = None,
+    mask_y: int | None = None,
 ) -> tuple[str, float, float, float, bytes, bytes]:
     """KR: 입력 바이트가 swizzled인지 휴리스틱으로 판별합니다.
     EN: Heuristically detect whether input bytes are likely swizzled.
     """
+    if mask_x is None or mask_y is None:
+        mask_x, mask_y = compute_ps5_swizzle_masks(width, height)
     raw_score = _ps5_roughness_score(data, width, height, bytes_per_element)
     unswizzled = ps5_unswizzle_bytes(data, width, height, bytes_per_element, mask_x=mask_x, mask_y=mask_y)
     swizzled = ps5_swizzle_bytes(data, width, height, bytes_per_element, mask_x=mask_x, mask_y=mask_y)
@@ -605,8 +670,8 @@ def detect_ps5_swizzle_state(
 
 def detect_ps5_swizzle_state_from_image(
     image: Image.Image,
-    mask_x: int = PS5_SWIZZLE_MASK_X,
-    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    mask_x: int | None = None,
+    mask_y: int | None = None,
     rotate: int = PS5_SWIZZLE_ROTATE,
 ) -> tuple[str, float, float, float]:
     """KR: Pillow 이미지의 swizzle 상태를 판별합니다.
@@ -629,8 +694,8 @@ def detect_ps5_swizzle_state_from_image(
 
 def apply_ps5_swizzle_to_image(
     image: Image.Image,
-    mask_x: int = PS5_SWIZZLE_MASK_X,
-    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    mask_x: int | None = None,
+    mask_y: int | None = None,
     rotate: int = PS5_SWIZZLE_ROTATE,
 ) -> Image.Image:
     """KR: 선형 이미지에 PS5 swizzle 변환을 적용합니다.
@@ -657,8 +722,8 @@ def apply_ps5_swizzle_to_image(
 
 def apply_ps5_unswizzle_to_image(
     image: Image.Image,
-    mask_x: int = PS5_SWIZZLE_MASK_X,
-    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    mask_x: int | None = None,
+    mask_y: int | None = None,
     rotate: int = PS5_SWIZZLE_ROTATE,
 ) -> Image.Image:
     """KR: swizzled 이미지에 PS5 unswizzle 변환을 적용합니다.
@@ -683,8 +748,8 @@ def apply_ps5_unswizzle_to_image(
 
 def detect_texture_object_ps5_swizzle(
     texture_obj: Any,
-    mask_x: int = PS5_SWIZZLE_MASK_X,
-    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    mask_x: int | None = None,
+    mask_y: int | None = None,
     rotate: int = PS5_SWIZZLE_ROTATE,
 ) -> str | None:
     """KR: Texture2D 오브젝트의 swizzle 상태를 판별합니다.
@@ -701,8 +766,8 @@ def detect_texture_object_ps5_swizzle(
 
 def detect_texture_object_ps5_swizzle_detail(
     texture_obj: Any,
-    mask_x: int = PS5_SWIZZLE_MASK_X,
-    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    mask_x: int | None = None,
+    mask_y: int | None = None,
     rotate: int = PS5_SWIZZLE_ROTATE,
 ) -> tuple[str | None, str | None]:
     """KR: Texture2D 오브젝트의 swizzle 상태를 판별합니다.
@@ -2238,8 +2303,6 @@ def replace_fonts_in_file(
                                     width,
                                     height,
                                     bpe,
-                                    mask_x=PS5_SWIZZLE_MASK_X,
-                                    mask_y=PS5_SWIZZLE_MASK_Y,
                                 )
                             except Exception:
                                 processed = raw_data
@@ -3737,12 +3800,12 @@ Examples:
         if is_ko:
             print(
                 "PS5 swizzle 모드: 대상 Atlas swizzle을 자동 판별해 교체 Atlas를 변환합니다 "
-                f"(mask_x={PS5_SWIZZLE_MASK_X:#x}, mask_y={PS5_SWIZZLE_MASK_Y:#x}, rotate={PS5_SWIZZLE_ROTATE})."
+                f"(마스크는 텍스처 크기에 따라 자동 계산, rotate={PS5_SWIZZLE_ROTATE})."
             )
         else:
             print(
                 "PS5 swizzle mode: auto-detecting target atlas swizzle state and transforming replacement atlas "
-                f"(mask_x={PS5_SWIZZLE_MASK_X:#x}, mask_y={PS5_SWIZZLE_MASK_Y:#x}, rotate={PS5_SWIZZLE_ROTATE})."
+                f"(masks computed per texture size, rotate={PS5_SWIZZLE_ROTATE})."
             )
     else:
         if is_ko:
