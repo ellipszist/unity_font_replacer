@@ -228,6 +228,34 @@ def _pack_rectangles_shelf(
     return placements, used_rects
 
 
+def _validate_layout_rectangles(
+    placements: dict[int, tuple[int, int, int, int]],
+    used_rects: list[JsonDict],
+    glyph_indices: set[int],
+    atlas_width: int,
+    atlas_height: int,
+) -> tuple[bool, str]:
+    if len(placements) != len(glyph_indices):
+        return False, "placement count mismatch"
+    if set(placements.keys()) != glyph_indices:
+        return False, "placement glyph index mismatch"
+    if len(used_rects) != len(placements):
+        return False, "used rect count mismatch"
+
+    occupied: set[tuple[int, int, int, int]] = set()
+    for glyph_index, rect in placements.items():
+        px, py, pw, ph = rect
+        if px < 0 or py < 0 or pw <= 0 or ph <= 0:
+            return False, f"invalid rectangle for glyph {glyph_index}: ({px}, {py}, {pw}, {ph})"
+        if px + pw > atlas_width or py + ph > atlas_height:
+            return False, f"out-of-bounds rectangle for glyph {glyph_index}: ({px}, {py}, {pw}, {ph})"
+        key = (px, py, pw, ph)
+        if key in occupied:
+            return False, f"duplicate rectangle allocation: ({px}, {py}, {pw}, {ph})"
+        occupied.add(key)
+    return True, ""
+
+
 def _compute_sdf_tile(alpha_tile: Any, spread: int) -> Any:
     if np is None or scipy_ndimage is None:
         raise RuntimeError("numpy and scipy are required for SDF generation.")
@@ -346,6 +374,18 @@ def generate_sdf_assets_from_ttf(
             return None
 
         placements, used_rects = packed_result
+        valid_layout, reason = _validate_layout_rectangles(
+            placements=placements,
+            used_rects=used_rects,
+            glyph_indices={int(code) for code in unicodes},
+            atlas_width=atlas_width,
+            atlas_height=atlas_height,
+        )
+        if not valid_layout:
+            _emit(f"[layout] point-size {candidate_point_size}: invalid layout ({reason})")
+            layout_cache[candidate_point_size] = None
+            return None
+
         layout: JsonDict = {
             "font": font,
             "point_size": int(candidate_point_size),
@@ -409,6 +449,14 @@ def generate_sdf_assets_from_ttf(
     selected_descent = int(selected_layout["descent"])
     selected_point_size = int(selected_layout["point_size"])
 
+    expected_glyph_indices = {int(entry.get("glyph_index", -1)) for entry in selected_entries}
+    if set(int(key) for key in selected_placements.keys()) != expected_glyph_indices:
+        _emit("[layout] selected placements do not match glyph entries.")
+        return None
+    if len(selected_used_rects) != len(selected_placements):
+        _emit("[layout] selected used rect count mismatch.")
+        return None
+
     atlas_alpha = np.zeros((selected_atlas_h, selected_atlas_w), dtype=np.uint8)
     glyph_table: list[JsonDict] = []
     char_table: list[JsonDict] = []
@@ -422,6 +470,9 @@ def generate_sdf_assets_from_ttf(
         if placement is None:
             continue
         px, py, pw, ph = placement
+        if px < 0 or py < 0 or pw <= 0 or ph <= 0 or (px + pw) > selected_atlas_w or (py + ph) > selected_atlas_h:
+            _emit(f"[layout] invalid placement for glyph={glyph_index}: ({px}, {py}, {pw}, {ph})")
+            return None
         glyph_w = int(entry["width"])
         glyph_h = int(entry["height"])
 
@@ -454,6 +505,16 @@ def generate_sdf_assets_from_ttf(
             glyph_rect_w = 1
             glyph_rect_h = 1
 
+        if glyph_x < 0 or glyph_y_top < 0:
+            _emit(f"[layout] negative glyph origin for glyph={glyph_index}: ({glyph_x}, {glyph_y_top})")
+            return None
+        if glyph_x + glyph_rect_w > selected_atlas_w or glyph_y_top + glyph_rect_h > selected_atlas_h:
+            _emit(
+                "[layout] glyph rect exceeds atlas for glyph="
+                f"{glyph_index}: ({glyph_x}, {glyph_y_top}, {glyph_rect_w}, {glyph_rect_h})"
+            )
+            return None
+
         glyph_y = selected_atlas_h - glyph_y_top - glyph_rect_h
         glyph_table.append(
             {
@@ -474,6 +535,50 @@ def generate_sdf_assets_from_ttf(
 
         if idx == 1 or idx == total_entries or idx % progress_step == 0:
             _emit(f"[render] glyph {idx}/{total_entries}")
+
+    unique_glyph_table: list[JsonDict] = []
+    glyph_index_seen: set[int] = set()
+    duplicate_glyph_indices: list[int] = []
+    for glyph in glyph_table:
+        glyph_index = _safe_int(glyph.get("m_Index", -1), -1)
+        if glyph_index < 0:
+            continue
+        if glyph_index in glyph_index_seen:
+            duplicate_glyph_indices.append(glyph_index)
+            continue
+        glyph_index_seen.add(glyph_index)
+        unique_glyph_table.append(glyph)
+    if duplicate_glyph_indices:
+        _emit(
+            "[render] duplicate glyph indices removed: "
+            + ", ".join(str(x) for x in sorted(set(duplicate_glyph_indices)))
+        )
+    glyph_table = unique_glyph_table
+
+    unique_char_table: list[JsonDict] = []
+    char_pair_seen: set[tuple[int, int]] = set()
+    duplicate_char_pairs = 0
+    for ch in char_table:
+        unicode_value = _safe_int(ch.get("m_Unicode", -1), -1)
+        glyph_index = _safe_int(ch.get("m_GlyphIndex", -1), -1)
+        if unicode_value < 0 or glyph_index < 0:
+            continue
+        if glyph_index not in glyph_index_seen:
+            continue
+        key = (unicode_value, glyph_index)
+        if key in char_pair_seen:
+            duplicate_char_pairs += 1
+            continue
+        char_pair_seen.add(key)
+        unique_char_table.append(ch)
+    if duplicate_char_pairs:
+        _emit(f"[render] duplicate character entries removed: {duplicate_char_pairs}")
+    char_table = unique_char_table
+
+    if len(glyph_table) != len(char_table):
+        _emit(
+            f"[render] glyph/char count mismatch after dedupe: glyphs={len(glyph_table)}, chars={len(char_table)}"
+        )
 
     glyph_table.sort(key=lambda item: int(item.get("m_Index", 0)))
     char_table.sort(key=lambda item: int(item.get("m_Unicode", 0)))

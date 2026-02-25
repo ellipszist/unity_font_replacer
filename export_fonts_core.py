@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
-from typing import Any, Literal, NoReturn
+from functools import lru_cache
+from typing import Any, Literal, NoReturn, cast
 
 import UnityPy
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
@@ -12,6 +14,8 @@ from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
+_TMP_OLD_ONLY_LAST = (2018, 3, 14)
+_TMP_NEW_SCHEMA_FIRST = (2018, 4, 2)
 
 
 def _debug_parse_enabled() -> bool:
@@ -198,21 +202,161 @@ def create_generator(
     return generator
 
 
-def detect_tmp_version(data: JsonDict) -> Literal["new", "old"]:
+@lru_cache(maxsize=256)
+def _parse_unity_version_triplet(version_text: str) -> tuple[int, int, int] | None:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text or "")
+    if not match:
+        return None
+    try:
+        return int(match.group(1)), int(match.group(2)), int(match.group(3))
+    except Exception:
+        return None
+
+
+def _tmp_version_hint(unity_version: str | None) -> Literal["new", "old"] | None:
+    if not unity_version:
+        return None
+    triplet = _parse_unity_version_triplet(str(unity_version))
+    if triplet is None:
+        return None
+    if triplet <= _TMP_OLD_ONLY_LAST:
+        return "old"
+    if triplet >= _TMP_NEW_SCHEMA_FIRST:
+        return "new"
+    return None
+
+
+def _safe_list_len(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
+
+
+def _first_atlas_ref(value: Any) -> JsonDict | None:
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, dict):
+            return cast(JsonDict, item)
+    return None
+
+
+def _atlas_ref_ids(ref: Any) -> tuple[int, int]:
+    if not isinstance(ref, dict):
+        return 0, 0
+    try:
+        file_id = int(ref.get("m_FileID", 0) or 0)
+    except Exception:
+        file_id = 0
+    try:
+        path_id = int(ref.get("m_PathID", 0) or 0)
+    except Exception:
+        path_id = 0
+    return file_id, path_id
+
+
+def _has_real_atlas_path(ref: Any) -> bool:
+    _, path_id = _atlas_ref_ids(ref)
+    return path_id > 0
+
+
+def _first_valid_atlas_ref(value: Any) -> JsonDict | None:
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, dict) and _has_real_atlas_path(item):
+            return cast(JsonDict, item)
+    return None
+
+
+def _best_atlas_ref(
+    data: JsonDict,
+    *,
+    prefer_new: bool,
+) -> JsonDict | None:
+    new_any = _first_atlas_ref(data.get("m_AtlasTextures"))
+    new_valid = _first_valid_atlas_ref(data.get("m_AtlasTextures"))
+    old_any = cast(JsonDict | None, data.get("atlas")) if isinstance(data.get("atlas"), dict) else None
+    old_valid = old_any if _has_real_atlas_path(old_any) else None
+
+    ordered = (new_valid, old_valid, new_any, old_any) if prefer_new else (old_valid, new_valid, old_any, new_any)
+    for ref in ordered:
+        if isinstance(ref, dict):
+            return ref
+    return None
+
+
+def detect_tmp_version(data: JsonDict, unity_version: str | None = None) -> Literal["new", "old"]:
     """KR: TMP 폰트 데이터가 신형/구형 포맷인지 판별합니다.
     EN: Detect whether TMP font data uses new or old schema.
     """
-    has_new_glyphs = len(data.get("m_GlyphTable", [])) > 0
-    has_old_glyphs = len(data.get("m_glyphInfoList", [])) > 0
-    if has_new_glyphs:
+    new_glyph_count = _safe_list_len(data.get("m_GlyphTable"))
+    old_glyph_count = _safe_list_len(data.get("m_glyphInfoList"))
+    has_new_glyphs = new_glyph_count > 0
+    has_old_glyphs = old_glyph_count > 0
+
+    has_new_face = isinstance(data.get("m_FaceInfo"), dict)
+    has_old_face = isinstance(data.get("m_fontInfo"), dict)
+    has_new_atlas = _first_atlas_ref(data.get("m_AtlasTextures")) is not None
+    has_old_atlas = isinstance(data.get("atlas"), dict)
+
+    if has_new_glyphs != has_old_glyphs:
+        return "new" if has_new_glyphs else "old"
+    if new_glyph_count != old_glyph_count:
+        return "new" if new_glyph_count > old_glyph_count else "old"
+    if has_new_face != has_old_face:
+        return "new" if has_new_face else "old"
+    if has_new_atlas != has_old_atlas:
+        return "new" if has_new_atlas else "old"
+
+    hint = _tmp_version_hint(unity_version)
+    if hint is not None:
+        return hint
+
+    if has_new_face or has_new_atlas or "m_CharacterTable" in data:
         return "new"
-    if has_old_glyphs:
-        return "old"
-    if "m_FaceInfo" in data:
-        return "new"
-    if "m_fontInfo" in data:
+    if has_old_face or has_old_atlas:
         return "old"
     return "new"
+
+
+def inspect_tmp_font_schema(
+    data: JsonDict,
+    unity_version: str | None = None,
+) -> dict[str, Any]:
+    """KR: TMP 스키마 판별 결과와 glyph/atlas 메타를 통합해 반환합니다.
+    EN: Return TMP schema result with unified glyph/atlas metadata.
+    """
+    target_version = detect_tmp_version(data, unity_version=unity_version)
+    new_glyph_count = _safe_list_len(data.get("m_GlyphTable"))
+    old_glyph_count = _safe_list_len(data.get("m_glyphInfoList"))
+    has_new_face = isinstance(data.get("m_FaceInfo"), dict)
+    has_old_face = isinstance(data.get("m_fontInfo"), dict)
+    new_atlas_ref = _first_atlas_ref(data.get("m_AtlasTextures"))
+    old_atlas_ref = cast(JsonDict | None, data.get("atlas")) if isinstance(data.get("atlas"), dict) else None
+
+    if target_version == "new":
+        glyph_count = new_glyph_count if new_glyph_count > 0 else old_glyph_count
+        atlas_ref = _best_atlas_ref(data, prefer_new=True)
+    else:
+        glyph_count = old_glyph_count if old_glyph_count > 0 else new_glyph_count
+        atlas_ref = _best_atlas_ref(data, prefer_new=False)
+
+    atlas_file_id, atlas_path_id = _atlas_ref_ids(atlas_ref)
+
+    is_tmp = bool(
+        new_glyph_count > 0
+        or old_glyph_count > 0
+        or has_new_face
+        or has_old_face
+        or new_atlas_ref is not None
+        or old_atlas_ref is not None
+    )
+    return {
+        "version": target_version,
+        "is_tmp": is_tmp,
+        "glyph_count": int(glyph_count),
+        "atlas_file_id": int(atlas_file_id),
+        "atlas_path_id": int(atlas_path_id),
+    }
 
 
 def is_tmp_font_asset(obj: Any) -> bool:
@@ -232,47 +376,31 @@ def is_tmp_font_asset(obj: Any) -> bool:
         _debug_parse_log(f"[export_fonts] parse_as_dict failed (PathID: {obj.path_id}): {e}")
         return False
 
-    version = detect_tmp_version(parse_dict)
-    has_new_face = "m_FaceInfo" in parse_dict or "m_GlyphTable" in parse_dict
-    has_old_face = "m_fontInfo" in parse_dict or "m_glyphInfoList" in parse_dict
-    has_new_atlas = "m_AtlasTextures" in parse_dict
-    has_old_atlas = "atlas" in parse_dict
-
-    if version == "new":
-        return has_new_face and (has_new_atlas or has_old_atlas)
-    return has_old_face and (has_old_atlas or has_new_atlas)
+    unity_version_hint = getattr(getattr(obj, "assets_file", None), "unity_version", None)
+    info = inspect_tmp_font_schema(
+        parse_dict,
+        unity_version=str(unity_version_hint) if unity_version_hint else None,
+    )
+    return bool(info.get("is_tmp"))
 
 
 def extract_tmp_refs(parse_dict: JsonDict) -> dict[str, int] | None:
     """KR: TMP 폰트 데이터에서 atlas/material PathID를 추출합니다.
     EN: Extract atlas/material PathIDs from TMP font data.
     """
-    tmp_version = detect_tmp_version(parse_dict)
+    info = inspect_tmp_font_schema(parse_dict)
+    glyph_count = int(info.get("glyph_count", 0) or 0)
+    version = str(info.get("version", "new"))
+    atlas_ref = _best_atlas_ref(parse_dict, prefer_new=(version == "new"))
+    file_id, path_id = _atlas_ref_ids(atlas_ref)
+    if path_id <= 0:
+        fallback_atlas_ref = _best_atlas_ref(parse_dict, prefer_new=(version != "new"))
+        file_id, path_id = _atlas_ref_ids(fallback_atlas_ref)
 
-    new_glyph_count = len(parse_dict.get("m_GlyphTable", []))
-    old_glyph_count = len(parse_dict.get("m_glyphInfoList", []))
-
-    if tmp_version == "new":
-        glyph_count = new_glyph_count if new_glyph_count > 0 else old_glyph_count
-        atlas_ref: Any = None
-        atlas_list = parse_dict.get("m_AtlasTextures", [])
-        if isinstance(atlas_list, list) and atlas_list:
-            atlas_ref = atlas_list[0]
-        elif isinstance(parse_dict.get("atlas"), dict):
-            atlas_ref = parse_dict.get("atlas")
-    else:
-        glyph_count = old_glyph_count if old_glyph_count > 0 else new_glyph_count
-        atlas_ref = parse_dict.get("atlas") if isinstance(parse_dict.get("atlas"), dict) else None
-        if atlas_ref is None:
-            atlas_list = parse_dict.get("m_AtlasTextures", [])
-            if isinstance(atlas_list, list) and atlas_list:
-                atlas_ref = atlas_list[0]
-
-    if glyph_count == 0 or not isinstance(atlas_ref, dict):
+    if glyph_count == 0:
         return None
-
-    file_id = int(atlas_ref.get("m_FileID", 0) or 0)
-    path_id = int(atlas_ref.get("m_PathID", 0) or 0)
+    if file_id == 0 and path_id == 0:
+        return None
 
     # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 텍스처를 가리키지 않으므로 제외합니다.
     # EN: Skip external stubs (FileID!=0, PathID=0) because they do not point to a real texture.

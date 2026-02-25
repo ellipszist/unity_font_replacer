@@ -66,12 +66,17 @@ jobs:
             --collect-all fontTools `
             make_sdf.py
 
+          pyinstaller --onefile --name ps5_swizzler `
+            --collect-all numpy `
+            ps5_swizzler.py
+
       - name: Prepare release files
         run: |
           mkdir release
           copy dist\unity_font_replacer.exe release\
           copy dist\export_fonts.exe release\
           copy dist\make_sdf.exe release\
+          copy dist\ps5_swizzler.exe release\
           xcopy KR_ASSETS release\KR_ASSETS\ /E /I
           xcopy Il2CppDumper release\Il2CppDumper\ /E /I
           copy README.md release\
@@ -80,6 +85,7 @@ jobs:
           copy dist\unity_font_replacer_en.exe release_en\
           copy dist\export_fonts_en.exe release_en\
           copy dist\make_sdf.exe release_en\
+          copy dist\ps5_swizzler.exe release_en\
           xcopy KR_ASSETS release_en\KR_ASSETS\ /E /I
           xcopy Il2CppDumper release_en\Il2CppDumper\ /E /I
           copy README_EN.md release_en\

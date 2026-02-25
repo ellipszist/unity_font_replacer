@@ -7,6 +7,7 @@ import inspect
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,7 +18,7 @@ from functools import lru_cache
 from typing import Any, Callable, Iterable, Literal, NoReturn, cast
 
 import UnityPy
-from PIL import Image, ImageStat
+from PIL import Image, ImageOps
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 
 
@@ -29,6 +30,102 @@ PS5_SWIZZLE_MASK_Y = 0x07A0F
 PS5_SWIZZLE_ROTATE = 90
 _PS5_MICRO_X_BITS = 5   # 32-pixel wide micro-tile (8bpp)
 _PS5_MICRO_Y_BITS = 4   # 16-pixel tall micro-tile (8bpp)
+# KR: Unity-Runtime-Libraries reports/sdf_font 분석 기준 경계 버전입니다.
+# EN: Boundary versions derived from Unity-Runtime-Libraries reports/sdf_font.
+_TMP_OLD_ONLY_LAST = (2018, 3, 14)
+_TMP_NEW_SCHEMA_FIRST = (2018, 4, 2)
+_TMP_CREATION_SETTINGS_KEYS = (
+    "m_CreationSettings",
+    "m_FontAssetCreationSettings",
+    "m_fontAssetCreationEditorSettings",
+)
+_TMP_DIRTY_FLAG_KEYS = (
+    "m_IsFontAssetLookupTablesDirty",
+    "IsFontAssetLookupTablesDirty",
+)
+_TMP_GLYPH_INDEX_LIST_KEYS = (
+    "m_GlyphIndexList",
+    "m_GlyphIndexes",
+)
+BUNDLE_SIGNATURES = {"UnityFS", "UnityWeb", "UnityRaw"}
+_OLD_LINE_METRIC_KEYS = (
+    "LineHeight",
+    "Baseline",
+    "Ascender",
+    "CapHeight",
+    "Descender",
+    "CenterLine",
+    "Scale",
+    "SuperscriptOffset",
+    "SubscriptOffset",
+    "SubSize",
+    "Underline",
+    "UnderlineThickness",
+    "strikethrough",
+    "strikethroughThickness",
+    "TabWidth",
+)
+_OLD_LINE_METRIC_SCALE_KEYS = (
+    "LineHeight",
+    "Baseline",
+    "Ascender",
+    "CapHeight",
+    "Descender",
+    "CenterLine",
+    "SuperscriptOffset",
+    "SubscriptOffset",
+    "Underline",
+    "UnderlineThickness",
+    "strikethrough",
+    "strikethroughThickness",
+    "TabWidth",
+)
+_NEW_LINE_METRIC_KEYS = (
+    "m_LineHeight",
+    "m_AscentLine",
+    "m_CapLine",
+    "m_MeanLine",
+    "m_Baseline",
+    "m_DescentLine",
+    "m_Scale",
+    "m_SuperscriptOffset",
+    "m_SuperscriptSize",
+    "m_SubscriptOffset",
+    "m_SubscriptSize",
+    "m_UnderlineOffset",
+    "m_UnderlineThickness",
+    "m_StrikethroughOffset",
+    "m_StrikethroughThickness",
+    "m_TabWidth",
+)
+_NEW_LINE_METRIC_SCALE_KEYS = (
+    "m_LineHeight",
+    "m_AscentLine",
+    "m_CapLine",
+    "m_MeanLine",
+    "m_Baseline",
+    "m_DescentLine",
+    "m_SuperscriptOffset",
+    "m_SubscriptOffset",
+    "m_UnderlineOffset",
+    "m_UnderlineThickness",
+    "m_StrikethroughOffset",
+    "m_StrikethroughThickness",
+    "m_TabWidth",
+)
+_MATERIAL_PADDING_SCALE_KEYS = (
+    "_GradientScale",
+    "_FaceDilate",
+    "_OutlineWidth",
+    "_OutlineSoftness",
+    "_UnderlayDilate",
+    "_UnderlaySoftness",
+    "_UnderlayOffsetX",
+    "_UnderlayOffsetY",
+    "_GlowOffset",
+    "_GlowInner",
+    "_GlowOuter",
+)
 
 
 @lru_cache(maxsize=64)
@@ -82,6 +179,16 @@ def compute_ps5_swizzle_masks(width: int, height: int) -> tuple[int, int]:
     for _ in range(mx_rem):
         mask_x |= 1 << pos; pos += 1
     return mask_x, mask_y
+
+
+def _ps5_dimensions_supported(width: int, height: int) -> bool:
+    if width <= 0 or height <= 0:
+        return False
+    if width & (width - 1) or height & (height - 1):
+        return False
+    micro_w = 1 << _PS5_MICRO_X_BITS
+    micro_h = 1 << _PS5_MICRO_Y_BITS
+    return width >= micro_w and height >= micro_h
 
 
 class TeeWriter:
@@ -419,6 +526,334 @@ def parse_bool_flag(value: Any) -> bool:
     return text in {"1", "true", "yes", "y", "on"}
 
 
+def _read_bundle_signature(path: str, bundle_signatures: set[str] | None = None) -> str | None:
+    """KR: 파일 헤더에서 Unity 번들 시그니처를 읽습니다.
+    EN: Read Unity bundle signature from file header.
+    """
+    signatures = bundle_signatures or BUNDLE_SIGNATURES
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+    except Exception:
+        return None
+
+    for sig in signatures:
+        token = (sig + "\x00").encode("ascii")
+        if header.startswith(token):
+            return sig
+    return None
+
+
+def _safe_metric_scale(game_point_size: Any, replacement_point_size: Any) -> float:
+    """KR: 게임 pointSize 대비 교체 pointSize 비율을 계산합니다.
+    EN: Compute scaling ratio from game pointSize to replacement pointSize.
+    """
+    try:
+        game_ps = float(game_point_size)
+        repl_ps = float(replacement_point_size)
+        if game_ps > 0 and repl_ps > 0:
+            return repl_ps / game_ps
+    except Exception:
+        pass
+    return 1.0
+
+
+def _detect_target_texture_swizzle(
+    texture_object_lookup: dict[tuple[str, int], Any],
+    texture_swizzle_state_cache: dict[str, tuple[str | None, str | None]],
+    assets_name: str,
+    path_id: int,
+) -> tuple[str | None, str | None]:
+    """KR: 타겟 Texture2D의 swizzle 판정 결과를 캐시와 함께 반환합니다.
+    EN: Return cached swizzle verdict for target Texture2D.
+    """
+    cache_key = f"{assets_name}|{path_id}"
+    if cache_key in texture_swizzle_state_cache:
+        return texture_swizzle_state_cache[cache_key]
+    texture_obj = texture_object_lookup.get((assets_name, int(path_id)))
+    verdict, source = (
+        detect_texture_object_ps5_swizzle_detail(texture_obj)
+        if texture_obj is not None
+        else (None, None)
+    )
+    texture_swizzle_state_cache[cache_key] = (verdict, source)
+    return verdict, source
+
+
+def _preview_visible_image(image: Image.Image) -> Image.Image:
+    """KR: RGBA/LA Atlas를 사람이 보기 쉬운 단일 채널 이미지로 정규화합니다.
+    EN: Normalize RGBA/LA atlas into a human-visible single-channel image.
+    """
+    try:
+        if image.mode == "RGBA":
+            alpha = image.getchannel("A")
+            rgb = image.convert("RGB")
+            rgb_bbox = rgb.getbbox()
+            alpha_bbox = alpha.getbbox()
+            if alpha_bbox and not rgb_bbox:
+                return alpha
+            return alpha if alpha_bbox else image.convert("L")
+        if image.mode == "LA":
+            alpha = image.getchannel("A")
+            return alpha if alpha.getbbox() else image.getchannel("L")
+        if image.mode == "P":
+            return image.convert("L")
+        if image.mode not in {"L", "RGB"}:
+            return image.convert("L")
+        return image
+    except Exception:
+        return image.convert("L")
+
+
+def _load_target_unswizzled_preview_image(
+    texture_object_lookup: dict[tuple[str, int], Any],
+    assets_name: str,
+    atlas_path_id: int,
+    swizzle_verdict: str | None,
+    preview_rotate: int = PS5_SWIZZLE_ROTATE,
+) -> Image.Image | None:
+    """KR: 대상 게임 Atlas(Texture2D)에서 검증용 unswizzle preview 이미지를 생성합니다.
+    EN: Build an unswizzled preview image from the target in-game Texture2D atlas.
+    """
+    texture_obj = texture_object_lookup.get((assets_name, int(atlas_path_id)))
+    if texture_obj is None:
+        return None
+    try:
+        texture = texture_obj.parse_as_object()
+        width = int(getattr(texture, "m_Width", 0) or 0)
+        height = int(getattr(texture, "m_Height", 0) or 0)
+        raw_data: bytes | None = None
+
+        get_image_data = getattr(texture, "get_image_data", None)
+        if callable(get_image_data):
+            try:
+                candidate = get_image_data()
+                if isinstance(candidate, (bytes, bytearray)):
+                    raw_data = bytes(candidate)
+            except Exception:
+                raw_data = None
+        if raw_data is None:
+            image_data = getattr(texture, "image_data", None)
+            if isinstance(image_data, (bytes, bytearray)):
+                raw_data = bytes(image_data)
+
+        if width > 0 and height > 0 and raw_data:
+            total_elements = width * height
+            bpe: int | None = None
+            try:
+                texture_format = int(getattr(texture, "m_TextureFormat", -1) or -1)
+            except Exception:
+                texture_format = -1
+            bpe_hint = _texture_format_bytes_per_element(texture_format)
+            if bpe_hint is not None:
+                bpe = bpe_hint
+            elif total_elements > 0 and (len(raw_data) % total_elements) == 0:
+                derived_bpe = len(raw_data) // total_elements
+                if derived_bpe in {1, 2, 3, 4}:
+                    bpe = derived_bpe
+
+            if bpe in {1, 2, 3, 4}:
+                try:
+                    base_data, _ = _ps5_clip_to_base_level(raw_data, width, height, int(bpe))
+                except Exception:
+                    base_data = raw_data
+                processed = base_data
+                if swizzle_verdict == "likely_swizzled_input":
+                    try:
+                        processed = ps5_unswizzle_bytes(
+                            base_data,
+                            width,
+                            height,
+                            int(bpe),
+                        )
+                    except Exception:
+                        processed = base_data
+                mode_map = {1: "L", 2: "LA", 3: "RGB", 4: "RGBA"}
+                preview_image = Image.frombytes(mode_map[int(bpe)], (width, height), processed)
+                if swizzle_verdict == "likely_swizzled_input":
+                    if preview_rotate % 360 != 0:
+                        preview_image = preview_image.rotate(preview_rotate % 360, expand=True)
+                else:
+                    # KR: linear(비-swizzle) 텍스쳐는 Unity 좌표계(Y=0 하단)로 저장되므로 상하 반전 보정
+                    # EN: Linear (non-swizzled) textures are stored in Unity coordinates (Y=0 at bottom); flip vertically
+                    preview_image = ImageOps.flip(preview_image)
+                return preview_image
+
+        image = getattr(texture, "image", None)
+        if isinstance(image, Image.Image):
+            preview_image = image
+            if swizzle_verdict == "likely_swizzled_input":
+                try:
+                    preview_image = apply_ps5_unswizzle_to_image(preview_image, rotate=preview_rotate)
+                except Exception:
+                    pass
+            return preview_image
+    except Exception:
+        return None
+    return None
+
+
+def _save_swizzle_preview(
+    image: Image.Image,
+    *,
+    preview_enabled: bool,
+    preview_root: str | None,
+    assets_file_name: str,
+    assets_name: str,
+    atlas_path_id: int,
+    font_name: str,
+    target_swizzled: bool,
+    lang: Language,
+) -> None:
+    if not (preview_enabled and preview_root):
+        return
+    try:
+        visible = _preview_visible_image(image)
+        file_dir = sanitize_filename_component(assets_file_name, fallback="assets_file")
+        out_dir = os.path.join(preview_root, file_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        safe_assets = sanitize_filename_component(assets_name, fallback="assets")
+        safe_font = sanitize_filename_component(font_name, fallback="font")
+        state_label = "target_swizzled" if target_swizzled else "target_linear"
+        out_name = f"{safe_assets}__{atlas_path_id}__{safe_font}__unswizzled__{state_label}.png"
+        out_path = os.path.join(out_dir, out_name)
+        visible.save(out_path, format="PNG")
+        if lang == "ko":
+            print(f"  Preview 저장: {out_path}")
+        else:
+            print(f"  Preview saved: {out_path}")
+    except Exception as preview_error:
+        if lang == "ko":
+            print(f"  경고: preview 저장 실패 ({preview_error})")
+        else:
+            print(f"  Warning: failed to save preview ({preview_error})")
+
+
+def _save_glyph_crop_previews(
+    image: Image.Image,
+    *,
+    preview_enabled: bool,
+    preview_root: str | None,
+    assets_file_name: str,
+    assets_name: str,
+    atlas_path_id: int,
+    font_name: str,
+    sdf_data: JsonDict,
+    lang: Language,
+) -> None:
+    if not (preview_enabled and preview_root):
+        return
+    glyph_table = sdf_data.get("m_GlyphTable")
+    char_table = sdf_data.get("m_CharacterTable")
+    if not isinstance(glyph_table, list) or not isinstance(char_table, list):
+        return
+    try:
+        visible = _preview_visible_image(image)
+        file_dir = sanitize_filename_component(assets_file_name, fallback="assets_file")
+        safe_assets = sanitize_filename_component(assets_name, fallback="assets")
+        safe_font = sanitize_filename_component(font_name, fallback="font")
+        glyph_dir = os.path.join(
+            preview_root,
+            file_dir,
+            f"{safe_assets}__{atlas_path_id}__{safe_font}",
+        )
+        os.makedirs(glyph_dir, exist_ok=True)
+
+        glyph_rect_by_index: dict[int, tuple[int, int, int, int]] = {}
+        for glyph in glyph_table:
+            if not isinstance(glyph, dict):
+                continue
+            try:
+                glyph_index = int(glyph.get("m_Index", -1))
+            except Exception:
+                continue
+            rect_raw = glyph.get("m_GlyphRect", {})
+            if not isinstance(rect_raw, dict):
+                continue
+            try:
+                gx = int(rect_raw.get("m_X", 0))
+                gy = int(rect_raw.get("m_Y", 0))
+                gw = int(rect_raw.get("m_Width", 0))
+                gh = int(rect_raw.get("m_Height", 0))
+            except Exception:
+                continue
+            if gw <= 0 or gh <= 0:
+                continue
+            glyph_rect_by_index[glyph_index] = (gx, gy, gw, gh)
+
+        if not glyph_rect_by_index:
+            return
+
+        saved = 0
+        used_names: set[str] = set()
+        for ch in char_table:
+            if not isinstance(ch, dict):
+                continue
+            try:
+                codepoint = int(ch.get("m_Unicode", -1))
+                glyph_index = int(ch.get("m_GlyphIndex", -1))
+            except Exception:
+                continue
+            if codepoint < 0:
+                continue
+            rect = glyph_rect_by_index.get(glyph_index)
+            if rect is None:
+                continue
+
+            x, y, w, h = rect
+            # KR: TMP new glyphRect.y는 bottom-origin이므로 top-origin 이미지(PIL) crop 좌표로 변환합니다.
+            # EN: TMP new glyphRect.y is bottom-origin; convert to top-origin image(PIL) crop coordinates.
+            y = int(round(_tmp_flip_y_between_old_new(y, h, visible.height)))
+            x0 = max(0, min(visible.width, x))
+            y0 = max(0, min(visible.height, y))
+            x1 = max(0, min(visible.width, x + w))
+            y1 = max(0, min(visible.height, y + h))
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            base = f"U+{codepoint:04X}"
+            try:
+                ch_text = chr(codepoint)
+                if ch_text.isprintable() and not ch_text.isspace():
+                    safe_char = sanitize_filename_component(ch_text, fallback="", max_len=8)
+                    if safe_char and safe_char != "unnamed":
+                        base = f"{base}_{safe_char}"
+            except Exception:
+                pass
+
+            name = base
+            if name in used_names:
+                name = f"{name}_g{glyph_index}"
+            used_names.add(name)
+            out_path = os.path.join(glyph_dir, f"{name}.png")
+            visible.crop((x0, y0, x1, y1)).save(out_path, format="PNG")
+            saved += 1
+
+        if saved > 0:
+            if lang == "ko":
+                print(f"  Glyph preview 저장: {saved}개 -> {glyph_dir}")
+            else:
+                print(f"  Glyph previews saved: {saved} -> {glyph_dir}")
+    except Exception as preview_error:
+        if lang == "ko":
+            print(f"  경고: glyph preview 저장 실패 ({preview_error})")
+        else:
+            print(f"  Warning: failed to save glyph previews ({preview_error})")
+
+
+def _image_to_alpha8_bytes(image: Image.Image) -> tuple[bytes, int, int]:
+    """KR: Pillow 이미지를 Alpha8 raw bytes로 변환합니다.
+    EN: Convert Pillow image into Alpha8 raw bytes.
+    """
+    if image.mode in {"RGBA", "LA"}:
+        alpha = image.getchannel("A")
+    elif image.mode == "L":
+        alpha = image
+    else:
+        alpha = image.convert("L")
+    return alpha.tobytes(), alpha.width, alpha.height
+
+
 @lru_cache(maxsize=128)
 def _ps5_bit_positions(mask: int) -> tuple[int, ...]:
     return tuple(i for i in range(max(mask.bit_length(), 0)) if (mask >> i) & 1)
@@ -454,12 +889,44 @@ def _ps5_validate_texture_shape(data: bytes, width: int, height: int, bytes_per_
         )
     total_elements = width * height
     expected_size = total_elements * bytes_per_element
-    if len(data) != expected_size:
+    if len(data) < expected_size:
         raise ValueError(
-            f"Texture data size mismatch: expected={expected_size}, got={len(data)} "
+            f"Texture data size mismatch: expected_at_least={expected_size}, got={len(data)} "
             f"(w={width}, h={height}, bpe={bytes_per_element})"
         )
     return total_elements
+
+
+def _ps5_clip_to_base_level(
+    data: bytes,
+    width: int,
+    height: int,
+    bytes_per_element: int,
+) -> tuple[bytes, int]:
+    total_elements = _ps5_validate_texture_shape(data, width, height, bytes_per_element)
+    expected_size = total_elements * bytes_per_element
+    if len(data) > expected_size:
+        return data[:expected_size], len(data) - expected_size
+    return data, 0
+
+
+def _texture_format_bytes_per_element(texture_format: int) -> int | None:
+    # KR: 압축 포맷은 고정 BPE로 해석할 수 없으므로 제외합니다.
+    # EN: Compressed formats are excluded because they do not map to fixed raw BPE.
+    format_to_bpe = {
+        1: 1,   # Alpha8
+        2: 2,   # ARGB4444
+        3: 3,   # RGB24
+        4: 4,   # RGBA32
+        5: 4,   # ARGB32
+        7: 2,   # RGB565
+        9: 2,   # R16
+        29: 1,  # R8
+    }
+    value = format_to_bpe.get(int(texture_format), None)
+    if value in {1, 2, 3, 4}:
+        return value
+    return None
 
 
 def ps5_unswizzle_bytes(
@@ -475,8 +942,12 @@ def ps5_unswizzle_bytes(
     mask_x/mask_y가 None이면 width/height에서 자동 계산합니다.
     When mask_x/mask_y are None they are computed from width/height.
     """
+    if not _ps5_dimensions_supported(width, height):
+        clipped, _ = _ps5_clip_to_base_level(data, width, height, bytes_per_element)
+        return clipped
     if mask_x is None or mask_y is None:
         mask_x, mask_y = compute_ps5_swizzle_masks(width, height)
+    data, _ = _ps5_clip_to_base_level(data, width, height, bytes_per_element)
     total_elements = _ps5_validate_texture_shape(data, width, height, bytes_per_element)
     src = memoryview(data)
     dst = bytearray(len(data))
@@ -522,8 +993,12 @@ def ps5_swizzle_bytes(
     mask_x/mask_y가 None이면 width/height에서 자동 계산합니다.
     When mask_x/mask_y are None they are computed from width/height.
     """
+    if not _ps5_dimensions_supported(width, height):
+        clipped, _ = _ps5_clip_to_base_level(data, width, height, bytes_per_element)
+        return clipped
     if mask_x is None or mask_y is None:
         mask_x, mask_y = compute_ps5_swizzle_masks(width, height)
+    data, _ = _ps5_clip_to_base_level(data, width, height, bytes_per_element)
     total_elements = _ps5_validate_texture_shape(data, width, height, bytes_per_element)
     src = memoryview(data)
     dst = bytearray(len(data))
@@ -582,6 +1057,7 @@ def _ps5_roughness_score(
     """KR: 로컬 픽셀 변화량 기반 거칠기 점수를 계산합니다.
     EN: Compute a local variation roughness score.
     """
+    data, _ = _ps5_clip_to_base_level(data, width, height, bytes_per_element)
     _ps5_validate_texture_shape(data, width, height, bytes_per_element)
     view = memoryview(data)
     step_x = max(1, width // max_axis_samples)
@@ -650,6 +1126,10 @@ def detect_ps5_swizzle_state(
     """KR: 입력 바이트가 swizzled인지 휴리스틱으로 판별합니다.
     EN: Heuristically detect whether input bytes are likely swizzled.
     """
+    data, _ = _ps5_clip_to_base_level(data, width, height, bytes_per_element)
+    if not _ps5_dimensions_supported(width, height):
+        raw_score = _ps5_roughness_score(data, width, height, bytes_per_element)
+        return "inconclusive", raw_score, raw_score, raw_score, data, data
     if mask_x is None or mask_y is None:
         mask_x, mask_y = compute_ps5_swizzle_masks(width, height)
     raw_score = _ps5_roughness_score(data, width, height, bytes_per_element)
@@ -702,10 +1182,14 @@ def apply_ps5_swizzle_to_image(
     EN: Apply PS5 swizzle transform to a linear image.
     """
     prepared = _ps5_prepare_image(image)
-    # KR: PS5 atlas 좌표계 보정을 위해 정사각 Atlas에서는 swizzle 전에 역방향 회전을 적용합니다.
-    # EN: For PS5 atlas orientation, apply inverse rotation before swizzle on square atlases.
-    if rotate % 360 != 0 and prepared.width == prepared.height:
-        prepared = prepared.rotate((-rotate) % 360, expand=False)
+    if not _ps5_dimensions_supported(prepared.width, prepared.height):
+        return prepared.copy()
+    # KR: PS5 atlas 좌표계 보정을 위해 swizzle 전에 역방향 회전을 적용합니다.
+    # EN: For PS5 atlas orientation, apply inverse rotation before swizzle.
+    if rotate % 360 != 0:
+        prepared = prepared.rotate((-rotate) % 360, expand=True)
+    if not _ps5_dimensions_supported(prepared.width, prepared.height):
+        return _ps5_prepare_image(image).copy()
 
     data = prepared.tobytes()
     bytes_per_element = len(prepared.getbands())
@@ -730,6 +1214,8 @@ def apply_ps5_unswizzle_to_image(
     EN: Apply PS5 unswizzle transform to a swizzled image.
     """
     prepared = _ps5_prepare_image(image)
+    if not _ps5_dimensions_supported(prepared.width, prepared.height):
+        return prepared.copy()
     data = prepared.tobytes()
     bytes_per_element = len(prepared.getbands())
     unswizzled = ps5_unswizzle_bytes(
@@ -741,8 +1227,8 @@ def apply_ps5_unswizzle_to_image(
         mask_y=mask_y,
     )
     output = Image.frombytes(prepared.mode, (prepared.width, prepared.height), unswizzled)
-    if rotate % 360 != 0 and output.width == output.height:
-        output = output.rotate(rotate % 360, expand=False)
+    if rotate % 360 != 0:
+        output = output.rotate(rotate % 360, expand=True)
     return output
 
 
@@ -844,22 +1330,36 @@ def detect_texture_object_ps5_swizzle_detail(
 
             if raw_data:
                 total_elements = width * height
-                if total_elements > 0 and (len(raw_data) % total_elements) == 0:
-                    bytes_per_element = len(raw_data) // total_elements
-                    if bytes_per_element > 0:
-                        try:
-                            verdict, *_ = detect_ps5_swizzle_state(
-                                raw_data,
-                                width,
-                                height,
-                                bytes_per_element,
-                                mask_x=mask_x,
-                                mask_y=mask_y,
-                            )
-                            if verdict != "inconclusive":
-                                return verdict, "raw-data"
-                        except Exception:
-                            pass
+                bytes_per_element: int | None = _texture_format_bytes_per_element(texture_format)
+                if bytes_per_element is None and total_elements > 0 and (len(raw_data) % total_elements) == 0:
+                    derived = len(raw_data) // total_elements
+                    if derived in {1, 2, 3, 4}:
+                        bytes_per_element = int(derived)
+                if bytes_per_element in {1, 2, 3, 4}:
+                    try:
+                        base_raw_data, trailing = _ps5_clip_to_base_level(
+                            raw_data,
+                            width,
+                            height,
+                            int(bytes_per_element),
+                        )
+                    except Exception:
+                        base_raw_data = raw_data
+                        trailing = 0
+                    try:
+                        verdict, *_ = detect_ps5_swizzle_state(
+                            base_raw_data,
+                            width,
+                            height,
+                            int(bytes_per_element),
+                            mask_x=mask_x,
+                            mask_y=mask_y,
+                        )
+                        if verdict != "inconclusive":
+                            source = "raw-data-base" if trailing > 0 else "raw-data"
+                            return verdict, source
+                    except Exception:
+                        pass
 
         image = getattr(texture, "image", None)
         if isinstance(image, Image.Image):
@@ -968,28 +1468,274 @@ def ensure_int(data: JsonDict | None, keys: Iterable[str]) -> None:
             data[key] = int(data[key])
 
 
-def detect_tmp_version(data: JsonDict) -> Literal["new", "old"]:
+@lru_cache(maxsize=256)
+def _parse_unity_version_triplet(version_text: str) -> tuple[int, int, int] | None:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text or "")
+    if not match:
+        return None
+    try:
+        return int(match.group(1)), int(match.group(2)), int(match.group(3))
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
+def _load_tmp_info_unity_field_index() -> dict[tuple[int, int, int], set[str]]:
+    """KR: TMP_Info의 Unity 축 스냅샷에서 버전별 최상위 필드 인덱스를 로드합니다.
+    EN: Load per-version top-level field index from TMP_Info unity snapshots.
+    """
+    try:
+        path = os.path.join(get_script_dir(), "TMP_Info", "02_unity_version_changes.json")
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        snapshots = obj.get("snapshots", []) if isinstance(obj, dict) else []
+        index: dict[tuple[int, int, int], set[str]] = {}
+        if not isinstance(snapshots, list):
+            return {}
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            if not bool(snapshot.get("has_type", False)):
+                continue
+            version_text = str(snapshot.get("version", "") or "")
+            triplet = _parse_unity_version_triplet(version_text)
+            if triplet is None:
+                continue
+            declared_fields = snapshot.get("declared_fields", [])
+            if not isinstance(declared_fields, list):
+                continue
+            fields: set[str] = set()
+            for field in declared_fields:
+                if isinstance(field, str) and field:
+                    fields.add(field)
+                elif isinstance(field, dict):
+                    name = field.get("name")
+                    if isinstance(name, str) and name:
+                        fields.add(name)
+            if fields:
+                index[triplet] = fields
+        return index
+    except Exception:
+        return {}
+
+
+@lru_cache(maxsize=256)
+def _get_tmp_info_fields_for_unity(unity_version: str | None) -> set[str]:
+    """KR: Unity 버전에 가장 가까운 TMP_Info 스냅샷 필드 집합을 반환합니다.
+    EN: Return TMP_Info field set from the nearest Unity version snapshot.
+    """
+    if not unity_version:
+        return set()
+    triplet = _parse_unity_version_triplet(str(unity_version))
+    if triplet is None:
+        return set()
+    index = _load_tmp_info_unity_field_index()
+    if not index:
+        return set()
+    if triplet in index:
+        return set(index[triplet])
+    lower_or_equal = [key for key in index.keys() if key <= triplet]
+    if lower_or_equal:
+        return set(index[max(lower_or_equal)])
+    return set(index[min(index.keys())])
+
+
+def _resolve_creation_settings_key(data: JsonDict, unity_version: str | None = None) -> str | None:
+    """KR: 타겟 딕셔너리에서 creation settings 키를 판별합니다.
+    EN: Resolve creation-settings key from target dict.
+    """
+    for key in _TMP_CREATION_SETTINGS_KEYS:
+        if isinstance(data.get(key), dict):
+            return key
+    expected_fields = _get_tmp_info_fields_for_unity(unity_version)
+    for key in _TMP_CREATION_SETTINGS_KEYS:
+        if key in expected_fields and key in data and isinstance(data.get(key), dict):
+            return key
+    return None
+
+
+def _sync_creation_settings_payload(
+    creation_settings: JsonDict,
+    atlas_width: int,
+    atlas_height: int,
+    padding: int,
+    point_size: int,
+) -> None:
+    """KR: creation settings 내부 키 패턴을 감지해 atlas/pointSize를 동기화합니다.
+    EN: Detect key patterns in creation settings and sync atlas/pointSize values.
+    """
+    for key in list(creation_settings.keys()):
+        normalized = key.replace("_", "").lower()
+        if "atlaswidth" in normalized:
+            creation_settings[key] = int(atlas_width)
+        elif "atlasheight" in normalized:
+            creation_settings[key] = int(atlas_height)
+        elif normalized.endswith("padding") or normalized == "padding":
+            creation_settings[key] = int(padding)
+        elif normalized.endswith("pointsize") or normalized == "pointsize":
+            creation_settings[key] = int(point_size)
+        elif "charactersequence" in normalized:
+            creation_settings[key] = ""
+
+
+def _tmp_version_hint(unity_version: str | None) -> Literal["new", "old"] | None:
+    if not unity_version:
+        return None
+    triplet = _parse_unity_version_triplet(str(unity_version))
+    if triplet is None:
+        return None
+    if triplet <= _TMP_OLD_ONLY_LAST:
+        return "old"
+    if triplet >= _TMP_NEW_SCHEMA_FIRST:
+        return "new"
+    return None
+
+
+def _safe_list_len(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
+
+
+def _first_atlas_ref(value: Any) -> JsonDict | None:
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, dict):
+            return cast(JsonDict, item)
+    return None
+
+
+def _atlas_ref_ids(ref: Any) -> tuple[int, int]:
+    if not isinstance(ref, dict):
+        return 0, 0
+    try:
+        file_id = int(ref.get("m_FileID", 0) or 0)
+    except Exception:
+        file_id = 0
+    try:
+        path_id = int(ref.get("m_PathID", 0) or 0)
+    except Exception:
+        path_id = 0
+    return file_id, path_id
+
+
+def _has_real_atlas_path(ref: Any) -> bool:
+    _, path_id = _atlas_ref_ids(ref)
+    return path_id > 0
+
+
+def _first_valid_atlas_ref(value: Any) -> JsonDict | None:
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, dict) and _has_real_atlas_path(item):
+            return cast(JsonDict, item)
+    return None
+
+
+def _best_atlas_ref(
+    data: JsonDict,
+    *,
+    prefer_new: bool,
+) -> JsonDict | None:
+    new_any = _first_atlas_ref(data.get("m_AtlasTextures"))
+    new_valid = _first_valid_atlas_ref(data.get("m_AtlasTextures"))
+    old_any = cast(JsonDict | None, data.get("atlas")) if isinstance(data.get("atlas"), dict) else None
+    old_valid = old_any if _has_real_atlas_path(old_any) else None
+
+    ordered = (new_valid, old_valid, new_any, old_any) if prefer_new else (old_valid, new_valid, old_any, new_any)
+    for ref in ordered:
+        if isinstance(ref, dict):
+            return ref
+    return None
+
+
+def detect_tmp_version(data: JsonDict, unity_version: str | None = None) -> Literal["new", "old"]:
     """KR: SDF TMP 데이터가 신형/구형 포맷인지 판별합니다.
     EN: Detect whether SDF TMP data uses new or old schema.
     """
-    has_new_glyphs = len(data.get("m_GlyphTable", [])) > 0
-    has_old_glyphs = len(data.get("m_glyphInfoList", [])) > 0
+    new_glyph_count = _safe_list_len(data.get("m_GlyphTable"))
+    old_glyph_count = _safe_list_len(data.get("m_glyphInfoList"))
+    has_new_glyphs = new_glyph_count > 0
+    has_old_glyphs = old_glyph_count > 0
+
+    has_new_face = isinstance(data.get("m_FaceInfo"), dict)
+    has_old_face = isinstance(data.get("m_fontInfo"), dict)
+    has_new_atlas = _first_atlas_ref(data.get("m_AtlasTextures")) is not None
+    has_old_atlas = isinstance(data.get("atlas"), dict)
 
     # KR: 두 포맷 키가 동시에 있어도 실제 글리프가 있는 쪽을 우선합니다.
     # EN: When both schema keys exist, prefer the side that has real glyph data.
-    if has_new_glyphs:
-        return "new"
-    if has_old_glyphs:
-        return "old"
+    if has_new_glyphs != has_old_glyphs:
+        return "new" if has_new_glyphs else "old"
+    if new_glyph_count != old_glyph_count:
+        return "new" if new_glyph_count > old_glyph_count else "old"
 
-    # KR: 글리프가 비어 있으면 필드 존재 여부로 포맷을 추정합니다.
-    # EN: If glyphs are empty, infer format by field presence.
-    if "m_FaceInfo" in data:
+    # KR: 글리프가 비슷하면 face/atlas 신호를 비교합니다.
+    # EN: When glyph evidence is ambiguous, compare face/atlas signals.
+    if has_new_face != has_old_face:
+        return "new" if has_new_face else "old"
+    if has_new_atlas != has_old_atlas:
+        return "new" if has_new_atlas else "old"
+
+    # KR: Unity-Runtime-Libraries 기준 버전 힌트(2018.3.14 / 2018.4.2)를 사용합니다.
+    # EN: Use Unity-Runtime-Libraries version boundaries (2018.3.14 / 2018.4.2).
+    hint = _tmp_version_hint(unity_version)
+    if hint is not None:
+        return hint
+
+    # KR: 최종 폴백은 신형 우선입니다.
+    # EN: Final fallback prefers new schema.
+    if has_new_face or has_new_atlas or "m_CharacterTable" in data:
         return "new"
-    if "m_fontInfo" in data:
+    if has_old_face or has_old_atlas:
         return "old"
 
     return "new"
+
+
+def inspect_tmp_font_schema(
+    data: JsonDict,
+    unity_version: str | None = None,
+) -> dict[str, Any]:
+    """KR: TMP 스키마 판별과 glyph/atlas 핵심 메타를 공통 형태로 반환합니다.
+    EN: Return unified TMP schema classification and glyph/atlas metadata.
+    """
+    target_version = detect_tmp_version(data, unity_version=unity_version)
+
+    new_glyph_count = _safe_list_len(data.get("m_GlyphTable"))
+    old_glyph_count = _safe_list_len(data.get("m_glyphInfoList"))
+    has_new_face = isinstance(data.get("m_FaceInfo"), dict)
+    has_old_face = isinstance(data.get("m_fontInfo"), dict)
+    new_atlas_ref = _first_atlas_ref(data.get("m_AtlasTextures"))
+    old_atlas_ref = cast(JsonDict | None, data.get("atlas")) if isinstance(data.get("atlas"), dict) else None
+
+    if target_version == "new":
+        glyph_count = new_glyph_count if new_glyph_count > 0 else old_glyph_count
+        atlas_ref = _best_atlas_ref(data, prefer_new=True)
+    else:
+        glyph_count = old_glyph_count if old_glyph_count > 0 else new_glyph_count
+        atlas_ref = _best_atlas_ref(data, prefer_new=False)
+
+    atlas_file_id, atlas_path_id = _atlas_ref_ids(atlas_ref)
+
+    is_tmp = bool(
+        new_glyph_count > 0
+        or old_glyph_count > 0
+        or has_new_face
+        or has_old_face
+        or new_atlas_ref is not None
+        or old_atlas_ref is not None
+    )
+
+    return {
+        "version": target_version,
+        "is_tmp": is_tmp,
+        "glyph_count": int(glyph_count),
+        "atlas_file_id": int(atlas_file_id),
+        "atlas_path_id": int(atlas_path_id),
+    }
 
 
 def convert_face_info_new_to_old(
@@ -1066,100 +1812,25 @@ def _new_glyph_rect_to_int(rect: JsonDict) -> tuple[int, int, int, int]:
     return x, y, w, h
 
 
-def detect_new_glyph_y_flip(
-    glyph_table: list[JsonDict],
-    char_table: list[JsonDict],
-    atlas_image: Image.Image | None,
-    sample_limit: int = 256,
-) -> bool:
-    """KR: 신형 TMP glyph Y축이 구형 TMP 기준으로 반전되어 있는지 추정합니다.
-    EN: Estimate whether new TMP glyph Y coordinates must be flipped for old TMP.
+def _tmp_flip_y_between_old_new(y_value: float, glyph_height: float, atlas_height: int | float | None) -> float:
+    """KR: TMP old(top-origin) <-> new(bottom-origin) Y 변환 공식을 적용합니다.
+    EN: Apply TMP old(top-origin) <-> new(bottom-origin) Y conversion formula.
     """
-    if atlas_image is None or not glyph_table or not char_table:
-        return False
-
-    glyph_by_index: dict[int, JsonDict] = {}
-    for glyph in glyph_table:
-        glyph_by_index[int(glyph.get("m_Index", 0))] = glyph
-
-    # KR: 문자 테이블 순서를 따라 샘플을 뽑아 실제 렌더와 가까운 분포를 사용합니다.
-    # EN: Sample in character-table order to match runtime usage distribution.
-    rect_samples: list[tuple[int, int, int, int]] = []
-    seen_indices: set[int] = set()
-    for char in char_table:
-        glyph_idx = int(char.get("m_GlyphIndex", -1))
-        if glyph_idx in seen_indices:
-            continue
-        seen_indices.add(glyph_idx)
-        glyph = glyph_by_index.get(glyph_idx)
-        if not glyph:
-            continue
-        rect = glyph.get("m_GlyphRect", {})
-        x, y, w, h = _new_glyph_rect_to_int(rect)
-        if w <= 1 or h <= 1:
-            continue
-        rect_samples.append((x, y, w, h))
-
-    if not rect_samples:
-        return False
-
-    if len(rect_samples) > sample_limit:
-        step = max(1, len(rect_samples) // sample_limit)
-        rect_samples = rect_samples[::step][:sample_limit]
-
-    if "A" in atlas_image.getbands():
-        alpha = atlas_image.getchannel("A")
-    else:
-        alpha = atlas_image.convert("L")
-
-    atlas_w, atlas_h = alpha.size
-
-    def _score(flip_y: bool) -> tuple[int, float, int]:
-        """KR: 후보 좌표계(flip 여부)에서 글리프 영역 유효도를 계산합니다.
-        EN: Score glyph-region validity for a candidate coordinate space (flipped or not).
-        """
-        non_zero_count = 0
-        mean_sum = 0.0
-        valid_rects = 0
-
-        for x, y, w, h in rect_samples:
-            yy = atlas_h - y - h if flip_y else y
-            x0 = max(0, min(atlas_w - 1, x))
-            y0 = max(0, min(atlas_h - 1, yy))
-            x1 = max(x0 + 1, min(atlas_w, x0 + w))
-            y1 = max(y0 + 1, min(atlas_h, y0 + h))
-
-            if x1 <= x0 or y1 <= y0:
-                continue
-
-            region = alpha.crop((x0, y0, x1, y1))
-            stats = ImageStat.Stat(region)
-            mean_sum += float(stats.mean[0]) if stats.mean else 0.0
-            if region.getbbox() is not None:
-                non_zero_count += 1
-            valid_rects += 1
-
-        return non_zero_count, mean_sum, valid_rects
-
-    direct_non_zero, direct_mean, direct_valid = _score(False)
-    flipped_non_zero, flipped_mean, flipped_valid = _score(True)
-
-    valid_count = min(direct_valid, flipped_valid)
-    if valid_count == 0:
-        return False
-
-    non_zero_margin = max(2, valid_count // 20)  # 5%
-    return (
-        flipped_non_zero > direct_non_zero + non_zero_margin
-        or (flipped_non_zero >= direct_non_zero and flipped_mean > (direct_mean * 1.2))
-    )
+    if atlas_height is None:
+        return float(y_value)
+    try:
+        atlas_h = float(atlas_height)
+    except Exception:
+        return float(y_value)
+    if atlas_h <= 0:
+        return float(y_value)
+    return atlas_h - float(y_value) - float(glyph_height)
 
 
 def convert_glyphs_new_to_old(
     glyph_table: list[JsonDict],
     char_table: list[JsonDict],
     atlas_height: int | None = None,
-    flip_y: bool = False,
 ) -> list[JsonDict]:
     """KR: 신형 글리프/문자 테이블을 구형 m_glyphInfoList로 변환합니다.
     EN: Convert new glyph/character tables into old m_glyphInfoList.
@@ -1174,10 +1845,12 @@ def convert_glyphs_new_to_old(
         g = glyph_by_index.get(glyph_idx, {})
         metrics = g.get("m_Metrics", {})
         rect = g.get("m_GlyphRect", {})
-        rect_y = float(rect.get("m_Y", 0))
         rect_h = float(rect.get("m_Height", 0))
-        if flip_y and atlas_height:
-            rect_y = float(atlas_height) - rect_y - rect_h
+        rect_y = _tmp_flip_y_between_old_new(
+            float(rect.get("m_Y", 0)),
+            rect_h,
+            atlas_height,
+        )
         result.append({
             "id": int(unicode_val),
             "x": float(rect.get("m_X", 0)),
@@ -1192,7 +1865,10 @@ def convert_glyphs_new_to_old(
     return result
 
 
-def convert_glyphs_old_to_new(glyph_info_list: list[JsonDict]) -> tuple[list[JsonDict], list[JsonDict]]:
+def convert_glyphs_old_to_new(
+    glyph_info_list: list[JsonDict],
+    atlas_height: int | None = None,
+) -> tuple[list[JsonDict], list[JsonDict]]:
     """KR: 구형 m_glyphInfoList를 신형 테이블 구조로 변환합니다.
     EN: Convert old m_glyphInfoList into new glyph/character tables.
     """
@@ -1201,6 +1877,9 @@ def convert_glyphs_old_to_new(glyph_info_list: list[JsonDict]) -> tuple[list[Jso
     glyph_idx = 0
     for glyph in glyph_info_list:
         uid = glyph.get("id", 0)
+        old_rect_y = float(glyph.get("y", 0))
+        glyph_h = float(glyph.get("height", 0))
+        new_rect_y = _tmp_flip_y_between_old_new(old_rect_y, glyph_h, atlas_height)
         glyph_table.append({
             "m_Index": glyph_idx,
             "m_Metrics": {
@@ -1212,7 +1891,7 @@ def convert_glyphs_old_to_new(glyph_info_list: list[JsonDict]) -> tuple[list[Jso
             },
             "m_GlyphRect": {
                 "m_X": int(glyph.get("x", 0)),
-                "m_Y": int(glyph.get("y", 0)),
+                "m_Y": int(round(new_rect_y)),
                 "m_Width": int(glyph.get("width", 0)),
                 "m_Height": int(glyph.get("height", 0)),
             },
@@ -1252,7 +1931,14 @@ def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
         # EN: Upgrade old face/glyph structures to new TMP fields.
         result["m_FaceInfo"] = convert_face_info_old_to_new(font_info)
 
-        glyph_table, char_table = convert_glyphs_old_to_new(glyph_info_list)
+        try:
+            atlas_height_int = int(atlas_height) if atlas_height is not None else None
+        except Exception:
+            atlas_height_int = None
+        glyph_table, char_table = convert_glyphs_old_to_new(
+            glyph_info_list,
+            atlas_height=atlas_height_int,
+        )
         result["m_GlyphTable"] = glyph_table
         result["m_CharacterTable"] = char_table
 
@@ -1453,43 +2139,36 @@ def _scan_fonts_from_env(
                 })
             elif obj.type.name == "MonoBehaviour":
                 parse_dict = None
-                is_font = False
                 atlas_file_id = 0
                 atlas_path_id = 0
+                glyph_count = 0
                 try:
                     parse_dict = obj.parse_as_dict()
-                    # KR: TMP 스키마 판별: 신형(m_FaceInfo/m_AtlasTextures) 또는 구형(m_fontInfo/atlas)
-                    # EN: Detect TMP schema: new(m_FaceInfo/m_AtlasTextures) or old(m_fontInfo/atlas)
-                    if ("m_AtlasTextures" in parse_dict and "m_FaceInfo" in parse_dict) or \
-                       ("atlas" in parse_dict and "m_fontInfo" in parse_dict):
-                        is_font = True
+                    unity_version_hint = getattr(obj.assets_file, "unity_version", None)
+                    tmp_info = inspect_tmp_font_schema(
+                        parse_dict,
+                        unity_version=str(unity_version_hint) if unity_version_hint else None,
+                    )
                 except Exception:
                     if lang == "ko":
                         debug_parse_log(f"[scan_fonts] parse_as_dict 실패: {file_name} | PathID {obj.path_id}")
                     else:
                         debug_parse_log(f"[scan_fonts] parse_as_dict failed: {file_name} | PathID {obj.path_id}")
+                    continue
 
-                if not is_font:
+                if not tmp_info.get("is_tmp"):
                     continue
 
                 try:
                     if parse_dict is None:
                         parse_dict = obj.parse_as_dict()
-                    atlas_textures = parse_dict.get("m_AtlasTextures", [])
-                    glyph_count = len(parse_dict.get("m_GlyphTable", []))
-                    if not atlas_textures and isinstance(parse_dict.get("atlas"), dict):
-                        atlas_textures = [cast(JsonDict, parse_dict.get("atlas"))]
-                    if glyph_count == 0:
-                        glyph_count = len(parse_dict.get("m_glyphInfoList", []))
-                    if atlas_textures:
-                        first_atlas = atlas_textures[0]
-                        if isinstance(first_atlas, dict):
-                            atlas_file_id = int(first_atlas.get("m_FileID", 0) or 0)
-                            atlas_path_id = int(first_atlas.get("m_PathID", 0) or 0)
-                            # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 교체 대상이 아닙니다.
-                            # EN: External stubs (FileID!=0, PathID=0) are not valid replacement targets.
-                            if atlas_file_id != 0 and atlas_path_id == 0:
-                                continue
+                    glyph_count = int(tmp_info.get("glyph_count", 0) or 0)
+                    atlas_file_id = int(tmp_info.get("atlas_file_id", 0) or 0)
+                    atlas_path_id = int(tmp_info.get("atlas_path_id", 0) or 0)
+                    # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 교체 대상이 아닙니다.
+                    # EN: External stubs (FileID!=0, PathID=0) are not valid replacement targets.
+                    if atlas_file_id != 0 and atlas_path_id == 0:
+                        continue
                     if glyph_count == 0:
                         continue
                 except Exception:
@@ -1995,7 +2674,7 @@ def replace_fonts_in_file(
     generator: TypeTreeGenerator | None = None,
     replacement_lookup: dict[tuple[str, str, str, int], str] | None = None,
     ps5_swizzle: bool = False,
-    preview: bool = False,
+    preview_export: bool = False,
     preview_root: str | None = None,
     lang: Language = "ko",
 ) -> bool:
@@ -2007,7 +2686,8 @@ def replace_fonts_in_file(
     KR: material_scale_by_padding=True면 SDF 머티리얼 float를 (게임 padding / 교체 padding) 비율로 보정합니다.
     KR: prefer_original_compress=True면 원본 압축 우선, False면 무압축 계열 우선 저장 전략을 사용합니다.
     KR: ps5_swizzle=True면 대상 Atlas의 swizzle 상태를 판별해 교체 Atlas를 자동 swizzle/unswizzle합니다.
-    KR: preview=True이고 ps5_swizzle=True면 preview 폴더에 unswizzle 결과 PNG를 저장합니다.
+    KR: preview_export=True면 preview 폴더에 Atlas/Glyph crop 미리보기를 저장합니다.
+    KR: ps5_swizzle=True일 때는 unswizzle 기준으로 저장합니다.
     KR: temp_root_dir가 지정되면 임시 저장 디렉터리 루트로 사용합니다.
     EN: Replace TTF/SDF fonts in one assets file and save changes.
     EN: By default, line-related metrics (LineHeight/Ascender/Descender, etc.) are adjusted from in-game ratios
@@ -2017,7 +2697,8 @@ def replace_fonts_in_file(
     EN: If material_scale_by_padding=True, SDF material floats are adjusted by (game padding / replacement padding).
     EN: When prefer_original_compress=True, original compression is tried first; otherwise uncompressed-family is preferred.
     EN: If ps5_swizzle=True, auto-detect target atlas swizzle state and swizzle/unswizzle replacement atlas.
-    EN: If preview=True with ps5_swizzle=True, save unswizzled preview PNGs to preview folder.
+    EN: If preview_export=True, save Atlas/Glyph crop previews into preview folder.
+    EN: With ps5_swizzle=True, previews are saved in unswizzled view.
     EN: If temp_root_dir is set, it is used as the root directory for temporary save files.
     """
     fn_without_path = os.path.basename(assets_file)
@@ -2029,25 +2710,8 @@ def replace_fonts_in_file(
         register_temp_dir_for_cleanup(tmp_path)
     else:
         register_temp_dir_for_cleanup(tmp_root)
-    bundle_signatures = {"UnityFS", "UnityWeb", "UnityRaw"}
-
-    def _read_bundle_signature(path: str) -> str | None:
-        """KR: 파일 헤더에서 Unity 번들 시그니처를 읽습니다.
-        EN: Read Unity bundle signature from file header.
-        """
-        try:
-            with open(path, "rb") as f:
-                header = f.read(16)
-        except Exception:
-            return None
-
-        for sig in bundle_signatures:
-            token = (sig + "\x00").encode("ascii")
-            if header.startswith(token):
-                return sig
-        return None
-
-    source_bundle_signature = _read_bundle_signature(assets_file)
+    bundle_signatures = BUNDLE_SIGNATURES
+    source_bundle_signature = _read_bundle_signature(assets_file, bundle_signatures)
 
     if not os.path.exists(tmp_root):
         os.makedirs(tmp_root, exist_ok=True)
@@ -2100,354 +2764,11 @@ def replace_fonts_in_file(
 
     target_sdf_pathids: set[int] = set()
     target_sdf_font_by_pathid: dict[int, str] = {}
-    old_line_metric_keys = (
-        "LineHeight",
-        "Baseline",
-        "Ascender",
-        "CapHeight",
-        "Descender",
-        "CenterLine",
-        "Scale",
-        "SuperscriptOffset",
-        "SubscriptOffset",
-        "SubSize",
-        "Underline",
-        "UnderlineThickness",
-        "strikethrough",
-        "strikethroughThickness",
-        "TabWidth",
-    )
-    old_line_metric_scale_keys = (
-        "LineHeight",
-        "Baseline",
-        "Ascender",
-        "CapHeight",
-        "Descender",
-        "CenterLine",
-        "SuperscriptOffset",
-        "SubscriptOffset",
-        "Underline",
-        "UnderlineThickness",
-        "strikethrough",
-        "strikethroughThickness",
-        "TabWidth",
-    )
-    new_line_metric_keys = (
-        "m_LineHeight",
-        "m_AscentLine",
-        "m_CapLine",
-        "m_MeanLine",
-        "m_Baseline",
-        "m_DescentLine",
-        "m_Scale",
-        "m_SuperscriptOffset",
-        "m_SuperscriptSize",
-        "m_SubscriptOffset",
-        "m_SubscriptSize",
-        "m_UnderlineOffset",
-        "m_UnderlineThickness",
-        "m_StrikethroughOffset",
-        "m_StrikethroughThickness",
-        "m_TabWidth",
-    )
-    new_line_metric_scale_keys = (
-        "m_LineHeight",
-        "m_AscentLine",
-        "m_CapLine",
-        "m_MeanLine",
-        "m_Baseline",
-        "m_DescentLine",
-        "m_SuperscriptOffset",
-        "m_SubscriptOffset",
-        "m_UnderlineOffset",
-        "m_UnderlineThickness",
-        "m_StrikethroughOffset",
-        "m_StrikethroughThickness",
-        "m_TabWidth",
-    )
-    material_padding_scale_keys = (
-        "_GradientScale",
-        "_FaceDilate",
-        "_OutlineWidth",
-        "_OutlineSoftness",
-        "_UnderlayDilate",
-        "_UnderlaySoftness",
-        "_UnderlayOffsetX",
-        "_UnderlayOffsetY",
-        "_GlowOffset",
-        "_GlowInner",
-        "_GlowOuter",
-    )
-
-    def _safe_metric_scale(game_point_size: Any, replacement_point_size: Any) -> float:
-        """KR: 게임 pointSize 대비 교체 pointSize 비율을 계산합니다.
-        EN: Compute scaling ratio from game pointSize to replacement pointSize.
-        """
-        try:
-            game_ps = float(game_point_size)
-            repl_ps = float(replacement_point_size)
-            if game_ps > 0 and repl_ps > 0:
-                return repl_ps / game_ps
-        except Exception:
-            pass
-        return 1.0
-
-    def _detect_target_texture_swizzle(assets_name: str, path_id: int) -> tuple[str | None, str | None]:
-        cache_key = f"{assets_name}|{path_id}"
-        if cache_key in texture_swizzle_state_cache:
-            return texture_swizzle_state_cache[cache_key]
-        texture_obj = texture_object_lookup.get((assets_name, int(path_id)))
-        verdict, source = (
-            detect_texture_object_ps5_swizzle_detail(texture_obj)
-            if texture_obj is not None
-            else (None, None)
-        )
-        texture_swizzle_state_cache[cache_key] = (verdict, source)
-        return verdict, source
-
-    def _save_swizzle_preview(
-        image: Image.Image,
-        assets_name: str,
-        atlas_path_id: int,
-        font_name: str,
-        target_swizzled: bool,
-    ) -> None:
-        if not (preview and ps5_swizzle and preview_root):
-            return
-        try:
-            visible = _preview_visible_image(image)
-            file_dir = sanitize_filename_component(fn_without_path, fallback="assets_file")
-            out_dir = os.path.join(preview_root, file_dir)
-            os.makedirs(out_dir, exist_ok=True)
-            safe_assets = sanitize_filename_component(assets_name, fallback="assets")
-            safe_font = sanitize_filename_component(font_name, fallback="font")
-            state_label = "target_swizzled" if target_swizzled else "target_linear"
-            out_name = f"{safe_assets}__{atlas_path_id}__{safe_font}__unswizzled__{state_label}.png"
-            out_path = os.path.join(out_dir, out_name)
-            visible.save(out_path, format="PNG")
-            if lang == "ko":
-                print(f"  Preview 저장: {out_path}")
-            else:
-                print(f"  Preview saved: {out_path}")
-        except Exception as preview_error:
-            if lang == "ko":
-                print(f"  경고: preview 저장 실패 ({preview_error})")
-            else:
-                print(f"  Warning: failed to save preview ({preview_error})")
-
-    def _preview_visible_image(image: Image.Image) -> Image.Image:
-        """KR: RGBA/LA Atlas를 사람이 보기 쉬운 단일 채널 이미지로 정규화합니다.
-        EN: Normalize RGBA/LA atlas into a human-visible single-channel image.
-        """
-        try:
-            if image.mode == "RGBA":
-                alpha = image.getchannel("A")
-                rgb = image.convert("RGB")
-                rgb_bbox = rgb.getbbox()
-                alpha_bbox = alpha.getbbox()
-                if alpha_bbox and not rgb_bbox:
-                    return alpha
-                return alpha if alpha_bbox else image.convert("L")
-            if image.mode == "LA":
-                alpha = image.getchannel("A")
-                return alpha if alpha.getbbox() else image.getchannel("L")
-            if image.mode == "P":
-                return image.convert("L")
-            if image.mode not in {"L", "RGB"}:
-                return image.convert("L")
-            return image
-        except Exception:
-            return image.convert("L")
-
-    def _load_target_unswizzled_preview_image(
-        assets_name: str,
-        atlas_path_id: int,
-        swizzle_verdict: str | None,
-        preview_rotate: int = PS5_SWIZZLE_ROTATE,
-    ) -> Image.Image | None:
-        """KR: 대상 게임 Atlas(Texture2D)에서 검증용 unswizzle preview 이미지를 생성합니다.
-        EN: Build an unswizzled preview image from the target in-game Texture2D atlas.
-        """
-        texture_obj = texture_object_lookup.get((assets_name, int(atlas_path_id)))
-        if texture_obj is None:
-            return None
-        try:
-            texture = texture_obj.parse_as_object()
-            width = int(getattr(texture, "m_Width", 0) or 0)
-            height = int(getattr(texture, "m_Height", 0) or 0)
-            raw_data: bytes | None = None
-
-            get_image_data = getattr(texture, "get_image_data", None)
-            if callable(get_image_data):
-                try:
-                    candidate = get_image_data()
-                    if isinstance(candidate, (bytes, bytearray)):
-                        raw_data = bytes(candidate)
-                except Exception:
-                    raw_data = None
-            if raw_data is None:
-                image_data = getattr(texture, "image_data", None)
-                if isinstance(image_data, (bytes, bytearray)):
-                    raw_data = bytes(image_data)
-
-            if width > 0 and height > 0 and raw_data:
-                total_elements = width * height
-                if total_elements > 0 and (len(raw_data) % total_elements) == 0:
-                    bpe = len(raw_data) // total_elements
-                    if bpe in {1, 2, 3, 4}:
-                        processed = raw_data
-                        if swizzle_verdict == "likely_swizzled_input":
-                            try:
-                                processed = ps5_unswizzle_bytes(
-                                    raw_data,
-                                    width,
-                                    height,
-                                    bpe,
-                                )
-                            except Exception:
-                                processed = raw_data
-                        mode_map = {1: "L", 2: "LA", 3: "RGB", 4: "RGBA"}
-                        preview_image = Image.frombytes(mode_map[bpe], (width, height), processed)
-                        if swizzle_verdict == "likely_swizzled_input" and preview_rotate % 360 != 0 and width == height:
-                            preview_image = preview_image.rotate(preview_rotate % 360, expand=False)
-                        return preview_image
-
-            image = getattr(texture, "image", None)
-            if isinstance(image, Image.Image):
-                preview_image = image
-                if swizzle_verdict == "likely_swizzled_input":
-                    try:
-                        preview_image = apply_ps5_unswizzle_to_image(preview_image, rotate=preview_rotate)
-                    except Exception:
-                        pass
-                return preview_image
-        except Exception:
-            return None
-        return None
-
-    def _save_glyph_crop_previews(
-        image: Image.Image,
-        assets_name: str,
-        atlas_path_id: int,
-        font_name: str,
-        sdf_data: JsonDict,
-    ) -> None:
-        if not (preview and ps5_swizzle and preview_root):
-            return
-        glyph_table = sdf_data.get("m_GlyphTable")
-        char_table = sdf_data.get("m_CharacterTable")
-        if not isinstance(glyph_table, list) or not isinstance(char_table, list):
-            return
-        try:
-            visible = _preview_visible_image(image)
-            file_dir = sanitize_filename_component(fn_without_path, fallback="assets_file")
-            safe_assets = sanitize_filename_component(assets_name, fallback="assets")
-            safe_font = sanitize_filename_component(font_name, fallback="font")
-            glyph_dir = os.path.join(
-                preview_root,
-                file_dir,
-                f"{safe_assets}__{atlas_path_id}__{safe_font}",
-            )
-            os.makedirs(glyph_dir, exist_ok=True)
-
-            glyph_rect_by_index: dict[int, tuple[int, int, int, int]] = {}
-            for glyph in glyph_table:
-                if not isinstance(glyph, dict):
-                    continue
-                try:
-                    glyph_index = int(glyph.get("m_Index", -1))
-                except Exception:
-                    continue
-                rect_raw = glyph.get("m_GlyphRect", {})
-                if not isinstance(rect_raw, dict):
-                    continue
-                try:
-                    gx = int(rect_raw.get("m_X", 0))
-                    gy = int(rect_raw.get("m_Y", 0))
-                    gw = int(rect_raw.get("m_Width", 0))
-                    gh = int(rect_raw.get("m_Height", 0))
-                except Exception:
-                    continue
-                if gw <= 0 or gh <= 0:
-                    continue
-                glyph_rect_by_index[glyph_index] = (gx, gy, gw, gh)
-
-            if not glyph_rect_by_index:
-                return
-
-            flip_preview_y = detect_new_glyph_y_flip(glyph_table, char_table, visible)
-            if flip_preview_y:
-                if lang == "ko":
-                    print("  Glyph preview 좌표 보정: Y-flip 적용")
-                else:
-                    print("  Glyph preview coordinate fix: applying Y-flip")
-
-            saved = 0
-            used_names: set[str] = set()
-            for ch in char_table:
-                if not isinstance(ch, dict):
-                    continue
-                try:
-                    codepoint = int(ch.get("m_Unicode", -1))
-                    glyph_index = int(ch.get("m_GlyphIndex", -1))
-                except Exception:
-                    continue
-                if codepoint < 0:
-                    continue
-                rect = glyph_rect_by_index.get(glyph_index)
-                if rect is None:
-                    continue
-
-                x, y, w, h = rect
-                if flip_preview_y:
-                    y = visible.height - y - h
-                x0 = max(0, min(visible.width, x))
-                y0 = max(0, min(visible.height, y))
-                x1 = max(0, min(visible.width, x + w))
-                y1 = max(0, min(visible.height, y + h))
-                if x1 <= x0 or y1 <= y0:
-                    continue
-
-                base = f"U+{codepoint:04X}"
-                try:
-                    ch_text = chr(codepoint)
-                    if ch_text.isprintable() and not ch_text.isspace():
-                        safe_char = sanitize_filename_component(ch_text, fallback="", max_len=8)
-                        if safe_char and safe_char != "unnamed":
-                            base = f"{base}_{safe_char}"
-                except Exception:
-                    pass
-
-                name = base
-                if name in used_names:
-                    name = f"{name}_g{glyph_index}"
-                used_names.add(name)
-                out_path = os.path.join(glyph_dir, f"{name}.png")
-                visible.crop((x0, y0, x1, y1)).save(out_path, format="PNG")
-                saved += 1
-
-            if saved > 0:
-                if lang == "ko":
-                    print(f"  Glyph preview 저장: {saved}개 -> {glyph_dir}")
-                else:
-                    print(f"  Glyph previews saved: {saved} -> {glyph_dir}")
-        except Exception as preview_error:
-            if lang == "ko":
-                print(f"  경고: glyph preview 저장 실패 ({preview_error})")
-            else:
-                print(f"  Warning: failed to save glyph previews ({preview_error})")
-
-    def _image_to_alpha8_bytes(image: Image.Image) -> tuple[bytes, int, int]:
-        """KR: Pillow 이미지를 Alpha8 raw bytes로 변환합니다.
-        EN: Convert Pillow image into Alpha8 raw bytes.
-        """
-        if image.mode in {"RGBA", "LA"}:
-            alpha = image.getchannel("A")
-        elif image.mode == "L":
-            alpha = image
-        else:
-            alpha = image.convert("L")
-        return alpha.tobytes(), alpha.width, alpha.height
+    old_line_metric_keys = _OLD_LINE_METRIC_KEYS
+    old_line_metric_scale_keys = _OLD_LINE_METRIC_SCALE_KEYS
+    new_line_metric_keys = _NEW_LINE_METRIC_KEYS
+    new_line_metric_scale_keys = _NEW_LINE_METRIC_SCALE_KEYS
+    material_padding_scale_keys = _MATERIAL_PADDING_SCALE_KEYS
 
     if replace_sdf:
         for key, value in replacement_lookup.items():
@@ -2459,40 +2780,8 @@ def replace_fonts_in_file(
     patched_sdf_targets = 0
     sdf_parse_failure_reasons: list[str] = []
 
-    def _close_reader(obj: Any) -> None:
-        """KR: UnityPy 내부 reader/객체를 안전하게 dispose합니다.
-        EN: Safely dispose UnityPy internal reader/object resources.
-        """
-        reader = getattr(obj, "reader", None)
-        if reader is not None and hasattr(reader, "dispose"):
-            try:
-                reader.dispose()
-            except Exception:
-                pass
-        if hasattr(obj, "dispose"):
-            try:
-                obj.dispose()
-            except Exception:
-                pass
-
-    def _close_env(environment: Any) -> None:
-        """KR: Environment에 연결된 파일 리소스를 순회 종료합니다.
-        EN: Walk and close file resources attached to environment.
-        """
-        if not environment:
-            return
-        stack: list[Any] = []
-        files = getattr(environment, "files", None)
-        if isinstance(files, dict):
-            stack.extend(files.values())
-        while stack:
-            item = stack.pop()
-            _close_reader(item)
-            sub_files = getattr(item, "files", None)
-            if isinstance(sub_files, dict):
-                stack.extend(sub_files.values())
-
     texture_replacements: dict[str, Any] = {}
+    texture_replacement_metadata_size: dict[str, tuple[int, int]] = {}
     material_replacements: dict[str, JsonDict] = {}
     modified = False
 
@@ -2543,81 +2832,75 @@ def replace_fonts_in_file(
                     print(f"  Warning: PathID {obj.path_id} parse_as_dict failed [{type(e).__name__}]: {e!r}")
                     debug_parse_log(f"[replace_fonts] MonoBehaviour parse_as_dict failed: {fn_without_path} | {reason}")
                 continue
-            has_new_keys = "m_FaceInfo" in parse_dict and "m_AtlasTextures" in parse_dict
-            has_old_keys = "m_fontInfo" in parse_dict and "atlas" in parse_dict
-            if has_new_keys or has_old_keys:
-                target_version = detect_tmp_version(parse_dict)
-                is_new_tmp = (target_version == "new")
-                is_old_tmp = (target_version == "old")
-                # KR: 외부 참조 stub만 제외하고 실제 TMP 폰트만 처리합니다.
-                # EN: Skip external stubs and process only concrete TMP font assets.
-                if is_new_tmp:
-                    atlas_textures = parse_dict.get("m_AtlasTextures", [])
-                    glyph_count = len(parse_dict.get("m_GlyphTable", []))
-                else:
-                    atlas_textures = []
-                    glyph_count = len(parse_dict.get("m_glyphInfoList", []))
-                if atlas_textures:
-                    first_atlas = atlas_textures[0]
-                    if first_atlas.get("m_FileID", 0) != 0 and first_atlas.get("m_PathID", 0) == 0:
-                        continue
-                if glyph_count == 0:
-                    continue
+            unity_version_hint_raw = getattr(obj.assets_file, "unity_version", None)
+            unity_version_hint = str(unity_version_hint_raw or unity_version or "")
+            tmp_info = inspect_tmp_font_schema(
+                parse_dict,
+                unity_version=unity_version_hint or None,
+            )
+            if not tmp_info.get("is_tmp"):
+                continue
+            glyph_count = int(tmp_info.get("glyph_count", 0) or 0)
+            atlas_file_id = int(tmp_info.get("atlas_file_id", 0) or 0)
+            atlas_path_id = int(tmp_info.get("atlas_path_id", 0) or 0)
 
-                objname = obj.peek_name()
-                replacement_font = replacement_lookup.get(("SDF", fn_without_path, assets_name, pathid))
-                if replacement_font is None:
-                    replacement_font = target_sdf_font_by_pathid.get(pathid)
+            # KR: 외부 참조 stub만 제외하고 실제 TMP 폰트만 처리합니다.
+            # EN: Skip external stubs and process only concrete TMP font assets.
+            if atlas_file_id != 0 and atlas_path_id == 0:
+                continue
+            if glyph_count == 0:
+                continue
 
-                preview_target_meta = preview_target_lookup.get((fn_without_path, assets_name, int(pathid)))
-                if replacement_font is None and preview_target_meta is not None and preview and ps5_swizzle:
-                    atlas_path_id_preview = 0
-                    if is_old_tmp:
-                        atlas_ref_preview = parse_dict.get("atlas", {})
-                        if isinstance(atlas_ref_preview, dict):
-                            try:
-                                atlas_path_id_preview = int(atlas_ref_preview.get("m_PathID", 0) or 0)
-                            except Exception:
-                                atlas_path_id_preview = 0
-                    else:
-                        atlas_textures_preview = parse_dict.get("m_AtlasTextures", [])
-                        if isinstance(atlas_textures_preview, list) and atlas_textures_preview:
-                            first_preview = atlas_textures_preview[0]
-                            if isinstance(first_preview, dict):
-                                try:
-                                    atlas_path_id_preview = int(first_preview.get("m_PathID", 0) or 0)
-                                except Exception:
-                                    atlas_path_id_preview = 0
+            objname = obj.peek_name()
+            replacement_font = replacement_lookup.get(("SDF", fn_without_path, assets_name, pathid))
+            if replacement_font is None:
+                replacement_font = target_sdf_font_by_pathid.get(pathid)
 
-                    if atlas_path_id_preview:
+            preview_target_meta = preview_target_lookup.get((fn_without_path, assets_name, int(pathid)))
+            if replacement_font is None and preview_target_meta is not None and preview_export:
+                atlas_path_id_preview = int(tmp_info.get("atlas_path_id", 0) or 0)
+                if atlas_path_id_preview:
+                    target_swizzle_verdict: str | None = None
+                    if ps5_swizzle:
                         target_swizzle_verdict, _ = _detect_target_texture_swizzle(
+                            texture_object_lookup,
+                            texture_swizzle_state_cache,
                             assets_name,
                             int(atlas_path_id_preview),
                         )
-                        target_preview_image = _load_target_unswizzled_preview_image(
-                            assets_name,
-                            int(atlas_path_id_preview),
-                            target_swizzle_verdict,
-                            preview_rotate=PS5_SWIZZLE_ROTATE,
+                    target_preview_image = _load_target_unswizzled_preview_image(
+                        texture_object_lookup,
+                        assets_name,
+                        int(atlas_path_id_preview),
+                        target_swizzle_verdict,
+                        preview_rotate=PS5_SWIZZLE_ROTATE if ps5_swizzle else 0,
+                    )
+                    if isinstance(target_preview_image, Image.Image):
+                        _save_swizzle_preview(
+                            target_preview_image,
+                            preview_enabled=preview_export,
+                            preview_root=preview_root,
+                            assets_file_name=fn_without_path,
+                            assets_name=assets_name,
+                            atlas_path_id=int(atlas_path_id_preview),
+                            font_name=str(objname),
+                            target_swizzled=bool(target_swizzle_verdict == "likely_swizzled_input"),
+                            lang=lang,
                         )
-                        if isinstance(target_preview_image, Image.Image):
-                            _save_swizzle_preview(
-                                target_preview_image,
-                                assets_name,
-                                int(atlas_path_id_preview),
-                                str(objname),
-                                bool(target_swizzle_verdict == "likely_swizzled_input"),
-                            )
-                            preview_sdf_data = normalize_sdf_data(parse_dict)
-                            _save_glyph_crop_previews(
-                                target_preview_image,
-                                assets_name,
-                                int(atlas_path_id_preview),
-                                str(objname),
-                                preview_sdf_data,
-                            )
+                        preview_sdf_data = normalize_sdf_data(parse_dict)
+                        _save_glyph_crop_previews(
+                            target_preview_image,
+                            preview_enabled=preview_export,
+                            preview_root=preview_root,
+                            assets_file_name=fn_without_path,
+                            assets_name=assets_name,
+                            atlas_path_id=int(atlas_path_id_preview),
+                            font_name=str(objname),
+                            sdf_data=preview_sdf_data,
+                            lang=lang,
+                        )
 
-                if replacement_font:
+            if replacement_font:
                     replacement_meta = replacement_meta_lookup.get(
                         ("SDF", fn_without_path, assets_name, int(pathid)),
                         {},
@@ -2656,6 +2939,13 @@ def replace_fonts_in_file(
                         m_GameObject_PathID = parse_dict["m_GameObject"]["m_PathID"]
                         m_Script_FileID = parse_dict["m_Script"]["m_FileID"]
                         m_Script_PathID = parse_dict["m_Script"]["m_PathID"]
+                        has_source_font_ref = isinstance(parse_dict.get("m_SourceFontFile"), dict)
+                        if has_source_font_ref:
+                            m_SourceFontFile_FileID = int(parse_dict["m_SourceFontFile"].get("m_FileID", 0) or 0)
+                            m_SourceFontFile_PathID = int(parse_dict["m_SourceFontFile"].get("m_PathID", 0) or 0)
+                        else:
+                            m_SourceFontFile_FileID = 0
+                            m_SourceFontFile_PathID = 0
 
                         if parse_dict.get("m_Material") is not None:
                             m_Material_FileID = parse_dict["m_Material"]["m_FileID"]
@@ -2664,95 +2954,43 @@ def replace_fonts_in_file(
                             m_Material_FileID = parse_dict["material"]["m_FileID"]
                             m_Material_PathID = parse_dict["material"]["m_PathID"]
 
-                        if is_old_tmp:
-                            # KR: 대상이 구형 TMP면 교체 데이터도 구형 필드로 역변환해 적용합니다.
-                            # EN: For old TMP targets, convert replacement data back to old schema before patching.
-                            atlas_ref = parse_dict["atlas"]
-                            m_AtlasTextures_FileID = atlas_ref["m_FileID"]
-                            m_AtlasTextures_PathID = atlas_ref["m_PathID"]
-                            game_font_info = parse_dict.get("m_fontInfo", {})
-                            try:
-                                game_padding_for_material = float(
-                                    game_font_info.get(
-                                        "Padding",
-                                        parse_dict.get("m_CreationSettings", {}).get("padding", 0),
-                                    )
-                                )
-                            except Exception:
-                                game_padding_for_material = 0.0
+                        target_new_atlas_ref = (
+                            _first_valid_atlas_ref(parse_dict.get("m_AtlasTextures"))
+                            or _first_atlas_ref(parse_dict.get("m_AtlasTextures"))
+                        )
+                        target_old_atlas_ref = (
+                            cast(JsonDict, parse_dict.get("atlas")) if isinstance(parse_dict.get("atlas"), dict) else None
+                        )
+                        target_has_new_face = isinstance(parse_dict.get("m_FaceInfo"), dict)
+                        target_has_new_glyphs = isinstance(parse_dict.get("m_GlyphTable"), list)
+                        target_has_new_chars = isinstance(parse_dict.get("m_CharacterTable"), list)
+                        target_has_old_face = isinstance(parse_dict.get("m_fontInfo"), dict)
+                        target_has_old_glyphs = isinstance(parse_dict.get("m_glyphInfoList"), list)
+                        target_creation_settings_key = _resolve_creation_settings_key(
+                            parse_dict,
+                            unity_version=unity_version_hint or None,
+                        )
+                        target_creation_settings = (
+                            cast(JsonDict, parse_dict.get(target_creation_settings_key))
+                            if target_creation_settings_key and isinstance(parse_dict.get(target_creation_settings_key), dict)
+                            else None
+                        )
 
-                            old_font_info = convert_face_info_new_to_old(
-                                replace_data["m_FaceInfo"],
-                                replace_data.get("m_AtlasPadding", 0),
-                                replace_data.get("m_AtlasWidth", 0),
-                                replace_data.get("m_AtlasHeight", 0)
-                            )
-                            if isinstance(game_font_info, dict):
-                                if use_game_line_metrics:
-                                    metric_scale = 1.0
-                                else:
-                                    metric_scale = _safe_metric_scale(
-                                        game_font_info.get("PointSize", 0),
-                                        old_font_info.get("PointSize", 0),
-                                    )
-                                for metric_key in old_line_metric_keys:
-                                    if metric_key in game_font_info:
-                                        metric_value = game_font_info[metric_key]
-                                        if metric_key in old_line_metric_scale_keys and metric_scale != 1.0:
-                                            try:
-                                                metric_value = float(metric_value) * metric_scale
-                                            except Exception:
-                                                pass
-                                        old_font_info[metric_key] = metric_value
-                            replacement_atlas = assets.get("sdf_atlas")
-                            atlas_height = int(
-                                replace_data.get(
-                                    "m_AtlasHeight",
-                                    replacement_atlas.height if replacement_atlas is not None else 0,
-                                )
-                            )
-                            flip_new_glyph_y = detect_new_glyph_y_flip(
-                                replace_data.get("m_GlyphTable", []),
-                                replace_data.get("m_CharacterTable", []),
-                                replacement_atlas if isinstance(replacement_atlas, Image.Image) else None,
-                            )
-                            if flip_new_glyph_y:
-                                if lang == "ko":
-                                    print("  구형 TMP 좌표계 보정(Y-flip) 적용")
-                                else:
-                                    print("  Applying old TMP coordinate fix (Y-flip)")
-                            old_glyph_list = convert_glyphs_new_to_old(
-                                replace_data.get("m_GlyphTable", []),
-                                replace_data.get("m_CharacterTable", []),
-                                atlas_height=atlas_height,
-                                flip_y=flip_new_glyph_y,
-                            )
-                            old_font_info["CharacterCount"] = len(old_glyph_list)
-                            parse_dict["m_fontInfo"] = old_font_info
-                            parse_dict["m_glyphInfoList"] = old_glyph_list
-
-                            if "m_CreationSettings" in parse_dict:
-                                cs = parse_dict["m_CreationSettings"]
-                                cs["atlasWidth"] = int(replace_data.get("m_AtlasWidth", cs.get("atlasWidth", 0)))
-                                cs["atlasHeight"] = int(replace_data.get("m_AtlasHeight", cs.get("atlasHeight", 0)))
-                                cs["pointSize"] = int(old_font_info["PointSize"])
-                                if not use_game_line_metrics:
-                                    cs["padding"] = int(old_font_info["Padding"])
-                                cs["characterSequence"] = ""
-
+                        if target_new_atlas_ref is not None:
+                            m_AtlasTextures_FileID, m_AtlasTextures_PathID = _atlas_ref_ids(target_new_atlas_ref)
+                        elif target_old_atlas_ref is not None:
+                            m_AtlasTextures_FileID, m_AtlasTextures_PathID = _atlas_ref_ids(target_old_atlas_ref)
                         else:
-                            # KR: 대상이 신형 TMP면 정규화된 신형 필드를 그대로 적용합니다.
-                            # EN: For new TMP targets, apply normalized new-schema fields directly.
-                            m_SourceFontFile_FileID = parse_dict["m_SourceFontFile"]["m_FileID"]
-                            m_SourceFontFile_PathID = parse_dict["m_SourceFontFile"]["m_PathID"]
-                            m_AtlasTextures_FileID = parse_dict["m_AtlasTextures"][0]["m_FileID"]
-                            m_AtlasTextures_PathID = parse_dict["m_AtlasTextures"][0]["m_PathID"]
+                            m_AtlasTextures_FileID = int(atlas_file_id)
+                            m_AtlasTextures_PathID = int(atlas_path_id)
+
+                        if target_has_new_face:
                             game_face_info = parse_dict.get("m_FaceInfo", {})
                             try:
                                 game_padding_for_material = float(
                                     parse_dict.get(
                                         "m_AtlasPadding",
-                                        parse_dict.get("m_CreationSettings", {}).get("padding", 0),
+                                        target_creation_settings.get("padding", 0) if isinstance(target_creation_settings, dict) else 0,
                                     )
                                 )
                             except Exception:
@@ -2778,57 +3016,144 @@ def replace_fonts_in_file(
                                         target_face_info[metric_key] = metric_value
                             ensure_int(target_face_info, ["m_PointSize", "m_AtlasWidth", "m_AtlasHeight"])
                             parse_dict["m_FaceInfo"] = target_face_info
-                            parse_dict["m_GlyphTable"] = replace_data["m_GlyphTable"]
-                            parse_dict["m_CharacterTable"] = replace_data["m_CharacterTable"]
-                            atlas_textures = replace_data.get("m_AtlasTextures", [])
-                            if isinstance(atlas_textures, list):
-                                parse_dict["m_AtlasTextures"] = [
-                                    {
-                                        "m_FileID": int(tex.get("m_FileID", 0) or 0),
-                                        "m_PathID": int(tex.get("m_PathID", 0) or 0),
-                                    }
-                                    for tex in atlas_textures
-                                    if isinstance(tex, dict)
-                                ]
-                            else:
-                                parse_dict["m_AtlasTextures"] = []
-                            if not parse_dict["m_AtlasTextures"]:
-                                parse_dict["m_AtlasTextures"] = [{"m_FileID": 0, "m_PathID": 0}]
-                            parse_dict["m_AtlasWidth"] = replace_data["m_AtlasWidth"]
-                            parse_dict["m_AtlasHeight"] = replace_data["m_AtlasHeight"]
-                            parse_dict["m_AtlasPadding"] = replace_data["m_AtlasPadding"]
-                            parse_dict["m_AtlasRenderMode"] = replace_data.get("m_AtlasRenderMode", 4118)
-                            parse_dict["m_UsedGlyphRects"] = replace_data.get("m_UsedGlyphRects", [])
-                            parse_dict["m_FreeGlyphRects"] = replace_data.get("m_FreeGlyphRects", [])
-                            parse_dict["m_FontWeightTable"] = replace_data.get("m_FontWeightTable", [])
 
-                            if "m_CreationSettings" in parse_dict:
-                                ensure_int(parse_dict["m_CreationSettings"], ["pointSize", "atlasWidth", "atlasHeight", "padding"])
+                        replacement_glyph_table = (
+                            replace_data.get("m_GlyphTable", [])
+                            if isinstance(replace_data.get("m_GlyphTable", []), list)
+                            else []
+                        )
+                        replacement_character_table = (
+                            replace_data.get("m_CharacterTable", [])
+                            if isinstance(replace_data.get("m_CharacterTable", []), list)
+                            else []
+                        )
 
-                            # KR: 신형 TMP를 쓰더라도 legacy m_fontInfo가 남아 있으면 동기화해 런타임 차이를 줄입니다.
-                            # EN: Keep legacy m_fontInfo in sync when present to reduce runtime schema differences.
-                            if "m_fontInfo" in parse_dict and isinstance(parse_dict["m_fontInfo"], dict):
-                                parse_dict["m_fontInfo"] = convert_face_info_new_to_old(
-                                    parse_dict["m_FaceInfo"],
-                                    int(parse_dict.get("m_AtlasPadding", 0)),
-                                    int(parse_dict.get("m_AtlasWidth", 0)),
-                                    int(parse_dict.get("m_AtlasHeight", 0)),
+                        if target_has_new_glyphs:
+                            parse_dict["m_GlyphTable"] = replacement_glyph_table
+                        if target_has_new_chars:
+                            parse_dict["m_CharacterTable"] = replacement_character_table
+
+                        if replacement_glyph_table:
+                            replacement_glyph_indexes = [
+                                int(g.get("m_Index", 0) or 0)
+                                for g in replacement_glyph_table
+                                if isinstance(g, dict)
+                            ]
+                            for glyph_index_key in _TMP_GLYPH_INDEX_LIST_KEYS:
+                                if glyph_index_key in parse_dict:
+                                    parse_dict[glyph_index_key] = list(replacement_glyph_indexes)
+
+                        if "m_AtlasWidth" in parse_dict:
+                            parse_dict["m_AtlasWidth"] = int(replace_data.get("m_AtlasWidth", parse_dict.get("m_AtlasWidth", 0)) or 0)
+                        if "m_AtlasHeight" in parse_dict:
+                            parse_dict["m_AtlasHeight"] = int(replace_data.get("m_AtlasHeight", parse_dict.get("m_AtlasHeight", 0)) or 0)
+                        if "m_AtlasPadding" in parse_dict:
+                            parse_dict["m_AtlasPadding"] = int(replace_data.get("m_AtlasPadding", parse_dict.get("m_AtlasPadding", 0)) or 0)
+                        if "m_AtlasRenderMode" in parse_dict:
+                            parse_dict["m_AtlasRenderMode"] = replace_data.get("m_AtlasRenderMode", parse_dict.get("m_AtlasRenderMode", 4118))
+                        if "m_UsedGlyphRects" in parse_dict:
+                            parse_dict["m_UsedGlyphRects"] = replace_data.get("m_UsedGlyphRects", parse_dict.get("m_UsedGlyphRects", []))
+                        if "m_FreeGlyphRects" in parse_dict:
+                            parse_dict["m_FreeGlyphRects"] = replace_data.get("m_FreeGlyphRects", parse_dict.get("m_FreeGlyphRects", []))
+                        if "m_FontWeightTable" in parse_dict:
+                            parse_dict["m_FontWeightTable"] = replace_data.get("m_FontWeightTable", parse_dict.get("m_FontWeightTable", []))
+
+                        if target_has_old_face or target_has_old_glyphs:
+                            game_font_info = parse_dict.get("m_fontInfo", {})
+                            if game_padding_for_material <= 0:
+                                try:
+                                    game_padding_for_material = float(
+                                        game_font_info.get(
+                                            "Padding",
+                                            target_creation_settings.get("padding", 0) if isinstance(target_creation_settings, dict) else 0,
+                                        )
+                                    )
+                                except Exception:
+                                    game_padding_for_material = 0.0
+
+                            old_font_info = convert_face_info_new_to_old(
+                                replace_data["m_FaceInfo"],
+                                replace_data.get("m_AtlasPadding", 0),
+                                replace_data.get("m_AtlasWidth", 0),
+                                replace_data.get("m_AtlasHeight", 0),
+                            )
+                            if isinstance(game_font_info, dict):
+                                if use_game_line_metrics:
+                                    metric_scale = 1.0
+                                else:
+                                    metric_scale = _safe_metric_scale(
+                                        game_font_info.get("PointSize", 0),
+                                        old_font_info.get("PointSize", 0),
+                                    )
+                                for metric_key in old_line_metric_keys:
+                                    if metric_key in game_font_info:
+                                        metric_value = game_font_info[metric_key]
+                                        if metric_key in old_line_metric_scale_keys and metric_scale != 1.0:
+                                            try:
+                                                metric_value = float(metric_value) * metric_scale
+                                            except Exception:
+                                                pass
+                                        old_font_info[metric_key] = metric_value
+
+                            replacement_atlas = assets.get("sdf_atlas")
+                            atlas_height = int(
+                                replace_data.get(
+                                    "m_AtlasHeight",
+                                    replacement_atlas.height if replacement_atlas is not None else 0,
+                                )
+                            )
+                            old_glyph_list = convert_glyphs_new_to_old(
+                                replacement_glyph_table,
+                                replacement_character_table,
+                                atlas_height=atlas_height,
+                            )
+                            old_font_info["CharacterCount"] = len(old_glyph_list)
+                            if target_has_old_face:
+                                parse_dict["m_fontInfo"] = old_font_info
+                            if target_has_old_glyphs:
+                                parse_dict["m_glyphInfoList"] = old_glyph_list
+
+                        if isinstance(target_creation_settings, dict):
+                            atlas_width_for_cs = int(parse_dict.get("m_AtlasWidth", replace_data.get("m_AtlasWidth", 0)) or 0)
+                            atlas_height_for_cs = int(parse_dict.get("m_AtlasHeight", replace_data.get("m_AtlasHeight", 0)) or 0)
+                            padding_for_cs = int(parse_dict.get("m_AtlasPadding", replace_data.get("m_AtlasPadding", 0)) or 0)
+                            if target_has_old_face and not use_game_line_metrics:
+                                try:
+                                    padding_for_cs = int(parse_dict.get("m_fontInfo", {}).get("Padding", padding_for_cs) or padding_for_cs)
+                                except Exception:
+                                    pass
+
+                            point_size_for_cs = int(replace_data.get("m_FaceInfo", {}).get("m_PointSize", 0) or 0)
+                            if target_has_new_face:
+                                point_size_for_cs = int(
+                                    parse_dict.get("m_FaceInfo", {}).get("m_PointSize", point_size_for_cs) or point_size_for_cs
+                                )
+                            elif target_has_old_face:
+                                point_size_for_cs = int(
+                                    parse_dict.get("m_fontInfo", {}).get("PointSize", point_size_for_cs) or point_size_for_cs
                                 )
 
-                            parse_dict["m_SourceFontFile"]["m_FileID"] = m_SourceFontFile_FileID
-                            parse_dict["m_SourceFontFile"]["m_PathID"] = m_SourceFontFile_PathID
-                            parse_dict["m_AtlasTextures"][0]["m_FileID"] = m_AtlasTextures_FileID
-                            parse_dict["m_AtlasTextures"][0]["m_PathID"] = m_AtlasTextures_PathID
-                            if "m_CreationSettings" in parse_dict:
-                                # KR: creation settings를 현재 atlas/face 값에 맞춰 동기화합니다.
-                                # EN: Align creation settings with the current atlas/face values.
-                                parse_dict["m_CreationSettings"]["atlasWidth"] = int(parse_dict.get("m_AtlasWidth", 0))
-                                parse_dict["m_CreationSettings"]["atlasHeight"] = int(parse_dict.get("m_AtlasHeight", 0))
-                                parse_dict["m_CreationSettings"]["padding"] = int(parse_dict.get("m_AtlasPadding", 0))
-                                parse_dict["m_CreationSettings"]["pointSize"] = int(
-                                    parse_dict["m_FaceInfo"].get("m_PointSize", parse_dict["m_CreationSettings"].get("pointSize", 0))
-                                )
-                                parse_dict["m_CreationSettings"]["characterSequence"] = ""
+                            _sync_creation_settings_payload(
+                                target_creation_settings,
+                                atlas_width=atlas_width_for_cs,
+                                atlas_height=atlas_height_for_cs,
+                                padding=padding_for_cs,
+                                point_size=point_size_for_cs,
+                            )
+
+                        # KR: 신형/구형 필드가 공존하면 신형 face 기준으로 legacy face도 동기화합니다.
+                        # EN: If both schemas exist, keep legacy face in sync from new face.
+                        if target_has_new_face and target_has_old_face:
+                            parse_dict["m_fontInfo"] = convert_face_info_new_to_old(
+                                parse_dict["m_FaceInfo"],
+                                int(parse_dict.get("m_AtlasPadding", replace_data.get("m_AtlasPadding", 0)) or 0),
+                                int(parse_dict.get("m_AtlasWidth", replace_data.get("m_AtlasWidth", 0)) or 0),
+                                int(parse_dict.get("m_AtlasHeight", replace_data.get("m_AtlasHeight", 0)) or 0),
+                            )
+
+                        for dirty_key in _TMP_DIRTY_FLAG_KEYS:
+                            if dirty_key in parse_dict:
+                                parse_dict[dirty_key] = True
 
                         # KR: 포맷 분기 후 공통 참조를 원래 값으로 되돌립니다.
                         # EN: Restore shared references to original values after schema-specific patching.
@@ -2844,13 +3169,26 @@ def replace_fonts_in_file(
                             parse_dict["material"]["m_FileID"] = m_Material_FileID
                             parse_dict["material"]["m_PathID"] = m_Material_PathID
 
-                        if is_old_tmp:
+                        if has_source_font_ref and isinstance(parse_dict.get("m_SourceFontFile"), dict):
+                            parse_dict["m_SourceFontFile"]["m_FileID"] = m_SourceFontFile_FileID
+                            parse_dict["m_SourceFontFile"]["m_PathID"] = m_SourceFontFile_PathID
+
+                        current_new_atlas_ref = (
+                            _first_valid_atlas_ref(parse_dict.get("m_AtlasTextures"))
+                            or _first_atlas_ref(parse_dict.get("m_AtlasTextures"))
+                        )
+                        if current_new_atlas_ref is not None:
+                            current_new_atlas_ref["m_FileID"] = m_AtlasTextures_FileID
+                            current_new_atlas_ref["m_PathID"] = m_AtlasTextures_PathID
+                        if isinstance(parse_dict.get("atlas"), dict):
                             parse_dict["atlas"]["m_FileID"] = m_AtlasTextures_FileID
                             parse_dict["atlas"]["m_PathID"] = m_AtlasTextures_PathID
 
                         desired_swizzle_state = source_swizzled
                         if ps5_swizzle:
                             target_swizzle_verdict, target_swizzle_source = _detect_target_texture_swizzle(
+                                texture_object_lookup,
+                                texture_swizzle_state_cache,
                                 assets_name,
                                 int(m_AtlasTextures_PathID),
                             )
@@ -2896,6 +3234,8 @@ def replace_fonts_in_file(
                             else:
                                 print("  process_swizzle=True: converting replacement atlas to swizzled state.")
 
+                        atlas_metadata_width = int(source_atlas.width)
+                        atlas_metadata_height = int(source_atlas.height)
                         atlas_for_write = source_atlas
                         if desired_swizzle_state != source_swizzled:
                             try:
@@ -2910,9 +3250,9 @@ def replace_fonts_in_file(
                                 else:
                                     print(f"  Warning: PS5 swizzle transform failed; using original atlas. ({swizzle_error})")
 
-                        if preview and ps5_swizzle:
+                        if preview_export:
                             preview_image = atlas_for_write
-                            if desired_swizzle_state:
+                            if ps5_swizzle and desired_swizzle_state:
                                 try:
                                     preview_image = apply_ps5_unswizzle_to_image(atlas_for_write)
                                 except Exception as preview_unswizzle_error:
@@ -2929,21 +3269,34 @@ def replace_fonts_in_file(
                                         )
                             _save_swizzle_preview(
                                 preview_image,
-                                assets_name,
-                                int(m_AtlasTextures_PathID),
-                                str(objname),
-                                bool(desired_swizzle_state),
+                                preview_enabled=preview_export,
+                                preview_root=preview_root,
+                                assets_file_name=fn_without_path,
+                                assets_name=assets_name,
+                                atlas_path_id=int(m_AtlasTextures_PathID),
+                                font_name=str(objname),
+                                target_swizzled=bool(desired_swizzle_state),
+                                lang=lang,
                             )
                             if isinstance(replace_data, dict):
                                 _save_glyph_crop_previews(
                                     preview_image,
-                                    assets_name,
-                                    int(m_AtlasTextures_PathID),
-                                    str(objname),
-                                    replace_data,
+                                    preview_enabled=preview_export,
+                                    preview_root=preview_root,
+                                    assets_file_name=fn_without_path,
+                                    assets_name=assets_name,
+                                    atlas_path_id=int(m_AtlasTextures_PathID),
+                                    font_name=str(objname),
+                                    sdf_data=replace_data,
+                                    lang=lang,
                                 )
 
-                        texture_replacements[f"{assets_name}|{m_AtlasTextures_PathID}"] = atlas_for_write
+                        texture_key = f"{assets_name}|{m_AtlasTextures_PathID}"
+                        texture_replacements[texture_key] = atlas_for_write
+                        texture_replacement_metadata_size[texture_key] = (
+                            atlas_metadata_width,
+                            atlas_metadata_height,
+                        )
                         if m_Material_FileID == 0 and m_Material_PathID != 0:
                             gradient_scale = None
                             apply_replacement_material = not use_game_mat
@@ -3013,8 +3366,8 @@ def replace_fonts_in_file(
                                         f"(x{material_padding_ratio:.3f})"
                                     )
                             material_replacements[f"{assets_name}|{m_Material_PathID}"] = {
-                                "w": atlas_for_write.width,
-                                "h": atlas_for_write.height,
+                                "w": atlas_metadata_width,
+                                "h": atlas_metadata_height,
                                 "gs": gradient_scale,
                                 "float_overrides": float_overrides,
                             }
@@ -3041,13 +3394,15 @@ def replace_fonts_in_file(
     for obj in env.objects:
         assets_name = obj.assets_file.name
         if obj.type.name == "Texture2D":
-            if f"{assets_name}|{obj.path_id}" in texture_replacements:
+            replacement_key = f"{assets_name}|{obj.path_id}"
+            if replacement_key in texture_replacements:
                 parse_dict = obj.parse_as_object()
                 if lang == "ko":
                     print(f"텍스처 교체: {obj.peek_name()} (PathID: {obj.path_id})")
                 else:
                     print(f"Texture replaced: {obj.peek_name()} (PathID: {obj.path_id})")
-                replacement_image = texture_replacements[f"{assets_name}|{obj.path_id}"]
+                replacement_image = texture_replacements[replacement_key]
+                metadata_w, metadata_h = texture_replacement_metadata_size.get(replacement_key, (0, 0))
                 applied_raw_alpha8 = False
                 try:
                     texture_format = int(getattr(parse_dict, "m_TextureFormat", -1) or -1)
@@ -3056,8 +3411,8 @@ def replace_fonts_in_file(
                 if ps5_swizzle and texture_format == 1 and isinstance(replacement_image, Image.Image):
                     try:
                         alpha_raw, aw, ah = _image_to_alpha8_bytes(replacement_image)
-                        parse_dict.m_Width = int(aw)
-                        parse_dict.m_Height = int(ah)
+                        parse_dict.m_Width = int(metadata_w if metadata_w > 0 else aw)
+                        parse_dict.m_Height = int(metadata_h if metadata_h > 0 else ah)
                         if hasattr(parse_dict, "m_CompleteImageSize"):
                             parse_dict.m_CompleteImageSize = int(len(alpha_raw))
                         parse_dict.image_data = alpha_raw
@@ -3158,7 +3513,7 @@ def replace_fonts_in_file(
             signature = source_bundle_signature or getattr(env_file, "signature", None)
             if signature not in bundle_signatures:
                 return True, None
-            saved_signature = _read_bundle_signature(saved_path)
+            saved_signature = _read_bundle_signature(saved_path, bundle_signatures)
             if saved_signature != signature:
                 reason = (
                     f"번들 시그니처 불일치 (기대: {signature}, 결과: {saved_signature or 'None'})"
@@ -3346,7 +3701,7 @@ def replace_fonts_in_file(
                             print("  Retrying with lz4 packer...")
                         _try_save("lz4", "3")
 
-        _close_env(env)
+        close_unitypy_env(env)
         gc.collect()
 
         if save_success:
@@ -3468,6 +3823,43 @@ def create_batch_replacements(
     return replacements
 
 
+def create_preview_export_targets(
+    game_path: str,
+    target_files: set[str] | None = None,
+    scan_jobs: int = 1,
+    lang: Language = "ko",
+    ps5_swizzle: bool = False,
+) -> dict[str, JsonDict]:
+    """KR: preview-export 전용 SDF 대상 매핑(Replace_to 비어 있음)을 생성합니다.
+    KR: scan_jobs/target_files 조건을 그대로 반영합니다.
+    EN: Build preview-export-only SDF mapping (Replace_to left empty).
+    EN: scan_jobs/target_files are applied as-is.
+    """
+    fonts = scan_fonts(
+        game_path,
+        lang=lang,
+        target_files=target_files,
+        scan_jobs=scan_jobs,
+        ps5_swizzle=ps5_swizzle,
+    )
+    targets: dict[str, JsonDict] = {}
+    for font in fonts["sdf"]:
+        key = f"{font['file']}|PREVIEW|{font['path_id']}"
+        entry: JsonDict = {
+            "File": font["file"],
+            "assets_name": font["assets_name"],
+            "Path_ID": font["path_id"],
+            "Type": "SDF",
+            "Name": font["name"],
+            "Replace_to": "",
+        }
+        if ps5_swizzle:
+            entry["swizzle"] = "True" if parse_bool_flag(font.get("swizzle")) else "False"
+            entry["process_swizzle"] = "True" if parse_bool_flag(font.get("process_swizzle")) else "False"
+        targets[key] = entry
+    return targets
+
+
 def exit_with_error(message: str, lang: Language = "ko") -> NoReturn:
     """KR: 로컬라이즈된 오류 메시지를 출력하고 종료합니다.
     EN: Print localized error message and terminate the process.
@@ -3581,6 +3973,7 @@ def main_cli(lang: Language = "ko") -> None:
         epilog = """
 예시:
   %(prog)s --gamepath "D:\\Games\\Muck" --parse
+  %(prog)s --gamepath "D:\\Games\\Muck" --preview-export
   %(prog)s --gamepath "D:\\Games\\Muck" --mulmaru
   %(prog)s --gamepath "D:\\Games\\Muck" --nanumgothic --sdfonly
   %(prog)s --gamepath "D:\\Games\\Muck" --list Muck.json
@@ -3598,7 +3991,7 @@ def main_cli(lang: Language = "ko") -> None:
         original_compress_help = "저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선)"
         temp_dir_help = "임시 저장 폴더 루트 경로 (가능하면 빠른 SSD/NVMe 권장)"
         output_only_help = "원본 파일은 유지하고, 수정된 파일만 지정 폴더에 원본 상대 경로로 저장"
-        preview_help = "--ps5-swizzle와 함께 사용 시 unswizzle 미리보기 PNG를 preview 폴더에 저장"
+        preview_help = "모든 SDF 폰트 Atlas/Glyph crop 미리보기를 preview 폴더에 저장 (--ps5-swizzle와 함께면 unswizzle 기준)"
         scan_jobs_help = "폰트 스캔 병렬 워커 수 (기본: 1, parse/일괄교체 스캔에 적용)"
         split_save_force_help = "대형 SDF 다건 교체에서 one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장"
         oneshot_save_force_help = "대형 SDF 다건 교체에서도 분할 저장 폴백 없이 one-shot 저장만 시도"
@@ -3609,6 +4002,7 @@ def main_cli(lang: Language = "ko") -> None:
         epilog = """
 Examples:
   %(prog)s --gamepath "D:\\Games\\Muck" --parse
+  %(prog)s --gamepath "D:\\Games\\Muck" --preview-export
   %(prog)s --gamepath "D:\\Games\\Muck" --mulmaru
   %(prog)s --gamepath "D:\\Games\\Muck" --nanumgothic --sdfonly
   %(prog)s --gamepath "D:\\Games\\Muck" --list Muck.json
@@ -3626,7 +4020,7 @@ Examples:
         original_compress_help = "Prefer original compression mode on save (default: uncompressed-family first)"
         temp_dir_help = "Root path for temporary save files (fast SSD/NVMe recommended)"
         output_only_help = "Keep originals untouched and write modified files only to this folder (preserve relative paths)"
-        preview_help = "With --ps5-swizzle, save unswizzled preview PNGs into preview folder"
+        preview_help = "Export preview PNGs (Atlas + glyph crops) for all SDF fonts into preview folder (unswizzled when used with --ps5-swizzle)"
         scan_jobs_help = "Number of parallel scan workers (default: 1, used for parse/bulk scan paths)"
         split_save_force_help = "Skip one-shot and force one-by-one SDF split save for large multi-SDF replacements"
         oneshot_save_force_help = "Force one-shot save even for large multi-SDF targets (disable split-save fallback)"
@@ -3654,7 +4048,8 @@ Examples:
     parser.add_argument("--original-compress", action="store_true", help=original_compress_help)
     parser.add_argument("--temp-dir", type=str, metavar="PATH", help=temp_dir_help)
     parser.add_argument("--output-only", type=str, metavar="PATH", help=output_only_help)
-    parser.add_argument("--preview", action="store_true", help=preview_help)
+    parser.add_argument("--preview-export", action="store_true", help=preview_help)
+    parser.add_argument("--preview", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--scan-jobs", type=int, default=1, metavar="N", help=scan_jobs_help)
     parser.add_argument("--split-save-force", action="store_true", help=split_save_force_help)
     parser.add_argument("--oneshot-save-force", action="store_true", help=oneshot_save_force_help)
@@ -3680,6 +4075,9 @@ Examples:
     args.use_game_line_metrics = bool(
         getattr(args, "use_game_line_metrics", False) or getattr(args, "use_game_line_matrics", False)
     )
+    # KR: 레거시 옵션(--preview)도 새 옵션(--preview-export)으로 병합합니다.
+    # EN: Merge legacy --preview into the canonical --preview-export flag.
+    args.preview_export = bool(getattr(args, "preview_export", False) or getattr(args, "preview", False))
     selected_files = parse_target_files_arg(getattr(args, "target_file", None))
     if args.target_file and not selected_files:
         if is_ko:
@@ -3756,7 +4154,7 @@ Examples:
             print(f"Output-only mode: writing modified files to '{output_only_root}'.")
 
     preview_root: str | None = None
-    if args.preview:
+    if args.preview_export:
         preview_root = os.path.join(get_script_dir(), "preview")
         try:
             os.makedirs(preview_root, exist_ok=True)
@@ -3769,11 +4167,11 @@ Examples:
             print(f"Preview 모드: '{preview_root}'에 미리보기를 저장합니다.")
         else:
             print(f"Preview mode: saving previews to '{preview_root}'.")
-        if not args.ps5_swizzle:
+        if args.ps5_swizzle:
             if is_ko:
-                print("  안내: --preview는 --ps5-swizzle와 함께 사용할 때 unswizzle 미리보기를 출력합니다.")
+                print("  PS5 swizzle 활성화: preview를 unswizzle 기준으로 저장합니다.")
             else:
-                print("  Note: --preview outputs unswizzled previews when used with --ps5-swizzle.")
+                print("  PS5 swizzle enabled: saving previews in unswizzled view.")
 
     if args.use_game_line_metrics:
         if is_ko:
@@ -3922,6 +4320,8 @@ Examples:
         mode = "nanumgothic"
     elif args.list:
         mode = "list"
+    elif args.preview_export:
+        mode = "preview_export"
     else:
         interactive_session = True
         if is_ko:
@@ -4052,7 +4452,31 @@ Examples:
             input("\nPress Enter to exit...")
         return
 
-    if mode == "mulmaru":
+    if mode == "preview_export":
+        if is_ko:
+            print("Preview export 모드: 모든 SDF 폰트 Atlas/Glyph crop 미리보기를 추출합니다...")
+        else:
+            print("Preview export mode: exporting Atlas/Glyph crop previews for all SDF fonts...")
+        replacements = create_preview_export_targets(
+            game_path,
+            target_files=selected_files if selected_files else None,
+            scan_jobs=args.scan_jobs,
+            lang=lang,
+            ps5_swizzle=args.ps5_swizzle,
+        )
+        if not replacements:
+            if is_ko:
+                print("Preview 대상 SDF 폰트를 찾지 못했습니다.")
+                input("\n엔터를 눌러 종료...")
+            else:
+                print("No SDF fonts found for preview export.")
+                input("\nPress Enter to exit...")
+            return
+        if is_ko:
+            print(f"Preview 대상 SDF 폰트: {len(replacements)}개")
+        else:
+            print(f"Preview target SDF fonts: {len(replacements)}")
+    elif mode == "mulmaru":
         if is_ko:
             print("Mulmaru 폰트로 일괄 교체합니다...")
         else:
@@ -4155,7 +4579,7 @@ Examples:
     generator = _create_generator(unity_version, game_path, data_path, compile_method, lang=lang)
     replacement_lookup, files_to_process = build_replacement_lookup(replacements)
     preview_files_to_process: set[str] = set()
-    if args.preview and args.ps5_swizzle:
+    if args.preview_export:
         preview_files_to_process = {
             os.path.basename(str(value.get("File", "")))
             for value in replacements.values()
@@ -4174,7 +4598,7 @@ Examples:
         fn = os.path.basename(assets_file)
         if fn in process_files:
             working_assets_file = assets_file
-            if output_only_root:
+            if output_only_root and mode != "preview_export":
                 working_assets_file = resolve_output_only_path(assets_file, data_path, output_only_root)
                 working_dir = os.path.dirname(working_assets_file)
                 if working_dir and not os.path.exists(working_dir):
@@ -4249,7 +4673,7 @@ Examples:
                             generator=generator,
                             replacement_lookup=file_lookup,
                             ps5_swizzle=args.ps5_swizzle,
-                            preview=args.preview,
+                            preview_export=args.preview_export,
                             preview_root=preview_root,
                             lang=lang,
                         )
@@ -4290,7 +4714,7 @@ Examples:
                                 generator=generator,
                                 replacement_lookup=file_ttf_lookup,
                                 ps5_swizzle=args.ps5_swizzle,
-                                preview=args.preview,
+                                preview_export=args.preview_export,
                                 preview_root=preview_root,
                                 lang=lang,
                             ):
@@ -4333,7 +4757,7 @@ Examples:
                                         generator=generator,
                                         replacement_lookup=batch_lookup,
                                         ps5_swizzle=args.ps5_swizzle,
-                                        preview=args.preview,
+                                        preview_export=args.preview_export,
                                         preview_root=preview_root,
                                         lang=lang,
                                     )
@@ -4402,7 +4826,7 @@ Examples:
                         generator=generator,
                         replacement_lookup=replacement_lookup,
                         ps5_swizzle=args.ps5_swizzle,
-                        preview=args.preview,
+                        preview_export=args.preview_export,
                         preview_root=preview_root,
                         lang=lang,
                     ):
@@ -4416,12 +4840,20 @@ Examples:
             if file_modified:
                 modified_count += 1
 
-    if is_ko:
-        print(f"\n완료! {modified_count}개의 파일이 수정되었습니다.")
-        input("\n엔터를 눌러 종료...")
+    if mode == "preview_export":
+        if is_ko:
+            print(f"\n완료! preview export 처리 파일: {len(process_files)}개 (원본 수정 없음)")
+            input("\n엔터를 눌러 종료...")
+        else:
+            print(f"\nDone! Preview-export processed {len(process_files)} file(s) (no source modifications).")
+            input("\nPress Enter to exit...")
     else:
-        print(f"\nDone! Modified {modified_count} file(s).")
-        input("\nPress Enter to exit...")
+        if is_ko:
+            print(f"\n완료! {modified_count}개의 파일이 수정되었습니다.")
+            input("\n엔터를 눌러 종료...")
+        else:
+            print(f"\nDone! Modified {modified_count} file(s).")
+            input("\nPress Enter to exit...")
 
 
 def main() -> None:
