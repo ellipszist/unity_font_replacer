@@ -27,27 +27,47 @@ echo [build] Using venv python: %VENV_PY%
 
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
-if exist unity_font_replacer.spec del unity_font_replacer.spec
-if exist export_fonts.spec del export_fonts.spec
+if exist unity_font_replacer_ko.spec del unity_font_replacer_ko.spec
+if exist export_fonts_ko.spec del export_fonts_ko.spec
+if exist unity_font_replacer_en.spec del unity_font_replacer_en.spec
+if exist export_fonts_en.spec del export_fonts_en.spec
 if exist make_sdf.spec del make_sdf.spec
 
-"%VENV_PY%" -m PyInstaller --onefile --name unity_font_replacer ^
+"%VENV_PY%" -m PyInstaller --onefile --name unity_font_replacer_ko ^
   --clean ^
   --noconfirm ^
   --collect-all UnityPy ^
   --collect-all TypeTreeGeneratorAPI ^
   --collect-all fmod_toolkit ^
   --collect-all archspec ^
-  unity_font_replacer.py
+  unity_font_replacer_ko.py
 
-"%VENV_PY%" -m PyInstaller --onefile --name export_fonts ^
+"%VENV_PY%" -m PyInstaller --onefile --name export_fonts_ko ^
   --clean ^
   --noconfirm ^
   --collect-all UnityPy ^
   --collect-all TypeTreeGeneratorAPI ^
   --collect-all fmod_toolkit ^
   --collect-all archspec ^
-  export_fonts.py
+  export_fonts_ko.py
+
+"%VENV_PY%" -m PyInstaller --onefile --name unity_font_replacer_en ^
+  --clean ^
+  --noconfirm ^
+  --collect-all UnityPy ^
+  --collect-all TypeTreeGeneratorAPI ^
+  --collect-all fmod_toolkit ^
+  --collect-all archspec ^
+  unity_font_replacer_en.py
+
+"%VENV_PY%" -m PyInstaller --onefile --name export_fonts_en ^
+  --clean ^
+  --noconfirm ^
+  --collect-all UnityPy ^
+  --collect-all TypeTreeGeneratorAPI ^
+  --collect-all fmod_toolkit ^
+  --collect-all archspec ^
+  export_fonts_en.py
 
 "%VENV_PY%" -m PyInstaller --onefile --name make_sdf ^
   --clean ^
@@ -58,15 +78,28 @@ if exist make_sdf.spec del make_sdf.spec
   make_sdf.py
 
 if exist release rmdir /s /q release
+if exist release_en rmdir /s /q release_en
+if exist release_make_sdf rmdir /s /q release_make_sdf
 mkdir release
-copy dist\unity_font_replacer.exe release\ >nul
-copy dist\export_fonts.exe release\ >nul
-copy dist\make_sdf.exe release\ >nul
+mkdir release_en
+mkdir release_make_sdf
+copy dist\unity_font_replacer_ko.exe release\ >nul
+copy dist\export_fonts_ko.exe release\ >nul
 xcopy KR_ASSETS release\KR_ASSETS\ /E /I >nul
 xcopy Il2CppDumper release\Il2CppDumper\ /E /I >nul
 copy README.md release\ >nul
 if exist CharList_3911.txt copy CharList_3911.txt release\ >nul
+copy dist\unity_font_replacer_en.exe release_en\ >nul
+copy dist\export_fonts_en.exe release_en\ >nul
+xcopy KR_ASSETS release_en\KR_ASSETS\ /E /I >nul
+xcopy Il2CppDumper release_en\Il2CppDumper\ /E /I >nul
+copy README_EN.md release_en\ >nul
+if exist CharList_3911.txt copy CharList_3911.txt release_en\ >nul
+copy dist\make_sdf.exe release_make_sdf\ >nul
+copy README.md release_make_sdf\ >nul
+copy README_EN.md release_make_sdf\ >nul
+if exist CharList_3911.txt copy CharList_3911.txt release_make_sdf\ >nul
 
-echo Build complete. Output in release\ and dist\
+echo Build complete. Output in release\, release_en\, release_make_sdf\, and dist\
 pause
 endlocal

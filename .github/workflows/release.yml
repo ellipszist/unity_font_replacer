@@ -32,19 +32,19 @@ jobs:
 
       - name: Build executables
         run: |
-          pyinstaller --onefile --name unity_font_replacer `
+          pyinstaller --onefile --name unity_font_replacer_ko `
             --collect-all UnityPy `
             --collect-all TypeTreeGeneratorAPI `
             --collect-all fmod_toolkit `
             --collect-all archspec `
-            unity_font_replacer.py
+            unity_font_replacer_ko.py
 
-          pyinstaller --onefile --name export_fonts `
+          pyinstaller --onefile --name export_fonts_ko `
             --collect-all UnityPy `
             --collect-all TypeTreeGeneratorAPI `
             --collect-all fmod_toolkit `
             --collect-all archspec `
-            export_fonts.py
+            export_fonts_ko.py
 
           pyinstaller --onefile --name unity_font_replacer_en `
             --collect-all UnityPy `
@@ -66,15 +66,11 @@ jobs:
             --collect-all fontTools `
             make_sdf.py
 
-          pyinstaller --onefile --name ps5_swizzler `
-            --collect-all numpy `
-            ps5_swizzler.py
-
       - name: Prepare release files
         run: |
           mkdir release
-          copy dist\unity_font_replacer.exe release\
-          copy dist\export_fonts.exe release\
+          copy dist\unity_font_replacer_ko.exe release\
+          copy dist\export_fonts_ko.exe release\
           xcopy KR_ASSETS release\KR_ASSETS\ /E /I
           xcopy Il2CppDumper release\Il2CppDumper\ /E /I
           copy README.md release\
@@ -86,10 +82,6 @@ jobs:
           xcopy Il2CppDumper release_en\Il2CppDumper\ /E /I
           copy README_EN.md release_en\
           if (Test-Path CharList_3911.txt) { copy CharList_3911.txt release_en\ }
-          mkdir release_ps5_swizzler
-          copy dist\ps5_swizzler.exe release_ps5_swizzler\
-          copy README.md release_ps5_swizzler\
-          copy README_EN.md release_ps5_swizzler\
           mkdir release_make_sdf
           copy dist\make_sdf.exe release_make_sdf\
           copy README.md release_make_sdf\
@@ -100,7 +92,6 @@ jobs:
         run: |
           Compress-Archive -Path release\* -DestinationPath Unity_Font_Replacer_v${{ inputs.version }}.zip
           Compress-Archive -Path release_en\* -DestinationPath Unity_Font_Replacer_EN_v${{ inputs.version }}.zip
-          Compress-Archive -Path release_ps5_swizzler\* -DestinationPath ps5_swizzler_v${{ inputs.version }}.zip
           Compress-Archive -Path release_make_sdf\* -DestinationPath make_sdf_v${{ inputs.version }}.zip
 
       - name: Create tag
@@ -119,7 +110,6 @@ jobs:
           files: |
             Unity_Font_Replacer_v${{ inputs.version }}.zip
             Unity_Font_Replacer_EN_v${{ inputs.version }}.zip
-            ps5_swizzler_v${{ inputs.version }}.zip
             make_sdf_v${{ inputs.version }}.zip
           generate_release_notes: true
         env:

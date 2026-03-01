@@ -1,7 +1,10 @@
+"""Core logic for exporting TMP SDF assets from Unity game data."""
+
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sys
@@ -11,11 +14,46 @@ from typing import Any, Literal, NoReturn, cast
 import UnityPy
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 
+logger = logging.getLogger(__name__)
+
 
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
 _TMP_OLD_ONLY_LAST = (2018, 3, 14)
 _TMP_NEW_SCHEMA_FIRST = (2018, 4, 2)
+
+
+def _configure_logging(level: int = logging.INFO) -> None:
+    """Configure console logging for CLI-mode output."""
+    if logging.getLogger().handlers:
+        logging.getLogger().setLevel(level)
+        return
+    logging.basicConfig(level=level, format="%(message)s")
+
+
+def _coerce_log_level(message: str, default_level: int = logging.INFO) -> int:
+    lowered = message.lower()
+    if "경고" in message or "warning" in lowered:
+        return logging.WARNING
+    if (
+        "오류" in message
+        or "error" in lowered
+        or "failed" in lowered
+        or "실패" in message
+    ):
+        return logging.ERROR
+    return default_level
+
+
+def _log_console(
+    *parts: object,
+    sep: str = " ",
+    level: int | None = None,
+) -> None:
+    """Print-compatible logging adapter."""
+    message = sep.join(str(part) for part in parts)
+    resolved_level = _coerce_log_level(message) if level is None else level
+    logger.log(resolved_level, message)
 
 
 def _debug_parse_enabled() -> bool:
@@ -30,7 +68,7 @@ def _debug_parse_log(message: str) -> None:
     EN: Print a debug message only when debug mode is enabled.
     """
     if _debug_parse_enabled():
-        print(message)
+        _log_console(message)
 
 
 def exit_with_error(lang: Language, message: str) -> NoReturn:
@@ -38,10 +76,10 @@ def exit_with_error(lang: Language, message: str) -> NoReturn:
     EN: Print a localized error and terminate the process.
     """
     if lang == "ko":
-        print(f"오류: {message}")
+        _log_console(f"오류: {message}")
         input("\n엔터를 눌러 종료...")
     else:
-        print(f"Error: {message}")
+        _log_console(f"Error: {message}")
         input("\nPress Enter to exit...")
     sys.exit(1)
 
@@ -83,17 +121,29 @@ def resolve_game_path(lang: Language, path: str | None = None) -> tuple[str, str
         ]
         if not data_folders:
             if lang == "ko":
-                exit_with_error(lang, f"'{path}'에서 _Data 폴더를 찾을 수 없습니다.\n게임 루트 폴더 또는 _Data 폴더에서 실행해주세요.")
+                exit_with_error(
+                    lang,
+                    f"'{path}'에서 _Data 폴더를 찾을 수 없습니다.\n게임 루트 폴더 또는 _Data 폴더에서 실행해주세요.",
+                )
             else:
-                exit_with_error(lang, f"Could not find the _Data folder in '{path}'.\nRun this from the game root folder or the _Data folder.")
+                exit_with_error(
+                    lang,
+                    f"Could not find the _Data folder in '{path}'.\nRun this from the game root folder or the _Data folder.",
+                )
         data_path = os.path.join(game_path, data_folders[0])
 
     ggm_path = find_ggm_file(data_path)
     if not ggm_path:
         if lang == "ko":
-            exit_with_error(lang, f"'{data_path}'에서 globalgamemanagers 파일을 찾을 수 없습니다.\n올바른 Unity 게임 폴더인지 확인해주세요.")
+            exit_with_error(
+                lang,
+                f"'{data_path}'에서 globalgamemanagers 파일을 찾을 수 없습니다.\n올바른 Unity 게임 폴더인지 확인해주세요.",
+            )
         else:
-            exit_with_error(lang, f"Could not find the globalgamemanagers file in '{data_path}'.\nPlease check that this is a valid Unity game folder.")
+            exit_with_error(
+                lang,
+                f"Could not find the globalgamemanagers file in '{data_path}'.\nPlease check that this is a valid Unity game folder.",
+            )
 
     return game_path, data_path
 
@@ -183,16 +233,22 @@ def create_generator(
                     generator.load_dll(f.read())
             except Exception as e:  # pragma: no cover
                 if lang == "ko":
-                    print(f"경고: DLL 로드 실패 '{fn}': {e}")
+                    _log_console(f"경고: DLL 로드 실패 '{fn}': {e}")
                 else:
-                    print(f"Warning: failed to load DLL '{fn}': {e}")
+                    _log_console(f"Warning: failed to load DLL '{fn}': {e}")
     else:
         il2cpp_path = os.path.join(game_path, "GameAssembly.dll")
-        metadata_path = os.path.join(data_path, "il2cpp_data", "Metadata", "global-metadata.dat")
+        metadata_path = os.path.join(
+            data_path, "il2cpp_data", "Metadata", "global-metadata.dat"
+        )
         if not os.path.exists(il2cpp_path) or not os.path.exists(metadata_path):
             if lang == "ko":
-                raise RuntimeError("Il2cpp 감지됨. 'GameAssembly.dll'과 'global-metadata.dat'가 필요합니다.")
-            raise RuntimeError("Detected Il2cpp. 'GameAssembly.dll' and 'global-metadata.dat' are required.")
+                raise RuntimeError(
+                    "Il2cpp 감지됨. 'GameAssembly.dll'과 'global-metadata.dat'가 필요합니다."
+                )
+            raise RuntimeError(
+                "Detected Il2cpp. 'GameAssembly.dll' and 'global-metadata.dat' are required."
+            )
         with open(il2cpp_path, "rb") as f:
             il2cpp = f.read()
         with open(metadata_path, "rb") as f:
@@ -274,17 +330,27 @@ def _best_atlas_ref(
 ) -> JsonDict | None:
     new_any = _first_atlas_ref(data.get("m_AtlasTextures"))
     new_valid = _first_valid_atlas_ref(data.get("m_AtlasTextures"))
-    old_any = cast(JsonDict | None, data.get("atlas")) if isinstance(data.get("atlas"), dict) else None
+    old_any = (
+        cast(JsonDict | None, data.get("atlas"))
+        if isinstance(data.get("atlas"), dict)
+        else None
+    )
     old_valid = old_any if _has_real_atlas_path(old_any) else None
 
-    ordered = (new_valid, old_valid, new_any, old_any) if prefer_new else (old_valid, new_valid, old_any, new_any)
+    ordered = (
+        (new_valid, old_valid, new_any, old_any)
+        if prefer_new
+        else (old_valid, new_valid, old_any, new_any)
+    )
     for ref in ordered:
         if isinstance(ref, dict):
             return ref
     return None
 
 
-def detect_tmp_version(data: JsonDict, unity_version: str | None = None) -> Literal["new", "old"]:
+def detect_tmp_version(
+    data: JsonDict, unity_version: str | None = None
+) -> Literal["new", "old"]:
     """KR: TMP 폰트 데이터가 신형/구형 포맷인지 판별합니다.
     EN: Detect whether TMP font data uses new or old schema.
     """
@@ -331,7 +397,11 @@ def inspect_tmp_font_schema(
     has_new_face = isinstance(data.get("m_FaceInfo"), dict)
     has_old_face = isinstance(data.get("m_fontInfo"), dict)
     new_atlas_ref = _first_atlas_ref(data.get("m_AtlasTextures"))
-    old_atlas_ref = cast(JsonDict | None, data.get("atlas")) if isinstance(data.get("atlas"), dict) else None
+    old_atlas_ref = (
+        cast(JsonDict | None, data.get("atlas"))
+        if isinstance(data.get("atlas"), dict)
+        else None
+    )
 
     if target_version == "new":
         glyph_count = new_glyph_count if new_glyph_count > 0 else old_glyph_count
@@ -368,15 +438,21 @@ def is_tmp_font_asset(obj: Any) -> bool:
         if hasattr(parse_obj, "get_type") and parse_obj.get_type() == "TMP_FontAsset":
             return True
     except Exception as e:  # pragma: no cover
-        _debug_parse_log(f"[export_fonts] parse_as_object failed (PathID: {obj.path_id}): {e}")
+        _debug_parse_log(
+            f"[export_fonts] parse_as_object failed (PathID: {obj.path_id}): {e}"
+        )
 
     try:
         parse_dict = obj.parse_as_dict()
     except Exception as e:  # pragma: no cover
-        _debug_parse_log(f"[export_fonts] parse_as_dict failed (PathID: {obj.path_id}): {e}")
+        _debug_parse_log(
+            f"[export_fonts] parse_as_dict failed (PathID: {obj.path_id}): {e}"
+        )
         return False
 
-    unity_version_hint = getattr(getattr(obj, "assets_file", None), "unity_version", None)
+    unity_version_hint = getattr(
+        getattr(obj, "assets_file", None), "unity_version", None
+    )
     info = inspect_tmp_font_schema(
         parse_dict,
         unity_version=str(unity_version_hint) if unity_version_hint else None,
@@ -440,21 +516,23 @@ def export_fonts(
     unity_version = get_unity_version(data_path)
     assets_files = find_assets_files(data_path)
     compile_method = get_compile_method(data_path)
-    generator = create_generator(unity_version, game_path, data_path, compile_method, lang)
+    generator = create_generator(
+        unity_version, game_path, data_path, compile_method, lang
+    )
 
     if lang == "ko":
-        print(f"게임 경로: {game_path}")
-        print(f"데이터 경로: {data_path}")
-        print(f"Unity 버전: {unity_version}")
-        print(f"컴파일 방식: {compile_method}")
-        print(f"출력 폴더: {output_dir}")
+        _log_console(f"게임 경로: {game_path}")
+        _log_console(f"데이터 경로: {data_path}")
+        _log_console(f"Unity 버전: {unity_version}")
+        _log_console(f"컴파일 방식: {compile_method}")
+        _log_console(f"출력 폴더: {output_dir}")
     else:
-        print(f"Game path: {game_path}")
-        print(f"Data path: {data_path}")
-        print(f"Unity version: {unity_version}")
-        print(f"Compile method: {compile_method}")
-        print(f"Output folder: {output_dir}")
-    print()
+        _log_console(f"Game path: {game_path}")
+        _log_console(f"Data path: {data_path}")
+        _log_console(f"Unity version: {unity_version}")
+        _log_console(f"Compile method: {compile_method}")
+        _log_console(f"Output folder: {output_dir}")
+    _log_console()
 
     exported_count = 0
 
@@ -464,9 +542,13 @@ def export_fonts(
             env.typetree_generator = generator
         except Exception as e:  # pragma: no cover
             if lang == "ko":
-                print(f"경고: 파일 로드 실패 '{os.path.basename(assets_file)}': {e}")
+                _log_console(
+                    f"경고: 파일 로드 실패 '{os.path.basename(assets_file)}': {e}"
+                )
             else:
-                print(f"Warning: failed to load '{os.path.basename(assets_file)}': {e}")
+                _log_console(
+                    f"Warning: failed to load '{os.path.basename(assets_file)}': {e}"
+                )
             continue
 
         texture_pointers: dict[int, str] = {}
@@ -485,15 +567,17 @@ def export_fonts(
 
                 objname = obj.peek_name() or f"TMP_FontAsset_{obj.path_id}"
                 if lang == "ko":
-                    print(f"SDF 폰트 발견: {objname} (PathID: {obj.path_id})")
-                    print(f"  Atlas 텍스처 PathID: {refs['atlas_path_id']}")
-                    print(f"  머티리얼 PathID: {refs['material_path_id']}")
+                    _log_console(f"SDF 폰트 발견: {objname} (PathID: {obj.path_id})")
+                    _log_console(f"  Atlas 텍스처 PathID: {refs['atlas_path_id']}")
+                    _log_console(f"  머티리얼 PathID: {refs['material_path_id']}")
                 else:
-                    print(f"SDF font found: {objname} (PathID: {obj.path_id})")
-                    print(f"  Atlas texture PathID: {refs['atlas_path_id']}")
-                    print(f"  Material PathID: {refs['material_path_id']}")
+                    _log_console(f"SDF font found: {objname} (PathID: {obj.path_id})")
+                    _log_console(f"  Atlas texture PathID: {refs['atlas_path_id']}")
+                    _log_console(f"  Material PathID: {refs['material_path_id']}")
 
-                texture_pointers[refs["atlas_path_id"]] = objname.replace(" SDF", " SDF Atlas")
+                texture_pointers[refs["atlas_path_id"]] = objname.replace(
+                    " SDF", " SDF Atlas"
+                )
                 if refs["material_path_id"]:
                     material_pointers.add(refs["material_path_id"])
 
@@ -501,32 +585,40 @@ def export_fonts(
                 with open(json_path, "w", encoding="utf-8") as f:
                     json.dump(parse_dict, indent=4, ensure_ascii=False, fp=f)
                 if lang == "ko":
-                    print(f"  -> {objname}.json 저장됨")
+                    _log_console(f"  -> {objname}.json 저장됨")
                 else:
-                    print(f"  -> {objname}.json saved")
+                    _log_console(f"  -> {objname}.json saved")
                 exported_count += 1
             except Exception as e:  # pragma: no cover
                 if lang == "ko":
-                    print(f"경고: TMP 파싱 실패 (파일: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}")
+                    _log_console(
+                        f"경고: TMP 파싱 실패 (파일: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
+                    )
                 else:
-                    print(f"Warning: TMP parse failed (file: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}")
+                    _log_console(
+                        f"Warning: TMP parse failed (file: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
+                    )
 
         for obj in env.objects:
             try:
                 if obj.type.name == "Texture2D" and obj.path_id in texture_pointers:
                     tex = obj.parse_as_object()
                     image = tex.image
-                    objname = texture_pointers.get(obj.path_id, obj.peek_name() or str(obj.path_id))
+                    objname = texture_pointers.get(
+                        obj.path_id, obj.peek_name() or str(obj.path_id)
+                    )
                     if lang == "ko":
-                        print(f"텍스처 추출: {objname} (PathID: {obj.path_id})")
+                        _log_console(f"텍스처 추출: {objname} (PathID: {obj.path_id})")
                     else:
-                        print(f"Extracting texture: {objname} (PathID: {obj.path_id})")
+                        _log_console(
+                            f"Extracting texture: {objname} (PathID: {obj.path_id})"
+                        )
                     png_path = os.path.join(output_dir, f"{objname}.png")
                     image.save(png_path)
                     if lang == "ko":
-                        print(f"  -> {objname}.png 저장됨")
+                        _log_console(f"  -> {objname}.png 저장됨")
                     else:
-                        print(f"  -> {objname}.png saved")
+                        _log_console(f"  -> {objname}.png saved")
                 elif obj.type.name == "Material" and obj.path_id in material_pointers:
                     mat = obj.parse_as_dict()
                     mat_name = obj.peek_name() or f"Material_{obj.path_id}"
@@ -535,9 +627,13 @@ def export_fonts(
                         json.dump(mat, f, indent=4, ensure_ascii=False)
             except Exception as e:  # pragma: no cover
                 if lang == "ko":
-                    print(f"경고: 추출 중 오류 (파일: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}")
+                    _log_console(
+                        f"경고: 추출 중 오류 (파일: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
+                    )
                 else:
-                    print(f"Warning: export error (file: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}")
+                    _log_console(
+                        f"Warning: export error (file: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
+                    )
 
     return exported_count
 
@@ -546,6 +642,7 @@ def main_cli(lang: Language = "ko") -> None:
     """KR: SDF 폰트 추출 CLI 진입점입니다.
     EN: CLI entry point for SDF font export.
     """
+    _configure_logging()
     parser = argparse.ArgumentParser(
         description=(
             "Unity 게임에서 TMP SDF 폰트를 추출합니다."
@@ -565,10 +662,10 @@ def main_cli(lang: Language = "ko") -> None:
     args = parser.parse_args()
 
     if lang == "ko":
-        print("=== Unity SDF 폰트 추출기 ===")
+        _log_console("=== Unity SDF 폰트 추출기 ===")
     else:
-        print("=== Unity SDF Font Exporter ===")
-    print()
+        _log_console("=== Unity SDF Font Exporter ===")
+    _log_console()
 
     input_path = args.gamepath
     if not input_path:
@@ -593,10 +690,10 @@ def main_cli(lang: Language = "ko") -> None:
     except Exception as e:
         exit_with_error(lang, str(e))
 
-    print()
+    _log_console()
     if lang == "ko":
-        print(f"완료! {exported_count}개의 SDF 폰트가 추출되었습니다.")
+        _log_console(f"완료! {exported_count}개의 SDF 폰트가 추출되었습니다.")
         input("\n엔터를 눌러 종료...")
     else:
-        print(f"Done! Exported {exported_count} SDF font(s).")
+        _log_console(f"Done! Exported {exported_count} SDF font(s).")
         input("\nPress Enter to exit...")

@@ -1,16 +1,16 @@
-"""English launcher for Unity Font Replacer CLI."""
+"""Korean launcher for Unity Font Replacer CLI."""
 
 import logging
 
-from unity_font_replacer_core import run_main_en
+from unity_font_replacer_core import run_main_ko
 
 logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    """Run English CLI entrypoint."""
+    """Run Korean CLI entrypoint."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    run_main_en()
+    run_main_ko()
 
 
 if __name__ == "__main__":

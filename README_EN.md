@@ -17,7 +17,7 @@ release_en/
 └── README_EN.md
 ```
 
-`make_sdf.exe` and `ps5_swizzler.exe` are distributed as standalone ZIPs (`make_sdf_vX.Y.Z.zip`, `ps5_swizzler_vX.Y.Z.zip`).
+`make_sdf.exe` is distributed as a standalone ZIP (`make_sdf_vX.Y.Z.zip`).
 
 Recommended run:
 
@@ -28,12 +28,11 @@ unity_font_replacer_en.exe
 
 | Executable | Description |
 |-----------|------|
-| `unity_font_replacer.exe` | Font replacement tool (Korean UI) |
+| `unity_font_replacer_ko.exe` | Font replacement tool (Korean UI) |
 | `unity_font_replacer_en.exe` | Font replacement tool (English UI) |
-| `export_fonts.exe` | TMP SDF font exporter (Korean UI) |
+| `export_fonts_ko.exe` | TMP SDF font exporter (Korean UI) |
 | `export_fonts_en.exe` | TMP SDF font exporter (English UI) |
 | `make_sdf.exe` | TTF -> TMP SDF JSON/Atlas generator (standalone ZIP) |
-| `ps5_swizzler.exe` | Standalone PS5 swizzle/unswizzle/detect tool (standalone ZIP) |
 
 ---
 
@@ -46,7 +45,7 @@ unity_font_replacer_en.exe
 unity_font_replacer_en.exe
 
 :: Set game path + bulk replace with Mulmaru
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --mulmaru
 ```
 
 ### Command Line Options
@@ -58,7 +57,9 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--gamepath <path>` | Game root path or `_Data` folder path |
 | `--parse` | Export font info to JSON |
 | `--list <JSON>` | Replace fonts from a JSON mapping |
-| `--verbose` | Save full logs to `verbose.txt` |
+| `--verbose` | Keep concise console logs and save detailed DEBUG logs (path/Unity version/per-file/per-font) to `verbose.txt` |
+
+- With `--verbose`, a `verbose.txt` file is created next to the executable (or script) and includes timestamped, level-tagged detailed trace logs.
 
 #### Replacement Targets
 
@@ -75,6 +76,7 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 | Option | Description |
 |------|------|
 | `--use-game-material` | Keep original in-game Material parameters (default: apply replacement Material) |
+| `--force-raster` | Force SDF replacement into Raster behavior (render mode + material effect neutralization) |
 | `--use-game-line-metrics` | Keep in-game line metrics (pointSize still follows replacement font) |
 
 #### Save / Output
@@ -93,7 +95,7 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 |------|------|
 | `--ps5-swizzle` | PS5 atlas swizzle detect/transform (masks auto-computed per texture size, `rotate=90`) |
 | `--preview-export` | Save SDF atlas + glyph crop PNGs into `preview/` (unswizzled view when used with `--ps5-swizzle`) |
-| `--scan-jobs <N>` | Number of parallel scan workers (default: `1`) |
+| `--scan-jobs <N>`, `--max-workers <N>` | Number of parallel scan workers (default: `1`) |
 
 ### Examples
 
@@ -101,59 +103,62 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 
 ```bat
 :: Replace all fonts with Mulmaru
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --mulmaru
 
 :: Replace SDF only with NanumGothic
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --sdfonly
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --sdfonly
 
 :: Replace using JSON mapping
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --list Muck.json
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --list font_map.json
 ```
 
 **Parsing / Scan:**
 
 ```bat
-:: Export font info (creates Muck.json)
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --parse
+:: Export font info (creates font_map.json)
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --parse
 
-:: Parallel workers + PS5 swizzle detection fields
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --parse --scan-jobs 10 --ps5-swizzle
+:: Parallel workers + PS5 swizzle detection fields (alias: --max-workers)
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --parse --max-workers 10 --ps5-swizzle
 ```
 
 **SDF options:**
 
 ```bat
 :: Keep original in-game material parameters
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-material
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --use-game-material
 
 :: Keep in-game line metrics
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-line-metrics
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --use-game-line-metrics
+
+:: Force Raster behavior for SDF replacement
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --force-raster
 ```
 
 **Save / Output:**
 
 ```bat
 :: Limit replacement to a specific file
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --target-file "sharedassets0.assets"
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --target-file "sharedassets0.assets"
 
 :: Keep originals and write modified files to a separate folder
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --output-only "D:\output"
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --output-only "D:\output"
 
 :: Prefer original compression on save
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --original-compress
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --original-compress
 
 :: Use a fast SSD/NVMe path for temporary save files
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --nanumgothic --temp-dir "E:\UFR_TEMP"
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --temp-dir "E:\UFR_TEMP"
 ```
 
 **PS5 preview:**
 
 ```bat
 :: Export normal (PC) previews
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --preview-export --sdfonly
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --preview-export --sdfonly
 
 :: Export PS5 previews in unswizzled view
-unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --preview-export --ps5-swizzle --sdfonly
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --preview-export --ps5-swizzle --sdfonly
 ```
 
 ---
@@ -354,7 +359,7 @@ pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
 ### Examples
 
 ```bash
-python unity_font_replacer_en.py --gamepath "D:\Games\Muck" --mulmaru
+python unity_font_replacer_en.py --gamepath "C:/path/to/game" --mulmaru
 python export_fonts_en.py "D:\MyGame"
 ```
 
@@ -372,7 +377,7 @@ python export_fonts_en.py "D:\MyGame"
 ### Scan
 
 - `--parse` scans via per-file worker processes so a crash in one file does not terminate the whole scan.
-- You can increase scan throughput with `--scan-jobs`.
+- You can increase scan throughput with `--scan-jobs` (alias: `--max-workers`).
 - Scanning uses blacklist-based exclusion (`*.bak`, `.info`, `.config`, etc.).
 - Use `--target-file` to restrict replacements to specific files.
 
@@ -382,6 +387,7 @@ python export_fonts_en.py "D:\MyGame"
 - Use `--use-game-line-metrics` to keep original in-game line metrics. (pointSize still follows replacement font.)
 - Default behavior applies material floats from `KR_ASSETS/* SDF Material.json` with padding-ratio correction.
   Use `--use-game-material` to preserve original in-game material style.
+- Use `--force-raster` to force Raster behavior even when the replacement font name does not end with `Raster`.
 - When a Raster asset is injected into an SDF slot, SDF material effect floats (outline/underlay/glow) are automatically neutralized to reduce box artifacts.
 
 ### Preview Export
@@ -406,80 +412,6 @@ python export_fonts_en.py "D:\MyGame"
 
 ---
 
-## Standalone PS5 Texture Tool (ps5_swizzler.py / ps5_swizzler.exe)
-
-`ps5_swizzler.py` is a standalone CLI that mirrors the core PS5 swizzle/unswizzle conversion logic
-used in `unity_font_replacer_core.py`. The name is unified to `swizzler` because it supports
-swizzle, unswizzle, and detect modes in one command.
-
-Supported conversion paths:
-
-- BIN -> BIN
-- BIN -> PNG
-- PNG -> BIN
-- PNG -> PNG
-
-Main modes:
-
-- `--mode detect`: heuristically detect whether input is swizzled or linear
-- `--mode unswizzle`: swizzled -> linear
-- `--mode swizzle`: linear -> swizzled
-
-### Key CLI options
-
-| Option | Description |
-|------|------|
-| `--mode {unswizzle,swizzle,detect}` | Processing mode (default: `unswizzle`) |
-| `--input <path>` | Input file path (`.bin` or `.png`) |
-| `--input-format {auto,bin,png}` | Force input format (default: `auto`) |
-| `--width`, `--height` | Texture dimensions for BIN input |
-| `--bytes-per-element <N>` | Bytes per pixel element (e.g. Alpha8=1) |
-| `--mask-x`, `--mask-y` | Manual swizzle masks (default: auto from dimensions) |
-| `--axis-swap {auto,off}` | For non-square unswizzle, compare `(w,h)` and `(h,w)` candidates and keep the more coherent result |
-| `--output-bin <path>` | Binary output path |
-| `--output-png <path>` | PNG output path |
-| `--skip-bin`, `--skip-png` | Skip writing selected output type |
-| `--rotate {0,90,180,270}` | Output image rotation |
-| `--hflip`, `--vflip` | Output image horizontal/vertical flip |
-
-### Conversion examples (4-way)
-
-```bat
-:: 1) BIN -> BIN (unswizzle)
-ps5_swizzler.exe --mode unswizzle --input atlas_swizzled.bin ^
-    --width 2048 --height 2048 --bytes-per-element 1 ^
-    --output-bin atlas_linear.bin --skip-png
-
-:: 2) BIN -> PNG (unswizzle)
-ps5_swizzler.exe --mode unswizzle --input atlas_swizzled.bin ^
-    --width 2048 --height 2048 --bytes-per-element 1 ^
-    --output-png atlas_linear.png --skip-bin
-
-:: 3) PNG -> BIN (swizzle)
-ps5_swizzler.exe --mode swizzle --input atlas_linear.png --input-format png ^
-    --bytes-per-element 1 --output-bin atlas_swizzled.bin --skip-png
-
-:: 4) PNG -> PNG (swizzle preview)
-ps5_swizzler.exe --mode swizzle --input atlas_linear.png --input-format png ^
-    --bytes-per-element 1 --output-png atlas_swizzled.png --skip-bin
-```
-
-Additional detect example:
-
-```bat
-ps5_swizzler.exe --mode detect --input atlas.bin --width 2048 --height 2048 --bytes-per-element 1
-```
-
-Run from Python source:
-
-```bash
-python ps5_swizzler.py --mode detect --input atlas.bin --width 2048 --height 2048 --bytes-per-element 1
-```
-
-Note:
-
-- `--axis-swap auto` automatically handles blocky/axis-mismatch artifacts seen on some non-square PS5 atlases.
-
 ---
 
 ## Special Thanks
@@ -492,3 +424,4 @@ Note:
 ## License
 
 MIT License
+
