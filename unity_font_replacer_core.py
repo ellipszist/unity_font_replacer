@@ -3259,11 +3259,19 @@ def _log_replacement_plan_details(
         path_id = entry.get("Path_ID")
         source_name = str(entry.get("Name", ""))
         replace_to = str(entry.get("Replace_to", ""))
+        force_raster = entry.get("force_raster")
         swizzle = entry.get("swizzle")
         process_swizzle = entry.get("process_swizzle")
         extra_flags = ""
-        if swizzle is not None or process_swizzle is not None:
-            extra_flags = f" swizzle={swizzle} process_swizzle={process_swizzle}"
+        if (
+            force_raster is not None
+            or swizzle is not None
+            or process_swizzle is not None
+        ):
+            extra_flags = (
+                f" force_raster={force_raster} swizzle={swizzle} "
+                f"process_swizzle={process_swizzle}"
+            )
         _log_debug(
             f"[replace_plan] type={type_name} file={file_name} assets={assets_name} path_id={path_id} "
             f"name={source_name} replace_to={replace_to}{extra_flags}"
@@ -3435,6 +3443,77 @@ def _atlas_ref_ids(ref: Any) -> tuple[int, int]:
     except Exception:
         path_id = 0
     return file_id, path_id
+
+
+def _normalize_assets_basename(value: Any) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    normalized = text.replace("\\", "/")
+    name = os.path.basename(normalized)
+    return name or None
+
+
+def _extract_external_assets_name(external_ref: Any) -> str | None:
+    if external_ref is None:
+        return None
+
+    candidates: list[Any] = []
+    if isinstance(external_ref, dict):
+        candidates.extend(
+            [
+                external_ref.get("path"),
+                external_ref.get("pathName"),
+                external_ref.get("name"),
+                external_ref.get("fileName"),
+                external_ref.get("asset_name"),
+                external_ref.get("assetPath"),
+            ]
+        )
+    else:
+        for attr in (
+            "path",
+            "pathName",
+            "name",
+            "fileName",
+            "asset_name",
+            "assetPath",
+        ):
+            candidates.append(getattr(external_ref, attr, None))
+
+    for candidate in candidates:
+        name = _normalize_assets_basename(candidate)
+        if name:
+            return name
+    return None
+
+
+def _resolve_assets_name_from_file_id(source_assets_file: Any, file_id: int) -> str | None:
+    try:
+        resolved_file_id = int(file_id or 0)
+    except Exception:
+        resolved_file_id = 0
+
+    if resolved_file_id == 0:
+        return _normalize_assets_basename(getattr(source_assets_file, "name", ""))
+
+    externals = getattr(source_assets_file, "externals", None)
+    if externals is None:
+        externals = getattr(source_assets_file, "m_Externals", None)
+
+    external_ref: Any = None
+    if isinstance(externals, dict):
+        external_ref = externals.get(resolved_file_id)
+        if external_ref is None:
+            external_ref = externals.get(resolved_file_id - 1)
+    elif isinstance(externals, (list, tuple)):
+        ext_index = resolved_file_id - 1
+        if 0 <= ext_index < len(externals):
+            external_ref = externals[ext_index]
+    else:
+        return None
+
+    return _extract_external_assets_name(external_ref)
 
 
 def _has_real_atlas_path(ref: Any) -> bool:
@@ -4407,6 +4486,7 @@ def parse_fonts(
             "Path_ID": font["path_id"],
             "Type": "TTF",
             "Name": font["name"],
+            "force_raster": "False",
             "Replace_to": "",
         }
 
@@ -4425,6 +4505,7 @@ def parse_fonts(
                 "Path_ID": font["path_id"],
                 "Type": "SDF",
                 "Name": font["name"],
+                "force_raster": "False",
                 "swizzle": swizzle_flag,
                 "process_swizzle": process_swizzle_flag,
                 "Replace_to": "",
@@ -4436,6 +4517,7 @@ def parse_fonts(
                 "Path_ID": font["path_id"],
                 "Type": "SDF",
                 "Name": font["name"],
+                "force_raster": "False",
                 "Replace_to": "",
             }
         result[key] = entry
@@ -4486,23 +4568,14 @@ def _load_font_assets_cached(
         return name
 
     base_name = _strip_render_suffix(raw_name)
-    has_explicit_variant = raw_name.endswith(" SDF") or raw_name.endswith(" Raster")
-    if has_explicit_variant:
-        explicit_candidates = [raw_name, base_name]
-        if raw_name.endswith(" Raster"):
-            explicit_candidates.append(f"{base_name} SDF")
-        elif raw_name.endswith(" SDF"):
-            explicit_candidates.append(f"{base_name} Raster")
-        name_candidates = _dedupe_preserve_order(explicit_candidates)
+    if prefer_raster:
+        name_candidates = _dedupe_preserve_order(
+            [raw_name, f"{base_name} Raster", f"{base_name} SDF"]
+        )
     else:
-        if prefer_raster:
-            name_candidates = _dedupe_preserve_order(
-                [raw_name, f"{base_name} Raster", f"{base_name} SDF"]
-            )
-        else:
-            name_candidates = _dedupe_preserve_order(
-                [raw_name, f"{base_name} SDF", f"{base_name} Raster"]
-            )
+        name_candidates = _dedupe_preserve_order(
+            [raw_name, f"{base_name} SDF", f"{base_name} Raster"]
+        )
 
     font_name_candidates = _dedupe_preserve_order(
         [raw_name, base_name] + name_candidates
@@ -4697,10 +4770,17 @@ def replace_fonts_in_file(
 
     texture_object_lookup: dict[tuple[str, int], Any] = {}
     texture_swizzle_state_cache: dict[str, tuple[str | None, str | None]] = {}
+    material_object_count_by_pathid: dict[int, int] = {}
     for item in env.objects:
-        if item.type.name != "Texture2D":
+        item_type = item.type.name
+        if item_type == "Texture2D":
+            texture_object_lookup[(item.assets_file.name, int(item.path_id))] = item
             continue
-        texture_object_lookup[(item.assets_file.name, int(item.path_id))] = item
+        if item_type == "Material":
+            material_path_id = int(item.path_id)
+            material_object_count_by_pathid[material_path_id] = (
+                material_object_count_by_pathid.get(material_path_id, 0) + 1
+            )
 
     target_sdf_targets: set[tuple[str, int]] = set()
     target_sdf_pathids: set[int] = set()
@@ -4734,6 +4814,8 @@ def replace_fonts_in_file(
     texture_replacements: dict[str, Any] = {}
     texture_replacement_metadata_size: dict[str, tuple[int, int]] = {}
     material_replacements: dict[str, JsonDict] = {}
+    material_replacements_by_pathid: dict[int, JsonDict] = {}
+    ambiguous_material_fallback_warned: set[int] = set()
     modified = False
 
     for obj in env.objects:
@@ -4898,15 +4980,20 @@ def replace_fonts_in_file(
                 replacement_swizzle_hint = parse_bool_flag(
                     replacement_meta.get("swizzle")
                 )
+                replacement_force_raster = parse_bool_flag(
+                    replacement_meta.get("force_raster")
+                )
+                effective_force_raster = force_raster or replacement_force_raster
                 _log_debug(
                     f"[replace_sdf] file={fn_without_path} assets={assets_name} path_id={pathid} "
                     f"font={objname} target={replacement_font} "
+                    f"effective_force_raster={effective_force_raster} "
                     f"replacement_swizzle_hint={replacement_swizzle_hint} "
                     f"replacement_process_swizzle={replacement_process_swizzle}"
                 )
                 matched_sdf_targets += 1
                 assets = load_font_assets(
-                    replacement_font, prefer_raster=force_raster
+                    replacement_font, prefer_raster=effective_force_raster
                 )
                 if assets["sdf_data"] and assets["sdf_atlas"]:
                     if lang == "ko":
@@ -4937,7 +5024,7 @@ def replace_fonts_in_file(
                         )
                     except Exception:
                         replacement_render_mode = 4118
-                    if force_raster:
+                    if effective_force_raster:
                         replacement_render_mode &= ~0x1000
                     replacement_is_sdf = (replacement_render_mode & 0x1000) != 0
                     game_padding_for_material = 0.0
@@ -5480,13 +5567,13 @@ def replace_fonts_in_file(
                         atlas_metadata_width,
                         atlas_metadata_height,
                     )
-                    if m_Material_FileID == 0 and m_Material_PathID != 0:
+                    if m_Material_PathID != 0:
                         gradient_scale = None
                         apply_replacement_material = not use_game_mat
                         float_overrides: dict[str, float] = {}
                         material_padding_ratio = 1.0
                         material_data = assets.get("sdf_materials")
-                        if (not replacement_is_sdf) and use_game_mat:
+                        if effective_force_raster and use_game_mat:
                             if lang == "ko":
                                 _log_console(
                                     "  경고: Raster 폰트에 --use-game-material 사용 시 박스 아티팩트가 생길 수 있습니다."
@@ -5532,7 +5619,7 @@ def replace_fonts_in_file(
                                             * material_padding_ratio
                                         )
                             gradient_scale = float_overrides.get("_GradientScale")
-                        if apply_replacement_material and not replacement_is_sdf:
+                        if apply_replacement_material and effective_force_raster:
                             # KR: Raster atlas를 SDF 머티리얼로 렌더링할 때 박스 아티팩트를 줄이기 위해
                             # KR: dilate/outline/underlay/glow 계열을 0으로 리셋합니다.
                             # EN: Reduce box artifacts when raster atlases are sampled by SDF materials by
@@ -5566,12 +5653,34 @@ def replace_fonts_in_file(
                                     f"  Applied material padding ratio: {game_padding_for_material:.2f}/{replacement_padding:.2f} "
                                     f"(x{material_padding_ratio:.3f})"
                                 )
-                        material_replacements[f"{assets_name}|{m_Material_PathID}"] = {
+                        material_target_assets_name = _resolve_assets_name_from_file_id(
+                            obj.assets_file,
+                            int(m_Material_FileID),
+                        )
+                        material_payload = {
                             "w": atlas_metadata_width,
                             "h": atlas_metadata_height,
                             "gs": gradient_scale,
                             "float_overrides": float_overrides,
                         }
+                        if material_target_assets_name:
+                            material_key_exact = (
+                                f"{material_target_assets_name}|{m_Material_PathID}"
+                            )
+                            material_key_lower = (
+                                f"{material_target_assets_name.lower()}|{m_Material_PathID}"
+                            )
+                            material_replacements[material_key_exact] = material_payload
+                            material_replacements[material_key_lower] = material_payload
+                        else:
+                            material_replacements_by_pathid[int(m_Material_PathID)] = (
+                                material_payload
+                            )
+                            _log_warning(
+                                f"[replace_sdf] file={fn_without_path} assets={assets_name} path_id={pathid} "
+                                f"material_ref={m_Material_FileID}:{m_Material_PathID} "
+                                "could_not_resolve_material_assets_name=True; fallback_to_pathid_only=True"
+                            )
                     obj.patch(parse_dict)
                     patched_sdf_targets += 1
                     modified = True
@@ -5668,10 +5777,24 @@ def replace_fonts_in_file(
                 parse_dict.save()
                 modified = True
         if obj.type.name == "Material":
-            if f"{assets_name}|{obj.path_id}" in material_replacements:
+            material_key = f"{assets_name}|{obj.path_id}"
+            mat_info = material_replacements.get(material_key)
+            if mat_info is None:
+                mat_info = material_replacements.get(f"{assets_name.lower()}|{obj.path_id}")
+            if mat_info is None:
+                fallback_path_id = int(obj.path_id)
+                if fallback_path_id in material_replacements_by_pathid:
+                    if material_object_count_by_pathid.get(fallback_path_id, 0) == 1:
+                        mat_info = material_replacements_by_pathid[fallback_path_id]
+                    elif fallback_path_id not in ambiguous_material_fallback_warned:
+                        ambiguous_material_fallback_warned.add(fallback_path_id)
+                        _log_warning(
+                            f"[replace_material] file={fn_without_path} path_id={fallback_path_id} "
+                            "fallback_pathid_only_match_ambiguous=True; skipped"
+                        )
+            if mat_info is not None:
                 parse_dict = obj.parse_as_object()
 
-                mat_info = material_replacements[f"{assets_name}|{obj.path_id}"]
                 float_overrides = mat_info.get("float_overrides", {})
                 for i in range(len(parse_dict.m_SavedProperties.m_Floats)):
                     prop_name = parse_dict.m_SavedProperties.m_Floats[i][0]
@@ -6078,6 +6201,7 @@ def create_batch_replacements(
                 "Path_ID": font["path_id"],
                 "Type": "TTF",
                 "File": font["file"],
+                "force_raster": "False",
                 "Replace_to": font_name,
             }
 
@@ -6097,6 +6221,7 @@ def create_batch_replacements(
                     "Path_ID": font["path_id"],
                     "Type": "SDF",
                     "Name": font["name"],
+                    "force_raster": "False",
                     "swizzle": swizzle_flag,
                     "process_swizzle": process_swizzle_flag,
                     "Replace_to": font_name,
@@ -6108,6 +6233,7 @@ def create_batch_replacements(
                     "Path_ID": font["path_id"],
                     "Type": "SDF",
                     "Name": font["name"],
+                    "force_raster": "False",
                     "Replace_to": font_name,
                 }
             replacements[key] = entry
@@ -6143,6 +6269,7 @@ def create_preview_export_targets(
             "Path_ID": font["path_id"],
             "Type": "SDF",
             "Name": font["name"],
+            "force_raster": "False",
             "Replace_to": "",
         }
         if ps5_swizzle:

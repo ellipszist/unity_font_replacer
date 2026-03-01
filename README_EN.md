@@ -179,6 +179,7 @@ JSON example (without `--ps5-swizzle`):
         "Path_ID": 123,
         "Type": "TTF",
         "Name": "Arial",
+        "force_raster": "False",
         "Replace_to": "Mulmaru"
     },
     "sharedassets0.assets|sharedassets0.assets|Arial SDF|SDF|456": {
@@ -187,10 +188,22 @@ JSON example (without `--ps5-swizzle`):
         "Path_ID": 456,
         "Type": "SDF",
         "Name": "Arial SDF",
+        "force_raster": "False",
         "Replace_to": ""
     }
 }
 ```
+
+### force_raster field
+
+`--parse` JSON includes a `force_raster` field with default `"False"`.
+
+| Field | Description |
+|------|------|
+| `force_raster` | Force Raster behavior for this entry only (`"True"` / `"False"`, default `"False"`) |
+
+- If `force_raster: "True"`, that SDF entry is processed with Raster behavior (render mode + material effect neutralization).
+- If `--force-raster` is used, Raster behavior is forced for all SDF entries regardless of JSON values.
 
 ### PS5 swizzle fields
 
@@ -213,6 +226,7 @@ JSON example (with `--ps5-swizzle`, SDF):
         "Path_ID": 456,
         "Type": "SDF",
         "Name": "Arial SDF",
+        "force_raster": "False",
         "swizzle": "True",
         "process_swizzle": "False",
         "Replace_to": ""
@@ -387,8 +401,10 @@ python export_fonts_en.py "D:\MyGame"
 - Use `--use-game-line-metrics` to keep original in-game line metrics. (pointSize still follows replacement font.)
 - Default behavior applies material floats from `KR_ASSETS/* SDF Material.json` with padding-ratio correction.
   Use `--use-game-material` to preserve original in-game material style.
-- Use `--force-raster` to force Raster behavior even when the replacement font name does not end with `Raster`.
-- When a Raster asset is injected into an SDF slot, SDF material effect floats (outline/underlay/glow) are automatically neutralized to reduce box artifacts.
+- You can set per-entry Raster forcing with JSON `force_raster: "True"` (default from `--parse`: `"False"`).
+- Use `--force-raster` to force Raster behavior for all SDF replacement entries.
+- For Raster-mode SDF replacement (per-entry `force_raster` or global `--force-raster`), SDF material effect floats (outline/underlay/glow) are neutralized to `0` to reduce box artifacts.
+- External Material references (`m_FileID != 0`) are also included in the same neutralization path.
 
 ### Preview Export
 
