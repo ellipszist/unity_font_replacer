@@ -78,7 +78,7 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --mulmaru
 
 | Option | Description |
 |------|------|
-| `--use-game-material` | Keep original in-game Material parameters (default: apply replacement Material) |
+| `--use-game-material` | Keep original in-game Material parameters without correction (default: preserve original style with automatic atlas/padding correction) |
 | `--force-raster` | Force SDF replacement into Raster behavior (render mode + material effect neutralization) |
 | `--use-game-line-metrics` | Keep in-game line metrics (pointSize still follows replacement font) |
 | `--outline-ratio <float>` | Apply a multiplier to `_OutlineWidth` and `_OutlineSoftness` on the currently selected Material baseline (default `1.0`) |
@@ -416,11 +416,13 @@ python export_fonts_en.py "D:\MyGame"
 
 - Default line metrics mode scales original proportions to the replacement font's pointSize.
 - Use `--use-game-line-metrics` to keep original in-game line metrics. (pointSize still follows replacement font.)
-- Default behavior applies material floats from `KR_ASSETS/* SDF Material.json` with padding-ratio correction.
-  Use `--use-game-material` to preserve original in-game material style.
+- Default SDF replacement preserves the original in-game Material style and only corrects atlas/padding-dependent differences.
+- Use `--use-game-material` when you want the original in-game Material parameters without atlas/padding correction.
+- Bulk `--nanumgothic` / `--mulmaru` replacement automatically chooses the nearest built-in preset (`Padding_5` / `Padding_7` / `Padding_15`) from the source `m_AtlasPadding`.
+- When the source padding is larger than the selected replacement atlas padding, the tool still applies Material correction but prints a warning that outline/underlay may not match the original exactly.
 - `--outline-ratio` treats the current Material baseline as `1.0` and multiplies `_OutlineWidth` / `_OutlineSoftness` after the baseline is chosen.
 - `--outline-ratio 1.25` makes outlines 25% thicker, while `--outline-ratio 0.6` makes them thinner.
-- With `--use-game-material --outline-ratio 1.25`, the baseline is the original in-game Material. Without `--use-game-material`, the baseline is the adjusted replacement Material.
+- With `--use-game-material --outline-ratio 1.25`, the baseline is the uncorrected original in-game Material. Without `--use-game-material`, the baseline is the atlas/padding-corrected original style.
 - You can set per-entry Raster forcing with JSON `force_raster: "True"` (default from `--parse`: `"False"`).
 - Use `--force-raster` to force Raster behavior for all SDF replacement entries.
 - For Raster-mode SDF replacement (per-entry `force_raster` or global `--force-raster`), SDF material effect floats (outline/underlay/glow) are neutralized to `0`, and the SDF flag (0x1000) is cleared from `m_AtlasRenderMode` so rendering follows the Raster path.

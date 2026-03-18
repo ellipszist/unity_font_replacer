@@ -78,7 +78,7 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --mulmaru
 
 | 옵션 | 설명 |
 |------|------|
-| `--use-game-material` | 게임 원본 Material 파라미터 유지 (기본: 교체 Material 보정 적용) |
+| `--use-game-material` | 게임 원본 Material 파라미터를 보정 없이 그대로 유지 (기본: 원본 스타일 유지 + atlas/padding 자동 보정) |
 | `--force-raster` | SDF 교체를 Raster 기준으로 강제 (렌더 모드 + Material 효과값 Raster 보정) |
 | `--use-game-line-metrics` | 게임 원본 줄 간격 메트릭 사용 (pointSize는 교체값 유지) |
 | `--outline-ratio <float>` | 현재 선택된 Material 기준 `_OutlineWidth`, `_OutlineSoftness`에 배율 적용 (기본 `1.0`) |
@@ -418,10 +418,13 @@ python export_fonts_ko.py "D:\MyGame"
 - 기본 줄 간격 메트릭 모드는 게임 원본 비율을 기준으로 교체 폰트 pointSize에 맞게 보정 적용합니다.
 - 게임 원본 줄 간격 메트릭을 그대로 쓰려면 `--use-game-line-metrics`를 사용하세요. (pointSize는 항상 교체 폰트 값)
 - SDF 교체 시 기본은 `KR_ASSETS/* SDF Material.json` 머티리얼 float를 적용하며, padding 비율 기준 보정도 함께 적용합니다.
-- 원본 게임 머티리얼 스타일을 유지하려면 `--use-game-material`을 사용하세요.
+- 기본 SDF 교체는 게임 원본 Material 스타일을 유지하고 atlas/padding 차이만 자동 보정합니다.
+- atlas/padding 보정 없이 게임 원본 Material 파라미터를 그대로 쓰려면 `--use-game-material`을 사용하세요.
+- `--nanumgothic` / `--mulmaru` 일괄 교체는 원본 `m_AtlasPadding`에 가장 가까운 내장 preset(`Padding_5` / `Padding_7` / `Padding_15`)을 자동 선택합니다.
+- 원본 padding이 선택된 교체 atlas padding보다 크면, Material 보정은 계속 적용되지만 외곽선/언더레이가 원본과 완전히 같지 않을 수 있다는 경고를 출력합니다.
 - `--outline-ratio`는 현재 선택된 Material 기준값을 1.0으로 보고 `_OutlineWidth`, `_OutlineSoftness`에 추가 배율을 곱합니다.
 - `--outline-ratio 1.25`는 외곽선을 25% 두껍게, `--outline-ratio 0.6`은 더 얇게 만듭니다.
-- `--use-game-material --outline-ratio 1.25`면 게임 원본 Material 기준으로, 기본 모드에서 `--outline-ratio 1.25`면 보정된 replacement Material 기준으로 배율이 적용됩니다.
+- `--use-game-material --outline-ratio 1.25`면 보정 없는 게임 원본 Material 기준으로, 기본 모드에서 `--outline-ratio 1.25`면 atlas/padding 보정이 적용된 게임 원본 스타일 기준으로 배율이 적용됩니다.
 - JSON 항목별 `force_raster: "True"`로 개별 Raster 강제를 지정할 수 있습니다. (`--parse` 기본값: `"False"`)
 - 전체 SDF 교체 항목을 Raster 방식으로 강제하려면 `--force-raster`를 사용하세요.
 - Raster 방식으로 처리되는 SDF 교체(개별 `force_raster` 또는 `--force-raster`)에서는 SDF 머티리얼 효과값(Outline/Underlay/Glow 등)을 0으로 보정하고 `m_AtlasRenderMode`의 SDF 플래그(0x1000)를 해제해 Raster 경로로 처리합니다.

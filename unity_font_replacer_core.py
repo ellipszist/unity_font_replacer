@@ -307,6 +307,39 @@ _MATERIAL_PADDING_SCALE_KEYS = (
     "_GlowInner",
     "_GlowOuter",
 )
+_MATERIAL_STYLE_FLOAT_KEYS = (
+    "_FaceDilate",
+    "_OutlineWidth",
+    "_OutlineSoftness",
+    "_UnderlayDilate",
+    "_UnderlaySoftness",
+    "_UnderlayOffsetX",
+    "_UnderlayOffsetY",
+    "_GlowOffset",
+    "_GlowInner",
+    "_GlowOuter",
+    "_ScaleRatioA",
+    "_ScaleRatioB",
+    "_ScaleRatioC",
+)
+_MATERIAL_STYLE_PADDING_SCALE_KEYS = (
+    "_FaceDilate",
+    "_OutlineWidth",
+    "_OutlineSoftness",
+    "_UnderlayDilate",
+    "_UnderlaySoftness",
+    "_UnderlayOffsetX",
+    "_UnderlayOffsetY",
+    "_GlowOffset",
+    "_GlowInner",
+    "_GlowOuter",
+)
+_MATERIAL_STYLE_COLOR_KEYS = (
+    "_FaceColor",
+    "_OutlineColor",
+    "_UnderlayColor",
+    "_GlowColor",
+)
 _MATERIAL_OUTLINE_RATIO_KEYS = (
     "_OutlineWidth",
     "_OutlineSoftness",
@@ -3740,8 +3773,6 @@ def _sync_creation_settings_payload(
             creation_settings[key] = int(padding)
         elif normalized.endswith("pointsize") or normalized == "pointsize":
             creation_settings[key] = int(point_size)
-        elif "charactersequence" in normalized:
-            creation_settings[key] = ""
 
 
 def _tmp_version_hint(unity_version: str | None) -> Literal["new", "old"] | None:
@@ -4507,6 +4538,13 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
     if outline_ratio <= 0:
         outline_ratio = 1.0
     outline_fallback_used = False
+    preserve_game_style = bool(mat_info.get("preserve_game_style", False))
+    try:
+        style_padding_scale_ratio = float(mat_info.get("style_padding_scale_ratio", 1.0))
+    except Exception:
+        style_padding_scale_ratio = 1.0
+    if style_padding_scale_ratio <= 0:
+        style_padding_scale_ratio = 1.0
     prune_raster_material = bool(mat_info.get("prune_raster_material", False))
     preserve_gradient_floor = bool(mat_info.get("preserve_gradient_floor", False))
     gradient_scale = mat_info.get("gs")
@@ -4531,6 +4569,15 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
     else:
         float_props = getattr(saved_props, "m_Floats", None)
         if isinstance(float_props, list):
+            existing_float_map: dict[str, float] = {}
+            for entry in float_props:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
+                try:
+                    existing_float_map[str(entry[0])] = float(entry[1])
+                except Exception:
+                    continue
+
             has_texture_height = False
             has_texture_width = False
             has_gradient_scale = False
@@ -4562,6 +4609,16 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                         float_props[i] = ("_GradientScale", candidate)
                         has_gradient_scale = True
                         changed = True
+                elif preserve_game_style and prop_name in _MATERIAL_STYLE_FLOAT_KEYS:
+                    candidate = existing_float_map.get(prop_name)
+                    if candidate is None:
+                        continue
+                    if prop_name in _MATERIAL_STYLE_PADDING_SCALE_KEYS:
+                        candidate = float(candidate * style_padding_scale_ratio)
+                    if prop_name in _MATERIAL_OUTLINE_RATIO_KEYS:
+                        candidate = float(candidate * outline_ratio)
+                    float_props[i] = (prop_name, float(candidate))
+                    changed = True
                 elif prop_name in _MATERIAL_OUTLINE_RATIO_KEYS:
                     candidate: float | None = None
                     existing_value: float | None = None
@@ -4578,13 +4635,58 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                             outline_ratio != 1.0
                             and candidate is not None
                             and abs(candidate) <= 1e-9
-                            and existing_value is not None
-                            and abs(existing_value) > 1e-9
                         ):
-                            candidate = existing_value
-                            outline_fallback_used = True
+                            if existing_value is not None and abs(existing_value) > 1e-9:
+                                candidate = existing_value
+                                outline_fallback_used = True
+                            elif prop_name == "_OutlineWidth":
+                                baseline_gradient_scale = None
+                                try:
+                                    if "_GradientScale" in float_overrides:
+                                        baseline_gradient_scale = float(
+                                            float_overrides["_GradientScale"]
+                                        )
+                                    elif gradient_scale is not None:
+                                        baseline_gradient_scale = float(gradient_scale)
+                                    else:
+                                        baseline_gradient_scale = existing_float_map.get(
+                                            "_GradientScale"
+                                        )
+                                except Exception:
+                                    baseline_gradient_scale = None
+                                if (
+                                    baseline_gradient_scale is not None
+                                    and baseline_gradient_scale > 0
+                                ):
+                                    candidate = 1.0 / baseline_gradient_scale
+                                    outline_fallback_used = True
                     elif outline_ratio != 1.0:
                         candidate = existing_value
+                        if (
+                            prop_name == "_OutlineWidth"
+                            and candidate is not None
+                            and abs(candidate) <= 1e-9
+                        ):
+                            baseline_gradient_scale = None
+                            try:
+                                if "_GradientScale" in float_overrides:
+                                    baseline_gradient_scale = float(
+                                        float_overrides["_GradientScale"]
+                                    )
+                                elif gradient_scale is not None:
+                                    baseline_gradient_scale = float(gradient_scale)
+                                else:
+                                    baseline_gradient_scale = existing_float_map.get(
+                                        "_GradientScale"
+                                    )
+                            except Exception:
+                                baseline_gradient_scale = None
+                            if (
+                                baseline_gradient_scale is not None
+                                and baseline_gradient_scale > 0
+                            ):
+                                candidate = 1.0 / baseline_gradient_scale
+                                outline_fallback_used = True
                     if candidate is not None:
                         float_props[i] = (prop_name, float(candidate * outline_ratio))
                         changed = True
@@ -4624,6 +4726,8 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
         if isinstance(color_props, list) and color_overrides:
             for i in range(len(color_props)):
                 color_name = color_props[i][0]
+                if preserve_game_style and str(color_name) in _MATERIAL_STYLE_COLOR_KEYS:
+                    continue
                 override = color_overrides.get(color_name)
                 if not isinstance(override, dict):
                     continue
@@ -4747,6 +4851,30 @@ def inspect_tmp_font_schema(
         "atlas_file_id": int(atlas_file_id),
         "atlas_path_id": int(atlas_path_id),
     }
+
+
+def extract_tmp_atlas_padding(
+    data: JsonDict,
+    unity_version: str | None = None,
+) -> float:
+    candidates: list[Any] = [data.get("m_AtlasPadding")]
+    creation_settings_key = _resolve_creation_settings_key(
+        data,
+        unity_version=unity_version,
+    )
+    if creation_settings_key and isinstance(data.get(creation_settings_key), dict):
+        candidates.append(cast(JsonDict, data[creation_settings_key]).get("padding"))
+    if isinstance(data.get("m_fontInfo"), dict):
+        candidates.append(cast(JsonDict, data["m_fontInfo"]).get("Padding"))
+
+    for candidate in candidates:
+        try:
+            numeric = float(candidate)
+        except Exception:
+            continue
+        if numeric > 0:
+            return numeric
+    return 0.0
 
 
 def convert_face_info_new_to_old(
@@ -5092,11 +5220,30 @@ def find_assets_files(
         ".bak",
         ".info",
         ".config",
+        ".browser",
+        ".aspx",
+        ".map",
+        ".resource",
+        ".resources",
     }
     if exclude_exts:
         blacklist_exts.update({str(ext).lower() for ext in exclude_exts if ext})
 
-    for root, _, files in os.walk(data_path):
+    skip_root_prefixes = [
+        os.path.normcase(
+            os.path.normpath(os.path.join(data_path, "il2cpp_data", "etc", "mono"))
+        )
+    ]
+
+    for root, dirs, files in os.walk(data_path):
+        normalized_root = os.path.normcase(os.path.normpath(root))
+        if any(
+            normalized_root == prefix
+            or normalized_root.startswith(prefix + os.sep)
+            for prefix in skip_root_prefixes
+        ):
+            dirs[:] = []
+            continue
         for fn in files:
             if normalized_targets is not None and fn not in normalized_targets:
                 continue
@@ -5822,6 +5969,39 @@ def _build_font_asset_name_candidates(
     return font_name_candidates, name_candidates
 
 
+_BULK_SDF_PADDING_VARIANTS = (5, 7, 15)
+
+
+def _select_builtin_bulk_padding_variant(
+    normalized: str,
+    source_padding: float | int | None,
+) -> int | None:
+    base_name = normalize_font_name(normalized).strip().lower()
+    if base_name not in {"nanumgothic", "mulmaru"}:
+        return None
+    try:
+        numeric_padding = float(source_padding) if source_padding is not None else 0.0
+    except Exception:
+        numeric_padding = 0.0
+    if numeric_padding <= 0:
+        return None
+    return min(
+        _BULK_SDF_PADDING_VARIANTS,
+        key=lambda value: (abs(float(value) - numeric_padding), -int(value)),
+    )
+
+
+def _iter_kr_asset_roots(
+    kr_assets: str,
+    padding_variant: int | None = None,
+) -> list[str]:
+    roots: list[str] = []
+    if padding_variant is not None:
+        roots.append(os.path.join(kr_assets, f"Padding_{int(padding_variant)}"))
+    roots.append(kr_assets)
+    return roots
+
+
 def _find_replacement_sdf_atlas_path(
     script_dir: str,
     normalized: str,
@@ -5915,12 +6095,16 @@ def _estimate_sdf_texture_batch_profile(
 
 @lru_cache(maxsize=64)
 def _load_font_assets_cached(
-    script_dir: str, normalized: str, prefer_raster: bool = False
+    script_dir: str,
+    normalized: str,
+    prefer_raster: bool = False,
+    padding_variant: int | None = None,
 ) -> JsonDict:
     """KR: KR_ASSETS에서 폰트 리소스를 읽어 캐시에 저장합니다.
     EN: Load and cache font resources from KR_ASSETS.
     """
     kr_assets = os.path.join(script_dir, "KR_ASSETS")
+    asset_roots = _iter_kr_asset_roots(kr_assets, padding_variant=padding_variant)
     font_name_candidates, name_candidates = _build_font_asset_name_candidates(
         normalized,
         bool(prefer_raster),
@@ -5929,10 +6113,13 @@ def _load_font_assets_cached(
     ttf_data = None
     for font_name in font_name_candidates:
         for ext in (".ttf", ".otf"):
-            font_path = os.path.join(kr_assets, f"{font_name}{ext}")
-            if os.path.exists(font_path):
-                with open(font_path, "rb") as f:
-                    ttf_data = f.read()
+            for asset_root in asset_roots:
+                font_path = os.path.join(asset_root, f"{font_name}{ext}")
+                if os.path.exists(font_path):
+                    with open(font_path, "rb") as f:
+                        ttf_data = f.read()
+                    break
+            if ttf_data is not None:
                 break
         if ttf_data is not None:
             break
@@ -5942,35 +6129,46 @@ def _load_font_assets_cached(
     sdf_swizzle = False
     sdf_process_swizzle = False
     for name_candidate in name_candidates:
-        sdf_json_path = os.path.join(kr_assets, f"{name_candidate}.json")
-        if not os.path.exists(sdf_json_path):
-            continue
-        with open(sdf_json_path, "r", encoding="utf-8") as f:
-            sdf_data = json.load(f)
-        if isinstance(sdf_data, dict):
-            sdf_data_normalized = normalize_sdf_data(sdf_data, deep_copy=True)
-            sdf_swizzle = parse_bool_flag(sdf_data.get("swizzle"))
-            sdf_process_swizzle = parse_bool_flag(sdf_data.get("process_swizzle"))
-        break
+        for asset_root in asset_roots:
+            sdf_json_path = os.path.join(asset_root, f"{name_candidate}.json")
+            if not os.path.exists(sdf_json_path):
+                continue
+            with open(sdf_json_path, "r", encoding="utf-8") as f:
+                sdf_data = json.load(f)
+            if isinstance(sdf_data, dict):
+                sdf_data_normalized = normalize_sdf_data(sdf_data, deep_copy=True)
+                sdf_swizzle = parse_bool_flag(sdf_data.get("swizzle"))
+                sdf_process_swizzle = parse_bool_flag(sdf_data.get("process_swizzle"))
+            break
+        if sdf_data is not None:
+            break
 
     sdf_atlas = None
     for name_candidate in name_candidates:
-        sdf_atlas_path = os.path.join(kr_assets, f"{name_candidate} Atlas.png")
-        if not os.path.exists(sdf_atlas_path):
-            continue
-        with open(sdf_atlas_path, "rb") as f:
-            sdf_atlas = Image.open(f)
-            sdf_atlas.load()
-        break
+        for asset_root in asset_roots:
+            sdf_atlas_path = os.path.join(asset_root, f"{name_candidate} Atlas.png")
+            if not os.path.exists(sdf_atlas_path):
+                continue
+            with open(sdf_atlas_path, "rb") as f:
+                sdf_atlas = Image.open(f)
+                sdf_atlas.load()
+            break
+        if sdf_atlas is not None:
+            break
 
     sdf_material_data = None
     for name_candidate in name_candidates:
-        sdf_material_path = os.path.join(kr_assets, f"{name_candidate} Material.json")
-        if not os.path.exists(sdf_material_path):
-            continue
-        with open(sdf_material_path, "r", encoding="utf-8") as f:
-            sdf_material_data = json.load(f)
-        break
+        for asset_root in asset_roots:
+            sdf_material_path = os.path.join(
+                asset_root, f"{name_candidate} Material.json"
+            )
+            if not os.path.exists(sdf_material_path):
+                continue
+            with open(sdf_material_path, "r", encoding="utf-8") as f:
+                sdf_material_data = json.load(f)
+            break
+        if sdf_material_data is not None:
+            break
 
     return {
         "ttf_data": ttf_data,
@@ -5980,16 +6178,24 @@ def _load_font_assets_cached(
         "sdf_materials": sdf_material_data,
         "sdf_swizzle": sdf_swizzle,
         "sdf_process_swizzle": sdf_process_swizzle,
+        "padding_variant": int(padding_variant) if padding_variant is not None else None,
     }
 
 
-def load_font_assets(font_name: str, prefer_raster: bool = False) -> JsonDict:
+def load_font_assets(
+    font_name: str,
+    prefer_raster: bool = False,
+    padding_variant: int | None = None,
+) -> JsonDict:
     """KR: 지정 폰트명의 교체용 리소스(TTF/SDF/Atlas/Material)를 로드합니다.
     EN: Load replacement assets (TTF/SDF/Atlas/Material) for a font name.
     """
     normalized = normalize_font_name(font_name)
     cached_assets = _load_font_assets_cached(
-        get_script_dir(), normalized, bool(prefer_raster)
+        get_script_dir(),
+        normalized,
+        bool(prefer_raster),
+        int(padding_variant) if padding_variant is not None else None,
     )
     atlas = cached_assets["sdf_atlas"]
     return {
@@ -6001,6 +6207,7 @@ def load_font_assets(font_name: str, prefer_raster: bool = False) -> JsonDict:
         "sdf_materials": cached_assets["sdf_materials"],
         "sdf_swizzle": cached_assets.get("sdf_swizzle"),
         "sdf_process_swizzle": bool(cached_assets.get("sdf_process_swizzle", False)),
+        "padding_variant": cached_assets.get("padding_variant"),
     }
 
 
@@ -6023,6 +6230,7 @@ def replace_fonts_in_file(
     ps5_swizzle: bool = False,
     preview_export: bool = False,
     preview_root: str | None = None,
+    prefer_builtin_padding_variants: bool = False,
     asset_file_index: dict[str, Any] | None = None,
     deferred_texture_plans: dict[str, dict[str, Any]] | None = None,
     deferred_material_plans: dict[str, dict[str, Any]] | None = None,
@@ -6054,6 +6262,7 @@ def replace_fonts_in_file(
     EN: If ps5_swizzle=True, auto-detect target atlas swizzle state and swizzle/unswizzle replacement atlas.
     EN: If preview_export=True, save Atlas/Glyph crop previews into preview folder.
     EN: With ps5_swizzle=True, previews are saved in unswizzled view.
+    EN: When prefer_builtin_padding_variants=True, batch replacements prefer the nearest built-in padding preset.
     EN: If temp_root_dir is set, it is used as the root directory for temporary save files.
     """
     fn_without_path = os.path.basename(assets_file)
@@ -6164,6 +6373,7 @@ def replace_fonts_in_file(
     new_line_metric_keys = _NEW_LINE_METRIC_KEYS
     new_line_metric_scale_keys = _NEW_LINE_METRIC_SCALE_KEYS
     material_padding_scale_keys = _MATERIAL_PADDING_SCALE_KEYS
+    replacement_padding_limit_warned: set[tuple[str, str, int]] = set()
 
     if replace_sdf:
         for key, value in replacement_lookup.items():
@@ -6374,8 +6584,22 @@ def replace_fonts_in_file(
                     f"replacement_process_swizzle={replacement_process_swizzle}"
                 )
                 matched_sdf_targets += 1
+                source_padding_hint = extract_tmp_atlas_padding(
+                    parse_dict,
+                    unity_version=unity_version_hint or None,
+                )
+                selected_padding_variant = (
+                    _select_builtin_bulk_padding_variant(
+                        replacement_font,
+                        source_padding_hint,
+                    )
+                    if prefer_builtin_padding_variants
+                    else None
+                )
                 assets = load_font_assets(
-                    replacement_font, prefer_raster=effective_force_raster
+                    replacement_font,
+                    prefer_raster=effective_force_raster,
+                    padding_variant=selected_padding_variant,
                 )
                 if assets["sdf_data"] and assets["sdf_atlas"]:
                     if lang == "ko":
@@ -6386,6 +6610,15 @@ def replace_fonts_in_file(
                         _log_console(
                             f"SDF font replaced: {assets_name} | {objname} | (PathID: {pathid}) -> {replacement_font}"
                         )
+                    if selected_padding_variant is not None:
+                        if lang == "ko":
+                            _log_console(
+                                f"  가장 가까운 내장 padding preset 선택: source {source_padding_hint:.2f} -> Padding_{selected_padding_variant}"
+                            )
+                        else:
+                            _log_console(
+                                f"  Selected nearest built-in padding preset: source {source_padding_hint:.2f} -> Padding_{selected_padding_variant}"
+                            )
                     source_atlas = assets["sdf_atlas"]
                     source_swizzled = parse_bool_flag(assets.get("sdf_swizzle"))
                     asset_process_swizzle = parse_bool_flag(
@@ -6899,6 +7132,7 @@ def replace_fonts_in_file(
                         reset_keywords = False
                         prune_raster_material = False
                         preserve_gradient_floor = False
+                        preserve_game_style = False
                         material_padding_ratio = 1.0
                         material_data = assets.get("sdf_materials")
                         if effective_force_raster and use_game_mat:
@@ -6918,6 +7152,31 @@ def replace_fonts_in_file(
                             replacement_padding = 0.0
                         if (
                             replacement_is_sdf
+                            and game_padding_for_material > 0
+                            and replacement_padding > 0
+                            and game_padding_for_material > replacement_padding
+                        ):
+                            warn_key = (
+                                str(assets_name),
+                                str(objname),
+                                int(pathid),
+                            )
+                            if warn_key not in replacement_padding_limit_warned:
+                                replacement_padding_limit_warned.add(warn_key)
+                                if lang == "ko":
+                                    _log_console(
+                                        "  경고: 원본 padding "
+                                        f"{game_padding_for_material:.2f}가 교체 padding {replacement_padding:.2f}보다 큽니다. "
+                                        "Material 보정을 적용하지만 외곽선/언더레이를 원본과 완전히 같게 복원하지 못할 수 있습니다."
+                                    )
+                                else:
+                                    _log_console(
+                                        "  Warning: source padding "
+                                        f"{game_padding_for_material:.2f} exceeds replacement padding {replacement_padding:.2f}. "
+                                        "Material correction is applied, but outline/underlay may not match the original exactly."
+                                    )
+                        if (
+                            replacement_is_sdf
                             and material_scale_by_padding
                             and game_padding_for_material > 0
                             and replacement_padding > 0
@@ -6928,17 +7187,34 @@ def replace_fonts_in_file(
                             if material_padding_ratio <= 0:
                                 material_padding_ratio = 1.0
                         if material_data and apply_replacement_material:
+                            preserve_game_style = (
+                                replacement_is_sdf and (not effective_force_raster)
+                            )
                             material_props = material_data.get("m_SavedProperties", {})
                             float_properties = material_props.get("m_Floats", [])
+                            color_properties = material_props.get("m_Colors", [])
                             for prop in float_properties:
                                 if not isinstance(prop, (list, tuple)) or len(prop) < 2:
                                     continue
                                 key = str(prop[0])
+                                if preserve_game_style and key in _MATERIAL_STYLE_FLOAT_KEYS:
+                                    continue
                                 try:
                                     value = float(prop[1])
                                 except (TypeError, ValueError):
                                     continue
                                 float_overrides[key] = value
+                            for prop in color_properties:
+                                if not isinstance(prop, (list, tuple)) or len(prop) < 2:
+                                    continue
+                                key = str(prop[0])
+                                if preserve_game_style and key in _MATERIAL_STYLE_COLOR_KEYS:
+                                    continue
+                                color_value = _color_value_to_dict(
+                                    prop[1],
+                                    {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
+                                )
+                                color_overrides[key] = color_value
                             if material_padding_ratio != 1.0:
                                 for key in material_padding_scale_keys:
                                     if key in float_overrides:
@@ -7004,6 +7280,8 @@ def replace_fonts_in_file(
                             "outline_ratio": outline_ratio,
                             "reset_keywords": reset_keywords,
                             "prune_raster_material": bool(prune_raster_material),
+                            "preserve_game_style": bool(preserve_game_style),
+                            "style_padding_scale_ratio": material_padding_ratio,
                             "preserve_gradient_floor": bool(
                                 preserve_gradient_floor
                             ),
@@ -8321,7 +8599,7 @@ def main_cli(lang: Language = "ko") -> None:
         exclude_ext_help = (
             "스캔 제외 확장자 목록 (콤마 구분, 예: \"resS,.resource\")"
         )
-        game_mat_help = "SDF 교체 시 게임 원본 Material 파라미터를 유지 (기본: 교체 Material 보정 적용)"
+        game_mat_help = "SDF 교체 시 게임 원본 Material 파라미터를 보정 없이 그대로 유지 (기본: 원본 스타일 유지 + atlas/padding 자동 보정)"
         force_raster_help = "SDF 교체 시 교체 폰트를 Raster 모드로 강제 (렌더 모드/Material 효과값 Raster 기준 적용)"
         game_line_metrics_help = "SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용)"
         outline_ratio_help = (
@@ -8367,7 +8645,7 @@ Examples:
         exclude_ext_help = (
             "Additional scan-excluded extensions (comma-separated, e.g. \"resS,.resource\")"
         )
-        game_mat_help = "Use original in-game Material parameters for SDF replacement (default: adjusted replacement material)"
+        game_mat_help = "Keep original in-game Material parameters without correction for SDF replacement (default: preserve original style with automatic atlas/padding correction)"
         force_raster_help = "Force replacement fonts into Raster mode for SDF replacement (render mode/material effects follow Raster behavior)"
         game_line_metrics_help = "Use original in-game line metrics for SDF replacement (default: adjusted replacement font metrics)"
         outline_ratio_help = (
@@ -8659,11 +8937,11 @@ Examples:
     else:
         if is_ko:
             _log_console(
-                "Material 모드: 교체 Material 보정(패딩 비율)을 기본 적용합니다."
+                "Material 모드: 게임 원본 Material 스타일을 유지하고 atlas/padding 차이를 자동 보정합니다."
             )
         else:
             _log_console(
-                "Material mode: using adjusted replacement material by default (padding ratio)."
+                "Material mode: preserving original in-game Material style with automatic atlas/padding correction."
             )
     if args.force_raster:
         if is_ko:
@@ -8932,6 +9210,7 @@ Examples:
     replace_ttf = not args.sdfonly
     replace_sdf = not args.ttfonly
     material_scale_by_padding = not args.use_game_material
+    prefer_builtin_padding_variants = mode in {"mulmaru", "nanumgothic"}
     if args.sdfonly and args.ttfonly:
         if is_ko:
             exit_with_error(
@@ -9375,6 +9654,7 @@ Examples:
                             ps5_swizzle=args.ps5_swizzle,
                             preview_export=args.preview_export,
                             preview_root=preview_root,
+                            prefer_builtin_padding_variants=prefer_builtin_padding_variants,
                             asset_file_index=asset_file_index,
                             deferred_texture_plans=deferred_texture_plans,
                             deferred_material_plans=deferred_material_plans,
@@ -9431,6 +9711,7 @@ Examples:
                                 ps5_swizzle=args.ps5_swizzle,
                                 preview_export=args.preview_export,
                                 preview_root=preview_root,
+                                prefer_builtin_padding_variants=prefer_builtin_padding_variants,
                                 asset_file_index=asset_file_index,
                                 deferred_texture_plans=deferred_texture_plans,
                                 deferred_material_plans=deferred_material_plans,
@@ -9525,6 +9806,7 @@ Examples:
                                         ps5_swizzle=args.ps5_swizzle,
                                         preview_export=args.preview_export,
                                         preview_root=preview_root,
+                                        prefer_builtin_padding_variants=prefer_builtin_padding_variants,
                                         asset_file_index=asset_file_index,
                                         deferred_texture_plans=deferred_texture_plans,
                                         deferred_material_plans=deferred_material_plans,
@@ -9639,6 +9921,7 @@ Examples:
                         ps5_swizzle=args.ps5_swizzle,
                         preview_export=args.preview_export,
                         preview_root=preview_root,
+                        prefer_builtin_padding_variants=prefer_builtin_padding_variants,
                         asset_file_index=asset_file_index,
                         deferred_texture_plans=deferred_texture_plans,
                         deferred_material_plans=deferred_material_plans,
