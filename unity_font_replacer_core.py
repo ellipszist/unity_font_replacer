@@ -7501,6 +7501,23 @@ def replace_fonts_in_file(
             )
             if not tmp_info.get("is_tmp"):
                 continue
+
+            # KR: TMP_SpriteAsset은 SDF 폰트가 아니므로 교체 대상에서 제외합니다.
+            #     spriteSheet, m_SpriteCharacterTable, spriteInfoList 중 하나라도 있으면 SpriteAsset입니다.
+            # EN: Skip TMP_SpriteAsset — not an SDF font.
+            #     Detected by presence of spriteSheet, m_SpriteCharacterTable, or spriteInfoList.
+            if (
+                parse_dict.get("spriteSheet") is not None
+                or isinstance(parse_dict.get("m_SpriteCharacterTable"), list)
+                or isinstance(parse_dict.get("spriteInfoList"), list)
+            ):
+                _log_debug(
+                    f"[replace_sdf] file={fn_without_path} assets={assets_name} "
+                    f"path_id={pathid} name={obj.peek_name()} "
+                    f"action=skip_sprite_asset"
+                )
+                continue
+
             glyph_count = int(tmp_info.get("glyph_count", 0) or 0)
             atlas_file_id = int(tmp_info.get("atlas_file_id", 0) or 0)
             atlas_path_id = int(tmp_info.get("atlas_path_id", 0) or 0)

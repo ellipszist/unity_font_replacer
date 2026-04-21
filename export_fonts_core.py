@@ -962,6 +962,15 @@ def is_tmp_font_asset(obj: Any) -> bool:
         )
         return False
 
+    # KR: TMP_SpriteAsset은 SDF 폰트가 아니므로 제외합니다.
+    # EN: Exclude TMP_SpriteAsset — not an SDF font.
+    if (
+        parse_dict.get("spriteSheet") is not None
+        or isinstance(parse_dict.get("m_SpriteCharacterTable"), list)
+        or isinstance(parse_dict.get("spriteInfoList"), list)
+    ):
+        return False
+
     unity_version_hint = getattr(
         getattr(obj, "assets_file", None), "unity_version", None
     )
