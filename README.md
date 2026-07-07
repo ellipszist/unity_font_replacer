@@ -46,9 +46,12 @@ unity_font_replacer_ko.exe
 
 :: 게임 경로 지정 + Mulmaru 일괄 교체
 unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --mulmaru
+
+:: 내가 가진 TTF로 TTF/SDF 전체 교체 (SDF는 자동 생성)
+unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.ttf"
 ```
 
-- 기본 작업 모드 인자(`--parse`, `--mulmaru`, `--nanumgothic`, `--list`, `--preview-export`)는 **하나만** 사용할 수 있습니다.
+- 기본 작업 모드 인자(`--parse`, `--mulmaru`, `--nanumgothic`, `--font`, `--list`, `--preview-export`)는 **하나만** 사용할 수 있습니다.
 - EXE를 대화형으로 실행하면 종료 전 엔터 입력을 기다리고, 명령줄 인자를 준 CLI 실행은 작업 완료 후 바로 종료됩니다.
 
 ### 명령줄 옵션
@@ -60,6 +63,7 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --mulmaru
 | `--gamepath <경로>` | 게임 루트 경로 또는 `_Data` 폴더 경로 |
 | `--parse` | 게임 폰트 정보를 JSON 파일로 출력 |
 | `--list <JSON파일>` | JSON 파일 기준 개별 폰트 교체 |
+| `--font <폰트/TTF/OTF>` | 지정 폰트로 전체 교체 (TTF/OTF이면 SDF 대상 자동 생성) |
 | `--verbose` | 콘솔은 현재 수준으로 유지하고, `verbose.txt`에 상세 DEBUG 로그(경로/Unity 버전/파일별/폰트별)를 저장 |
 
 - `--verbose`를 사용하면 실행 파일(또는 스크립트) 기준 폴더에 `verbose.txt`가 생성되며, 타임스탬프/로그 레벨이 포함된 상세 추적 로그가 기록됩니다.
@@ -82,6 +86,7 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --mulmaru
 | `--force-raster` | SDF 교체를 Raster 기준으로 강제 (렌더 모드 + Material 효과값 Raster 보정) |
 | `--use-game-line-metrics` | 게임 원본 줄 간격 메트릭 사용 (pointSize는 교체값 유지) |
 | `--outline-ratio <float>` | 현재 선택된 Material 기준 `_OutlineWidth`, `_OutlineSoftness`에 배율 적용 (기본 `1.0`) |
+| `--charset <파일/문자열>` | TTF/OTF에서 SDF 자동 생성 시 사용할 글자셋 지정 (기본 `CharList_3911.txt`) |
 
 #### 저장
 
@@ -117,6 +122,12 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --sdfonly
 
 :: JSON 기반 개별 교체
 unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --list font_map.json
+
+:: 사용자 TTF로 전체 교체
+unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\Galmuri14.ttf"
+
+:: 번역문에서 추출한 글자셋으로 사용자 TTF SDF 생성
+unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\Galmuri14.ttf" --charset "D:\Fonts\charset.txt"
 ```
 
 **파싱 / 스캔:**
@@ -261,6 +272,8 @@ JSON 예시 (`--ps5-swizzle` 사용, SDF):
 | SDF Atlas | `Mulmaru SDF Atlas.png`, `Mulmaru Raster Atlas.png` |
 | Material | `NGothic Material.json` |
 
+SDF 항목의 `Replace_to`에 `.ttf` 또는 `.otf` 파일 경로를 넣으면, 대상 게임 SDF 폰트의 `m_AtlasPadding` 값에 맞춰 임시 SDF/Raster 세트를 자동 생성한 뒤 교체합니다.
+
 ---
 
 ## PS5 검증 워크플로 (--preview-export)
@@ -344,11 +357,11 @@ export_fonts_ko.exe
 | 파일 | 필수 여부 |
 |------|-----------|
 | `폰트이름.ttf` 또는 `.otf` | 필수 |
-| `폰트이름 SDF.json` / `Raster.json` / `.json` | SDF 교체 시 필요 |
-| `폰트이름 SDF Atlas.png` / `Raster Atlas.png` / `Atlas.png` | SDF 교체 시 필요 |
+| `폰트이름 SDF.json` / `Raster.json` / `.json` | 선택 (없으면 TTF/OTF에서 자동 생성 가능) |
+| `폰트이름 SDF Atlas.png` / `Raster Atlas.png` / `Atlas.png` | 선택 (없으면 TTF/OTF에서 자동 생성 가능) |
 | `폰트이름 SDF Material.json` / `Raster Material.json` / `Material.json` | 선택 |
 
-SDF 데이터가 없으면 아래 `make_sdf.exe`로 먼저 생성하거나 `export_fonts_ko.exe`로 추출할 수 있습니다.
+SDF 데이터가 없으면 `--font` 또는 `--list`의 `Replace_to`에 TTF/OTF를 지정해 자동 생성할 수 있습니다. 별도 파일로 보관하고 싶을 때는 아래 `make_sdf.exe`를 사용하세요.
 
 ---
 
@@ -421,6 +434,10 @@ python export_fonts_ko.py "D:\MyGame"
 - 기본 SDF 교체는 게임 원본 Material 스타일을 유지하고 atlas/padding 차이만 자동 보정합니다.
 - atlas/padding 보정 없이 게임 원본 Material 파라미터를 그대로 쓰려면 `--use-game-material`을 사용하세요.
 - `--nanumgothic` / `--mulmaru` 일괄 교체는 원본 `m_AtlasPadding`에 가장 가까운 내장 preset(`Padding_5` / `Padding_7` / `Padding_15`)을 자동 선택합니다.
+- `--font <TTF/OTF>` 또는 JSON `Replace_to`의 TTF/OTF 지정은 원본 `m_AtlasPadding` 값에 맞춰 임시 SDF/Raster atlas를 자동 생성합니다.
+- 자동 생성은 기본 문자셋 `CharList_3911.txt`, atlas `4096x4096`, point size 자동 탐색을 사용합니다.
+- 번역문에 기본 문자셋에 없는 한글/한자/특수문자가 있으면 `--charset <파일>`로 실제 사용 문자 목록을 지정하세요. JSON 항목별로는 `Charset` 또는 `charset` 필드를 사용할 수 있습니다.
+- 글리프가 0개인 TMP fallback FontAsset도 atlas 참조가 있으면 SDF 교체 대상에 포함합니다. 일부 게임의 `* SDF - Fallback` 빈 에셋이 남아 누락 글자가 빈칸으로 떨어지는 문제를 줄이기 위한 처리입니다.
 - 원본 padding이 선택된 교체 atlas padding보다 크면, Material 보정은 계속 적용되지만 외곽선/언더레이가 원본과 완전히 같지 않을 수 있다는 경고를 출력합니다.
 - `--outline-ratio`는 현재 선택된 Material 기준값을 1.0으로 보고 `_OutlineWidth`, `_OutlineSoftness`에 추가 배율을 곱합니다.
 - `--outline-ratio 1.25`는 외곽선을 25% 두껍게, `--outline-ratio 0.6`은 더 얇게 만듭니다.
@@ -446,7 +463,7 @@ python export_fonts_ko.py "D:\MyGame"
 
 ### 일반
 
-- 기본 작업 모드 인자(`--parse`, `--mulmaru`, `--nanumgothic`, `--list`, `--preview-export`)는 하나만 사용할 수 있습니다.
+- 기본 작업 모드 인자(`--parse`, `--mulmaru`, `--nanumgothic`, `--font`, `--list`, `--preview-export`)는 하나만 사용할 수 있습니다.
 - `TypeTreeGeneratorAPI`가 TMP(FontAsset) 파싱/교체에 필요합니다.
 - 대화형 입력에서 경로 앞뒤 따옴표가 중복되어도 자동으로 정리해 처리합니다.
 - 게임 파일 수정 전 백업을 권장합니다.

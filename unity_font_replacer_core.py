@@ -2349,6 +2349,7 @@ _PRIMARY_MODE_ARGS: tuple[tuple[str, str], ...] = (
     ("parse", "--parse"),
     ("mulmaru", "--mulmaru"),
     ("nanumgothic", "--nanumgothic"),
+    ("font", "--font"),
     ("list", "--list"),
     ("preview_export", "--preview-export"),
 )
@@ -2373,7 +2374,7 @@ def _mode_uses_scan_jobs(mode: str | None) -> bool:
     """KR: 해당 모드가 스캔 작업을 사용하는지 여부를 반환한다.
     EN: Return whether the given mode uses scan jobs.
     """
-    return mode in {"parse", "mulmaru", "nanumgothic", "preview_export"}
+    return mode in {"parse", "mulmaru", "nanumgothic", "font", "preview_export"}
 
 
 def _should_pause_before_exit(*, interactive_session: bool = False) -> bool:
@@ -4091,13 +4092,23 @@ def build_replacement_lookup(
         except (TypeError, ValueError):
             continue
 
-        normalized_target = normalize_font_name(str(replace_to))
-        lookup[(type_name_raw, file_name_raw, assets_name_raw, path_id)] = (
-            normalized_target
-        )
+        lookup[(type_name_raw, file_name_raw, assets_name_raw, path_id)] = str(
+            replace_to
+        ).strip()
         files_to_process.add(file_name_raw)
 
     return lookup, files_to_process
+
+
+def load_replacement_mapping_file(json_file: str) -> dict[str, JsonDict]:
+    with open(json_file, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    if not isinstance(loaded, dict):
+        raise ValueError("JSON root must be an object (dict).")
+    fonts = loaded.get("fonts")
+    if isinstance(fonts, dict):
+        return cast(dict[str, JsonDict], fonts)
+    return cast(dict[str, JsonDict], loaded)
 
 
 def debug_parse_enabled() -> bool:
@@ -5752,6 +5763,16 @@ def convert_glyphs_old_to_new(
     return glyph_table, char_table
 
 
+def _default_font_weight_table() -> list[JsonDict]:
+    return [
+        {
+            "regularTypeface": {"m_FileID": 0, "m_PathID": 0},
+            "italicTypeface": {"m_FileID": 0, "m_PathID": 0},
+        }
+        for _ in range(10)
+    ]
+
+
 def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
     """KR: SDF 교체 데이터를 신형 TMP 형식으로 정규화해 반환합니다.
     deep_copy=True면 입력 데이터를 복사해 원본 변형을 방지합니다.
@@ -5799,7 +5820,9 @@ def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
         # EN: Fills missing weight tables in old-format data with defaults.
         if "m_FontWeightTable" not in result:
             font_weights = result.get("fontWeights", [])
-            result["m_FontWeightTable"] = font_weights if font_weights else []
+            result["m_FontWeightTable"] = (
+                font_weights if font_weights else _default_font_weight_table()
+            )
 
     # KR: 정규화 후 반복 사용을 위해 숫자 타입/기본값을 한 번만 정리합니다.
     # EN: Cleans up numeric types/defaults once after normalization for repeated use.
@@ -5812,7 +5835,10 @@ def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
     result.setdefault("m_AtlasRenderMode", 4118)
     result.setdefault("m_UsedGlyphRects", [])
     result.setdefault("m_FreeGlyphRects", [])
-    result.setdefault("m_FontWeightTable", [])
+    if not isinstance(result.get("m_FontWeightTable"), list) or not result.get(
+        "m_FontWeightTable"
+    ):
+        result["m_FontWeightTable"] = _default_font_weight_table()
 
     face_info = result.get("m_FaceInfo")
     if isinstance(face_info, dict):
@@ -6073,7 +6099,16 @@ def _scan_fonts_from_env(
                     if atlas_file_id != 0 and atlas_path_id == 0:
                         continue
                     if glyph_count == 0:
-                        continue
+                        is_sprite_asset = (
+                            parse_dict.get("spriteSheet") is not None
+                            or isinstance(parse_dict.get("m_SpriteCharacterTable"), list)
+                            or isinstance(parse_dict.get("m_SpriteGlyphTable"), list)
+                            or isinstance(parse_dict.get("spriteInfoList"), list)
+                        )
+                        if is_sprite_asset:
+                            continue
+                        if atlas_file_id == 0 and atlas_path_id == 0:
+                            continue
                 except Exception:
                     if lang == "ko":
                         debug_parse_log(
@@ -6691,6 +6726,22 @@ def _select_builtin_bulk_padding_variant(
     )
 
 
+def select_replacement_asset_padding(
+    replacement_font: str,
+    source_padding_hint: float | int | None,
+    selected_builtin_padding: int | None,
+) -> int | None:
+    if selected_builtin_padding is not None:
+        return int(selected_builtin_padding)
+    if _resolve_ttf_source_path(str(replacement_font)) is None:
+        return None
+    try:
+        numeric_padding = int(round(float(source_padding_hint or 0)))
+    except Exception:
+        numeric_padding = 0
+    return numeric_padding if numeric_padding > 0 else 7
+
+
 def _iter_kr_asset_roots(
     kr_assets: str,
     padding_variant: int | None = None,
@@ -6700,6 +6751,150 @@ def _iter_kr_asset_roots(
         roots.append(os.path.join(kr_assets, f"Padding_{int(padding_variant)}"))
     roots.append(kr_assets)
     return roots
+
+
+def _candidate_font_file_paths(source: str, script_dir: str) -> list[str]:
+    raw = strip_wrapping_quotes_repeated(str(source))
+    normalized = normalize_font_name(raw)
+    source_names = _dedupe_preserve_order_str([raw, normalized])
+    roots = _dedupe_preserve_order_str(
+        [
+            "",
+            os.getcwd(),
+            script_dir,
+            os.path.join(script_dir, "KR_ASSETS"),
+        ]
+    )
+    candidates: list[str] = []
+
+    for name in source_names:
+        if not name:
+            continue
+        direct_names = [name]
+        base, ext = os.path.splitext(name)
+        if ext.lower() not in {".ttf", ".otf"}:
+            direct_names.extend([f"{name}.ttf", f"{name}.otf"])
+        for direct_name in direct_names:
+            if os.path.isabs(direct_name):
+                candidates.append(direct_name)
+                continue
+            for root in roots:
+                if root:
+                    candidates.append(os.path.join(root, direct_name))
+                else:
+                    candidates.append(direct_name)
+
+    return _dedupe_preserve_order_str(candidates)
+
+
+def _resolve_ttf_source_path(source: str, script_dir: str | None = None) -> str | None:
+    if script_dir is None:
+        script_dir = get_script_dir()
+    for candidate in _candidate_font_file_paths(source, script_dir):
+        if not os.path.exists(candidate):
+            continue
+        if os.path.splitext(candidate)[1].lower() not in {".ttf", ".otf"}:
+            continue
+        return os.path.abspath(candidate)
+    return None
+
+
+def resolve_charset_source(
+    charset_source: str | None,
+    script_dir: str | None = None,
+) -> str:
+    """KR: TTF->SDF 생성에 사용할 글자셋 인자를 파일 경로 또는 리터럴 문자열로 정규화합니다.
+    EN: Normalize the charset argument for TTF-to-SDF generation as a path or literal text.
+    """
+    if script_dir is None:
+        script_dir = get_script_dir()
+    if not charset_source:
+        return os.path.join(script_dir, "CharList_3911.txt")
+
+    raw = strip_wrapping_quotes_repeated(str(charset_source)).strip()
+    if not raw:
+        return os.path.join(script_dir, "CharList_3911.txt")
+
+    candidates = [raw]
+    if not os.path.isabs(raw):
+        candidates.extend(
+            [
+                os.path.join(os.getcwd(), raw),
+                os.path.join(script_dir, raw),
+            ]
+        )
+    for candidate in _dedupe_preserve_order_str(candidates):
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+    return raw
+
+
+@lru_cache(maxsize=32)
+def _load_generated_font_assets_cached(
+    script_dir: str,
+    ttf_path: str,
+    prefer_raster: bool = False,
+    atlas_padding: int = 7,
+    charset_source: str | None = None,
+) -> JsonDict:
+    try:
+        import make_sdf as make_sdf_module
+    except Exception as e:
+        _log_warning(f"[make_sdf] import failed: {e!r}")
+        return {}
+
+    try:
+        with open(ttf_path, "rb") as f:
+            ttf_data = f.read()
+    except Exception as e:
+        _log_warning(f"[make_sdf] failed to read TTF: {ttf_path} ({e!r})")
+        return {}
+
+    try:
+        charset_text = make_sdf_module._load_charset_text(
+            resolve_charset_source(charset_source, script_dir)
+        )
+        unicodes = make_sdf_module._text_to_unicodes(charset_text)
+    except Exception as e:
+        _log_warning(f"[make_sdf] failed to load charset: {e!r}")
+        return {}
+
+    if not unicodes:
+        _log_warning("[make_sdf] charset is empty.")
+        return {}
+
+    padding = max(1, int(atlas_padding or 7))
+    render_mode = "raster" if prefer_raster else "sdf"
+    generated = make_sdf_module.generate_sdf_assets_from_ttf(
+        ttf_data=ttf_data,
+        font_name=os.path.splitext(os.path.basename(ttf_path))[0],
+        unicodes=unicodes,
+        point_size=0,
+        atlas_padding=padding,
+        atlas_width=4096,
+        atlas_height=4096,
+        render_mode=render_mode,
+        log_fn=_log_debug,
+    )
+    if not isinstance(generated, dict):
+        _log_warning(f"[make_sdf] generation failed: {ttf_path}")
+        return {}
+
+    sdf_data = generated.get("sdf_data")
+    sdf_data_normalized = generated.get("sdf_data_normalized")
+    if isinstance(sdf_data, dict) and not isinstance(sdf_data_normalized, dict):
+        sdf_data_normalized = normalize_sdf_data(sdf_data, deep_copy=True)
+
+    return {
+        "ttf_data": generated.get("ttf_data") or ttf_data,
+        "sdf_data": sdf_data,
+        "sdf_data_normalized": sdf_data_normalized,
+        "sdf_atlas": generated.get("sdf_atlas"),
+        "sdf_materials": generated.get("sdf_materials"),
+        "sdf_swizzle": False,
+        "sdf_process_swizzle": False,
+        "padding_variant": padding,
+    }
 
 
 def _find_replacement_sdf_atlas_path(
@@ -6886,20 +7081,69 @@ def load_font_assets(
     font_name: str,
     prefer_raster: bool = False,
     padding_variant: int | None = None,
+    generate_sdf: bool = True,
+    charset_source: str | None = None,
 ) -> JsonDict:
     """KR: 지정 폰트명의 교체용 리소스(TTF/SDF/Atlas/Material)를 로드합니다.
     EN: Loads replacement resources (TTF/SDF/Atlas/Material) for the specified font name.
     """
-    normalized = normalize_font_name(font_name)
+    script_dir = get_script_dir()
+    source = strip_wrapping_quotes_repeated(str(font_name))
+    normalized = normalize_font_name(source)
     cached_assets = _load_font_assets_cached(
-        get_script_dir(),
+        script_dir,
         normalized,
         bool(prefer_raster),
         int(padding_variant) if padding_variant is not None else None,
     )
+    ttf_path = _resolve_ttf_source_path(source, script_dir)
+    explicit_ttf_source = (
+        ttf_path is not None
+        and os.path.splitext(source)[1].lower() in {".ttf", ".otf"}
+    )
+    ttf_data = cached_assets["ttf_data"]
+    if ttf_data is None and ttf_path:
+        try:
+            with open(ttf_path, "rb") as f:
+                ttf_data = f.read()
+        except Exception:
+            ttf_data = None
+
+    generated_assets: JsonDict = {}
+    if (
+        generate_sdf
+        and ttf_path
+        and (
+            explicit_ttf_source
+            or charset_source
+            or not (cached_assets.get("sdf_data") and cached_assets.get("sdf_atlas"))
+        )
+    ):
+        generated_assets = _load_generated_font_assets_cached(
+            script_dir,
+            ttf_path,
+            bool(prefer_raster),
+            int(padding_variant) if padding_variant is not None else 7,
+            resolve_charset_source(charset_source, script_dir),
+        )
+
+    if generated_assets.get("sdf_data") and generated_assets.get("sdf_atlas"):
+        return {
+            "ttf_data": generated_assets.get("ttf_data") or ttf_data,
+            "sdf_data": generated_assets.get("sdf_data"),
+            "sdf_data_normalized": generated_assets.get("sdf_data_normalized"),
+            "sdf_atlas": generated_assets.get("sdf_atlas"),
+            "sdf_materials": generated_assets.get("sdf_materials"),
+            "sdf_swizzle": generated_assets.get("sdf_swizzle"),
+            "sdf_process_swizzle": bool(
+                generated_assets.get("sdf_process_swizzle", False)
+            ),
+            "padding_variant": generated_assets.get("padding_variant"),
+        }
+
     atlas = cached_assets["sdf_atlas"]
     return {
-        "ttf_data": cached_assets["ttf_data"],
+        "ttf_data": ttf_data,
         "sdf_data": cached_assets["sdf_data"],
         "sdf_data_normalized": cached_assets.get("sdf_data_normalized"),
         # KR: 캐시된 atlas 객체를 재사용하여 교체 시 이미지 중복 생성을 방지합니다.
@@ -7239,6 +7483,7 @@ def replace_fonts_in_file(
     preview_export: bool = False,
     preview_root: str | None = None,
     prefer_builtin_padding_variants: bool = False,
+    charset_source: str | None = None,
     asset_file_index: dict[str, Any] | None = None,
     deferred_texture_plans: dict[str, dict[str, Any]] | None = None,
     deferred_material_plans: dict[str, dict[str, Any]] | None = None,
@@ -7428,7 +7673,7 @@ def replace_fonts_in_file(
             )
 
             if replacement_font:
-                assets = load_font_assets(replacement_font)
+                assets = load_font_assets(replacement_font, generate_sdf=False)
                 if assets["ttf_data"]:
                     font = _safe_parse_as_object(obj)
                     _raw_font_data = getattr(font, "m_FontData", b"")
@@ -7527,7 +7772,8 @@ def replace_fonts_in_file(
             if atlas_file_id != 0 and atlas_path_id == 0:
                 continue
             if glyph_count == 0:
-                continue
+                if atlas_file_id == 0 and atlas_path_id == 0:
+                    continue
 
             objname = obj.peek_name()
             replacement_font = replacement_lookup.get(
@@ -7623,10 +7869,20 @@ def replace_fonts_in_file(
                     if prefer_builtin_padding_variants
                     else None
                 )
+                replacement_asset_padding = select_replacement_asset_padding(
+                    replacement_font,
+                    source_padding_hint,
+                    selected_padding_variant,
+                )
                 assets = load_font_assets(
                     replacement_font,
                     prefer_raster=effective_force_raster,
-                    padding_variant=selected_padding_variant,
+                    padding_variant=replacement_asset_padding,
+                    charset_source=(
+                        replacement_meta.get("Charset")
+                        or replacement_meta.get("charset")
+                        or charset_source
+                    ),
                 )
                 if assets["sdf_data"] and assets["sdf_atlas"]:
                     if lang == "ko":
@@ -9659,12 +9915,14 @@ def main_cli(lang: Language = "ko") -> None:
   %(prog)s --gamepath "C:/path/to/game" --preview-export
   %(prog)s --gamepath "C:/path/to/game" --mulmaru
   %(prog)s --gamepath "C:/path/to/game" --nanumgothic --sdfonly
+  %(prog)s --gamepath "C:/path/to/game" --font "D:/Fonts/MyFont.ttf"
   %(prog)s --gamepath "C:/path/to/game" --list font_map.json
         """
         gamepath_help = "게임의 루트 경로 (예: C:/path/to/game)"
         parse_help = "폰트 정보를 JSON으로 출력"
         mulmaru_help = "모든 폰트를 Mulmaru로 일괄 교체"
         nanum_help = "모든 폰트를 NanumGothic으로 일괄 교체"
+        font_help = "지정한 폰트 이름/TTF/OTF로 모든 폰트를 일괄 교체"
         sdf_help = "SDF 폰트만 교체"
         ttf_help = "TTF 폰트만 교체"
         list_help = "JSON 파일을 읽어서 폰트 교체"
@@ -9672,6 +9930,7 @@ def main_cli(lang: Language = "ko") -> None:
         exclude_ext_help = (
             "스캔 제외 확장자 목록 (콤마 구분, 예: \"resS,.resource\")"
         )
+        charset_help = "TTF/OTF에서 SDF 자동 생성 시 사용할 글자셋 파일 또는 직접 문자열 (기본: CharList_3911.txt)"
         game_mat_help = "SDF 교체 시 게임 원본 Material 파라미터를 보정 없이 그대로 유지 (기본: 원본 스타일 유지 + atlas/padding 자동 보정)"
         force_raster_help = "SDF 교체 시 교체 폰트를 Raster 모드로 강제 (렌더 모드/Material 효과값 Raster 기준 적용)"
         game_line_metrics_help = "SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용)"
@@ -9703,12 +9962,14 @@ Examples:
   %(prog)s --gamepath "C:/path/to/game" --preview-export
   %(prog)s --gamepath "C:/path/to/game" --mulmaru
   %(prog)s --gamepath "C:/path/to/game" --nanumgothic --sdfonly
+  %(prog)s --gamepath "C:/path/to/game" --font "D:/Fonts/MyFont.ttf"
   %(prog)s --gamepath "C:/path/to/game" --list font_map.json
         """
         gamepath_help = "Game root path (e.g. C:/path/to/game)"
         parse_help = "Export font info to JSON"
         mulmaru_help = "Replace all fonts with Mulmaru"
         nanum_help = "Replace all fonts with NanumGothic"
+        font_help = "Bulk replace all fonts with this font name/TTF/OTF"
         sdf_help = "Replace SDF fonts only"
         ttf_help = "Replace TTF fonts only"
         list_help = "Replace fonts using a JSON file"
@@ -9718,6 +9979,7 @@ Examples:
         exclude_ext_help = (
             "Additional scan-excluded extensions (comma-separated, e.g. \"resS,.resource\")"
         )
+        charset_help = "Charset file or literal characters for TTF/OTF-to-SDF auto-generation (default: CharList_3911.txt)"
         game_mat_help = "Keep original in-game Material parameters without correction for SDF replacement (default: preserve original style with automatic atlas/padding correction)"
         force_raster_help = "Force replacement fonts into Raster mode for SDF replacement (render mode/material effects follow Raster behavior)"
         game_line_metrics_help = "Use original in-game line metrics for SDF replacement (default: adjusted replacement font metrics)"
@@ -9743,6 +10005,7 @@ Examples:
     parser.add_argument("--parse", action="store_true", help=parse_help)
     parser.add_argument("--mulmaru", action="store_true", help=mulmaru_help)
     parser.add_argument("--nanumgothic", action="store_true", help=nanum_help)
+    parser.add_argument("--font", type=str, metavar="FONT", help=font_help)
     parser.add_argument("--sdfonly", action="store_true", help=sdf_help)
     parser.add_argument("--ttfonly", action="store_true", help=ttf_help)
     parser.add_argument("--list", type=str, metavar="JSON_FILE", help=list_help)
@@ -9752,6 +10015,7 @@ Examples:
     parser.add_argument(
         "--exclude-ext", action="append", metavar="EXTS", help=exclude_ext_help
     )
+    parser.add_argument("--charset", type=str, metavar="PATH_OR_TEXT", help=charset_help)
     parser.add_argument("--use-game-material", action="store_true", help=game_mat_help)
     parser.add_argument("--force-raster", action="store_true", help=force_raster_help)
     parser.add_argument("--use-game-mat", action="store_true", help=argparse.SUPPRESS)
@@ -9821,8 +10085,12 @@ Examples:
         args.gamepath = strip_wrapping_quotes_repeated(args.gamepath)
     if isinstance(args.list, str):
         args.list = strip_wrapping_quotes_repeated(args.list)
+    if isinstance(args.charset, str):
+        args.charset = strip_wrapping_quotes_repeated(args.charset)
     if isinstance(args.output_only, str):
         args.output_only = strip_wrapping_quotes_repeated(args.output_only)
+    if isinstance(args.font, str):
+        args.font = strip_wrapping_quotes_repeated(args.font)
     if isinstance(getattr(args, "exclude_ext", None), list):
         args.exclude_ext = [
             strip_wrapping_quotes_repeated(str(item))
@@ -9891,6 +10159,12 @@ Examples:
             exit_with_error("--exclude-ext 값이 비어 있습니다.", lang=lang)
         else:
             exit_with_error("--exclude-ext values are empty.", lang=lang)
+    if args.charset:
+        charset_resolved = resolve_charset_source(args.charset, get_script_dir())
+        if is_ko:
+            _log_info(f"SDF 생성 글자셋: {charset_resolved}")
+        else:
+            _log_info(f"SDF generation charset: {charset_resolved}")
 
     if args.split_save_force and args.oneshot_save_force:
         if is_ko:
@@ -10116,6 +10390,8 @@ Examples:
         mode = "mulmaru"
     elif args.nanumgothic:
         mode = "nanumgothic"
+    elif args.font:
+        mode = "font"
     elif args.list:
         mode = "list"
     elif args.preview_export:
@@ -10283,7 +10559,12 @@ Examples:
     replace_ttf = not args.sdfonly
     replace_sdf = not args.ttfonly
     material_scale_by_padding = not args.use_game_material
-    prefer_builtin_padding_variants = mode in {"mulmaru", "nanumgothic"}
+    font_mode_builtin = (
+        mode == "font"
+        and normalize_font_name(str(getattr(args, "font", ""))).strip().lower()
+        in {"mulmaru", "nanumgothic"}
+    )
+    prefer_builtin_padding_variants = mode in {"mulmaru", "nanumgothic"} or font_mode_builtin
     if args.sdfonly and args.ttfonly:
         if is_ko:
             exit_with_error(
@@ -10488,6 +10769,28 @@ Examples:
             _log_console(f"발견된 폰트: TTF {ttf_count}개, SDF {sdf_count}개")
         else:
             _log_console(f"Found fonts: TTF {ttf_count}, SDF {sdf_count}")
+    elif mode == "font":
+        if is_ko:
+            _log_console(f"{args.font} 폰트로 일괄 교체합니다...")
+        else:
+            _log_console(f"Bulk replacing with {args.font}...")
+        replacements = create_batch_replacements(
+            game_path,
+            str(args.font),
+            replace_ttf,
+            replace_sdf,
+            target_files=selected_files if selected_files else None,
+            exclude_exts=excluded_exts if excluded_exts else None,
+            scan_jobs=args.scan_jobs,
+            lang=lang,
+            ps5_swizzle=args.ps5_swizzle,
+        )
+        ttf_count = sum(1 for v in replacements.values() if v["Type"] == "TTF")
+        sdf_count = sum(1 for v in replacements.values() if v["Type"] == "SDF")
+        if is_ko:
+            _log_console(f"발견된 폰트: TTF {ttf_count}개, SDF {sdf_count}개")
+        else:
+            _log_console(f"Found fonts: TTF {ttf_count}, SDF {sdf_count}")
     elif mode == "list":
         if isinstance(args.list, str):
             args.list = strip_wrapping_quotes_repeated(args.list)
@@ -10515,14 +10818,13 @@ Examples:
             _log_console(f"'{args.list}' 파일을 읽어서 교체합니다...")
         else:
             _log_console(f"Replacing using '{args.list}'...")
-        with open(args.list, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        if not isinstance(loaded, dict):
+        try:
+            replacements = load_replacement_mapping_file(args.list)
+        except ValueError:
             if is_ko:
                 exit_with_error("JSON 루트는 객체(dict)여야 합니다.", lang=lang)
             else:
                 exit_with_error("JSON root must be an object (dict).", lang=lang)
-        replacements = cast(dict[str, JsonDict], loaded)
 
     if replacements is None:
         if is_ko:
@@ -10728,6 +11030,7 @@ Examples:
                             preview_export=args.preview_export,
                             preview_root=preview_root,
                             prefer_builtin_padding_variants=prefer_builtin_padding_variants,
+                            charset_source=args.charset,
                             asset_file_index=asset_file_index,
                             deferred_texture_plans=deferred_texture_plans,
                             deferred_material_plans=deferred_material_plans,
@@ -10785,6 +11088,7 @@ Examples:
                                 preview_export=args.preview_export,
                                 preview_root=preview_root,
                                 prefer_builtin_padding_variants=prefer_builtin_padding_variants,
+                                charset_source=args.charset,
                                 asset_file_index=asset_file_index,
                                 deferred_texture_plans=deferred_texture_plans,
                                 deferred_material_plans=deferred_material_plans,
@@ -10880,6 +11184,7 @@ Examples:
                                         preview_export=args.preview_export,
                                         preview_root=preview_root,
                                         prefer_builtin_padding_variants=prefer_builtin_padding_variants,
+                                        charset_source=args.charset,
                                         asset_file_index=asset_file_index,
                                         deferred_texture_plans=deferred_texture_plans,
                                         deferred_material_plans=deferred_material_plans,
@@ -10995,6 +11300,7 @@ Examples:
                         preview_export=args.preview_export,
                         preview_root=preview_root,
                         prefer_builtin_padding_variants=prefer_builtin_padding_variants,
+                        charset_source=args.charset,
                         asset_file_index=asset_file_index,
                         deferred_texture_plans=deferred_texture_plans,
                         deferred_material_plans=deferred_material_plans,

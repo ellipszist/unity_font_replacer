@@ -46,9 +46,12 @@ unity_font_replacer_en.exe
 
 :: Set game path + bulk replace with Mulmaru
 unity_font_replacer_en.exe --gamepath "C:/path/to/game" --mulmaru
+
+:: Replace all TTF/SDF fonts from your TTF (SDF is auto-generated)
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.ttf"
 ```
 
-- Primary mode arguments (`--parse`, `--mulmaru`, `--nanumgothic`, `--list`, `--preview-export`) are **mutually exclusive**.
+- Primary mode arguments (`--parse`, `--mulmaru`, `--nanumgothic`, `--font`, `--list`, `--preview-export`) are **mutually exclusive**.
 - Interactive EXE runs wait for Enter before exit; explicit CLI invocations exit immediately when the job finishes.
 
 ### Command Line Options
@@ -60,6 +63,7 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --mulmaru
 | `--gamepath <path>` | Game root path or `_Data` folder path |
 | `--parse` | Export font info to JSON |
 | `--list <JSON>` | Replace fonts from a JSON mapping |
+| `--font <font/TTF/OTF>` | Bulk replace with this font (SDF targets are auto-generated for TTF/OTF) |
 | `--verbose` | Keep concise console logs and save detailed DEBUG logs (path/Unity version/per-file/per-font) to `verbose.txt` |
 
 - With `--verbose`, a `verbose.txt` file is created next to the executable (or script) and includes timestamped, level-tagged detailed trace logs.
@@ -82,6 +86,7 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --mulmaru
 | `--force-raster` | Force SDF replacement into Raster behavior (render mode + material effect neutralization) |
 | `--use-game-line-metrics` | Keep in-game line metrics (pointSize still follows replacement font) |
 | `--outline-ratio <float>` | Apply a multiplier to `_OutlineWidth` and `_OutlineSoftness` on the currently selected Material baseline (default `1.0`) |
+| `--charset <file/text>` | Charset for TTF/OTF-to-SDF auto-generation (default `CharList_3911.txt`) |
 
 #### Save / Output
 
@@ -117,6 +122,12 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --sdfonly
 
 :: Replace using JSON mapping
 unity_font_replacer_en.exe --gamepath "C:/path/to/game" --list font_map.json
+
+:: Replace all fonts with a custom TTF
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\Galmuri14.ttf"
+
+:: Generate SDF from a custom TTF using a charset extracted from translated text
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\Galmuri14.ttf" --charset "D:\Fonts\charset.txt"
 ```
 
 **Parsing / Scan:**
@@ -261,6 +272,8 @@ If `Replace_to` is empty, that font is skipped.
 | SDF Atlas | `Mulmaru SDF Atlas.png`, `Mulmaru Raster Atlas.png` |
 | Material | `NGothic Material.json` |
 
+If an SDF entry's `Replace_to` points to a `.ttf` or `.otf`, the tool auto-generates a temporary SDF/Raster set using that target font's `m_AtlasPadding`, then applies the replacement.
+
 ---
 
 ## PS5 Validation Workflow (--preview-export)
@@ -344,11 +357,11 @@ Add these files under `KR_ASSETS`:
 | File | Required |
 |------|----------|
 | `FontName.ttf` or `.otf` | Required |
-| `FontName SDF.json` / `Raster.json` / `.json` | Required for SDF replacement |
-| `FontName SDF Atlas.png` / `Raster Atlas.png` / `Atlas.png` | Required for SDF replacement |
+| `FontName SDF.json` / `Raster.json` / `.json` | Optional (can be auto-generated from TTF/OTF) |
+| `FontName SDF Atlas.png` / `Raster Atlas.png` / `Atlas.png` | Optional (can be auto-generated from TTF/OTF) |
 | `FontName SDF Material.json` / `Raster Material.json` / `Material.json` | Optional |
 
-If SDF data is missing, generate it first with `make_sdf.exe` below or extract it with `export_fonts_en.exe`.
+If SDF data is missing, use `--font` or set a JSON `Replace_to` field to a TTF/OTF path for automatic generation. Use `make_sdf.exe` below when you want to keep generated files.
 
 ---
 
@@ -419,6 +432,10 @@ python export_fonts_en.py "D:\MyGame"
 - Default SDF replacement preserves the original in-game Material style and only corrects atlas/padding-dependent differences.
 - Use `--use-game-material` when you want the original in-game Material parameters without atlas/padding correction.
 - Bulk `--nanumgothic` / `--mulmaru` replacement automatically chooses the nearest built-in preset (`Padding_5` / `Padding_7` / `Padding_15`) from the source `m_AtlasPadding`.
+- `--font <TTF/OTF>` or a JSON `Replace_to` TTF/OTF path auto-generates temporary SDF/Raster atlases using the source `m_AtlasPadding`.
+- Automatic generation uses default charset `CharList_3911.txt`, a `4096x4096` atlas, and automatic point-size search.
+- If translated text contains Hangul, CJK, or special characters outside the default charset, pass the real character list with `--charset <file>`. Per JSON entry, use `Charset` or `charset`.
+- Empty TMP fallback FontAssets are included as SDF replacement targets when they still have an atlas reference. This prevents unresolved characters from falling back into an unchanged `* SDF - Fallback` asset with no glyphs.
 - When the source padding is larger than the selected replacement atlas padding, the tool still applies Material correction but prints a warning that outline/underlay may not match the original exactly.
 - `--outline-ratio` treats the current Material baseline as `1.0` and multiplies `_OutlineWidth` / `_OutlineSoftness` after the baseline is chosen.
 - `--outline-ratio 1.25` makes outlines 25% thicker, while `--outline-ratio 0.6` makes them thinner.
@@ -444,7 +461,7 @@ python export_fonts_en.py "D:\MyGame"
 
 ### General
 
-- Primary mode arguments (`--parse`, `--mulmaru`, `--nanumgothic`, `--list`, `--preview-export`) are mutually exclusive.
+- Primary mode arguments (`--parse`, `--mulmaru`, `--nanumgothic`, `--font`, `--list`, `--preview-export`) are mutually exclusive.
 - `TypeTreeGeneratorAPI` is required for TMP(FontAsset) parsing/replacement.
 - Interactive path input strips repeated wrapping quotes automatically.
 - Back up game files before modification.

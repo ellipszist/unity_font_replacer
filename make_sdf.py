@@ -521,6 +521,16 @@ def _compute_sdf_tile(alpha_tile: Any, spread: int) -> Any:
 #  EN: SDF payload normalization
 # --------------------------------------------------------------------------- #
 
+def _default_font_weight_table() -> list[JsonDict]:
+    return [
+        {
+            "regularTypeface": {"m_FileID": 0, "m_PathID": 0},
+            "italicTypeface": {"m_FileID": 0, "m_PathID": 0},
+        }
+        for _ in range(10)
+    ]
+
+
 def _normalize_sdf_payload(data: JsonDict) -> JsonDict:
     """KR: SDF 데이터를 독립 실행 시에도 유효하도록 최소 필드를 보장한다.
     딥카피 후 누락된 필수 키(m_AtlasTextures, m_UsedGlyphRects 등)를 채운다.
@@ -533,7 +543,10 @@ def _normalize_sdf_payload(data: JsonDict) -> JsonDict:
     data.setdefault("m_AtlasTextures", [{"m_FileID": 0, "m_PathID": 0}])
     data.setdefault("m_UsedGlyphRects", [])
     data.setdefault("m_FreeGlyphRects", [])
-    data.setdefault("m_FontWeightTable", [])
+    if not isinstance(data.get("m_FontWeightTable"), list) or not data.get(
+        "m_FontWeightTable"
+    ):
+        data["m_FontWeightTable"] = _default_font_weight_table()
     if isinstance(data.get("m_AtlasTextures"), list):
         normalized = []
         for tex in data["m_AtlasTextures"]:
@@ -1074,7 +1087,7 @@ def generate_sdf_assets_from_ttf(
         "m_AtlasRenderMode": atlas_render_mode_value,
         "m_UsedGlyphRects": selected_used_rects,
         "m_FreeGlyphRects": [],
-        "m_FontWeightTable": [],
+        "m_FontWeightTable": _default_font_weight_table(),
     }
 
     # ------------------------------------------------------------------ #
