@@ -391,12 +391,16 @@ If you prefer Python scripts instead of EXEs:
 ### Requirements
 
 - Python 3.12 recommended
-- Packages: `UnityPy (fork)`, `TypeTreeGeneratorAPI`, `Pillow`, `numpy`, `scipy`
+- Packages: `custom UnityPy 1.25.2 fork`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`
 
 ```bash
-pip install TypeTreeGeneratorAPI Pillow numpy scipy
-pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
+pip install TypeTreeGeneratorAPI Pillow fonttools numpy scipy
+pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@4018e7600357e185f9986af536d6f105729f0950
 ```
+
+When this repository and `UnityPy` share the same parent directory, source runs
+automatically prefer the sibling checkout. Saving stops with an actionable error
+if the required low-memory APIs are unavailable.
 
 ### Examples
 
@@ -413,6 +417,8 @@ python export_fonts_en.py "D:\MyGame"
 
 - Default save order prefers uncompressed-family modes (`safe-none -> legacy-none`), then falls back to `original -> lz4`.
 - Use `--original-compress` to prefer original compression mode first.
+- Cross-file TMP Atlas/Material patches commit only after every target validates; missing targets, conflicts, or save failures roll related files back to their pre-run state.
+- Unity `.split0/.split1` assets are skipped for replacement because safe re-splitting is not supported. The exporter reads the set once through `.split0`.
 - If save is slow, try `--temp-dir` and point it to a fast SSD/NVMe path.
 - For large multi-SDF replacements, split-save fallback is enabled by default when one-shot fails (adaptive batch size).
 
