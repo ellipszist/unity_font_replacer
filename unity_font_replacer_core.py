@@ -33,6 +33,7 @@ import argparse
 import atexit
 import gc
 import inspect
+import io
 import json
 import logging
 import math
@@ -68,6 +69,11 @@ try:
     import texture2ddecoder
 except Exception:  # pragma: no cover - KR: 선택적 의존성 / EN: optional dependency
     texture2ddecoder = None
+
+try:
+    from fontTools.ttLib import TTFont
+except Exception:  # pragma: no cover - KR: 선택적 의존성 / EN: optional dependency
+    TTFont = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -6029,6 +6035,8 @@ def _scan_fonts_from_env(
     file_name: str,
     lang: Language = "ko",
     detect_ps5_swizzle: bool = False,
+    scan_ttf: bool = True,
+    scan_sdf: bool = True,
 ) -> dict[str, list[JsonDict]]:
     """KR: 로드된 UnityPy env에서 TTF/SDF 폰트 정보를 추출합니다.
     EN: Extracts TTF/SDF font information from a loaded UnityPy env.
@@ -6036,7 +6044,7 @@ def _scan_fonts_from_env(
     scanned: dict[str, list[JsonDict]] = {"ttf": [], "sdf": []}
     texture_lookup: dict[tuple[str, int], Any] = {}
     texture_swizzle_cache: dict[str, str | None] = {}
-    if detect_ps5_swizzle:
+    if scan_sdf and detect_ps5_swizzle:
         for item in env.objects:
             if item.type.name != "Texture2D":
                 continue
@@ -6044,7 +6052,7 @@ def _scan_fonts_from_env(
 
     for obj in env.objects:
         try:
-            if obj.type.name == "Font":
+            if scan_ttf and obj.type.name == "Font":
                 font_name = obj.peek_name()
                 if not font_name:
                     try:
@@ -6060,7 +6068,7 @@ def _scan_fonts_from_env(
                         "path_id": obj.path_id,
                     }
                 )
-            elif obj.type.name == "MonoBehaviour":
+            elif scan_sdf and obj.type.name == "MonoBehaviour":
                 parse_dict = None
                 atlas_file_id = 0
                 atlas_path_id = 0
@@ -6165,6 +6173,8 @@ def _scan_fonts_in_asset_file(
     generator: TypeTreeGenerator,
     lang: Language = "ko",
     detect_ps5_swizzle: bool = False,
+    scan_ttf: bool = True,
+    scan_sdf: bool = True,
 ) -> tuple[dict[str, list[JsonDict]], str | None]:
     """KR: 단일 에셋 파일을 로드해 폰트 정보를 추출합니다.
     EN: Loads a single asset file and extracts font information.
@@ -6183,7 +6193,12 @@ def _scan_fonts_in_asset_file(
 
     try:
         scanned = _scan_fonts_from_env(
-            env, file_name, lang=lang, detect_ps5_swizzle=detect_ps5_swizzle
+            env,
+            file_name,
+            lang=lang,
+            detect_ps5_swizzle=detect_ps5_swizzle,
+            scan_ttf=scan_ttf,
+            scan_sdf=scan_sdf,
         )
     finally:
         close_unitypy_env(env)
@@ -6198,6 +6213,8 @@ def _scan_fonts_via_worker(
     assets_file: str,
     lang: Language = "ko",
     detect_ps5_swizzle: bool = False,
+    scan_ttf: bool = True,
+    scan_sdf: bool = True,
 ) -> tuple[dict[str, list[JsonDict]], str | None]:
     """KR: 파일 단위 서브프로세스 워커로 스캔해 크래시를 격리합니다.
     EN: Scans via a per-file subprocess worker to isolate crashes.
@@ -6242,6 +6259,10 @@ def _scan_fonts_via_worker(
                 ]
             if detect_ps5_swizzle:
                 cmd.append("--ps5-swizzle")
+            if scan_ttf and not scan_sdf:
+                cmd.append("--_scan-ttf-only")
+            elif scan_sdf and not scan_ttf:
+                cmd.append("--_scan-sdf-only")
 
             proc = subprocess.run(
                 cmd,
@@ -6353,6 +6374,8 @@ def scan_fonts(
     isolate_files: bool = True,
     scan_jobs: int = 1,
     ps5_swizzle: bool = False,
+    scan_ttf: bool = True,
+    scan_sdf: bool = True,
 ) -> dict[str, list[JsonDict]]:
     """KR: 게임 에셋을 스캔해 TTF/SDF 폰트 목록을 반환합니다.
 
@@ -6368,6 +6391,8 @@ def scan_fonts(
     If scan_jobs>1, runs workers in parallel on the isolate_files path.
     """
     data_path = get_data_path(game_path, lang=lang)
+    scan_ttf = bool(scan_ttf)
+    scan_sdf = bool(scan_sdf)
     unity_version = get_unity_version(game_path, lang=lang)
     assets_files = find_assets_files(
         game_path,
@@ -6427,6 +6452,8 @@ def scan_fonts(
                     assets_file,
                     lang,
                     ps5_swizzle,
+                    scan_ttf,
+                    scan_sdf,
                 ): (idx, os.path.basename(assets_file), assets_file)
                 for idx, assets_file in enumerate(assets_files)
             }
@@ -6474,6 +6501,8 @@ def scan_fonts(
                     assets_file,
                     lang=lang,
                     detect_ps5_swizzle=ps5_swizzle,
+                    scan_ttf=scan_ttf,
+                    scan_sdf=scan_sdf,
                 )
                 previous_scanned, previous_error, _ = indexed_results.get(
                     idx, ({"ttf": [], "sdf": []}, None, fn)
@@ -6528,6 +6557,8 @@ def scan_fonts(
                     assets_file,
                     lang=lang,
                     detect_ps5_swizzle=ps5_swizzle,
+                    scan_ttf=scan_ttf,
+                    scan_sdf=scan_sdf,
                 )
                 if worker_error:
                     if lang == "ko":
@@ -6546,6 +6577,8 @@ def scan_fonts(
                 generator,
                 lang=lang,
                 detect_ps5_swizzle=ps5_swizzle,
+                scan_ttf=scan_ttf,
+                scan_sdf=scan_sdf,
             )
             if load_error:
                 _log_console(f"[scan_fonts] {load_error}")
@@ -6797,6 +6830,137 @@ def _resolve_ttf_source_path(source: str, script_dir: str | None = None) -> str 
             continue
         return os.path.abspath(candidate)
     return None
+
+
+def _fallback_font_display_name(fallback_name: str) -> str:
+    raw = strip_wrapping_quotes_repeated(str(fallback_name)).strip()
+    if not raw:
+        return "Font"
+    base = os.path.basename(raw)
+    if base:
+        raw = base
+    return normalize_font_name(raw).strip() or "Font"
+
+
+def _dedupe_nonempty_strings(values: Iterable[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def _read_ttf_name_records(name_table: Any, name_ids: set[int]) -> list[str]:
+    names: list[str] = []
+    for record in getattr(name_table, "names", []) or []:
+        if int(getattr(record, "nameID", -1)) not in name_ids:
+            continue
+        try:
+            value = record.toUnicode()
+        except Exception:
+            continue
+        names.append(value)
+    return _dedupe_nonempty_strings(names)
+
+
+def read_ttf_font_metadata(
+    ttf_data: bytes,
+    fallback_name: str = "",
+    font_size: float | int = 16.0,
+) -> JsonDict:
+    fallback = _fallback_font_display_name(fallback_name)
+    metadata: JsonDict = {
+        "font_names": [fallback],
+        "ascent": None,
+        "descent": None,
+        "line_spacing": None,
+    }
+    if TTFont is None:
+        return metadata
+
+    try:
+        size = float(font_size or 16.0)
+    except Exception:
+        size = 16.0
+    if size <= 0:
+        size = 16.0
+
+    try:
+        with TTFont(io.BytesIO(bytes(ttf_data)), lazy=True) as ttf:
+            name_table = ttf.get("name")
+            name_candidates: list[str] = []
+            if name_table is not None:
+                name_candidates.extend(_read_ttf_name_records(name_table, {16}))
+                try:
+                    name_candidates.append(name_table.getBestFamilyName())
+                except Exception:
+                    pass
+                name_candidates.extend(_read_ttf_name_records(name_table, {1}))
+            metadata["font_names"] = _dedupe_nonempty_strings(
+                name_candidates + [fallback]
+            )
+
+            units_per_em = 1000
+            head = ttf.get("head")
+            if head is not None:
+                units_per_em = int(getattr(head, "unitsPerEm", units_per_em) or 1000)
+            units_per_em = max(1, units_per_em)
+
+            ascent = descent = line_gap = None
+            hhea = ttf.get("hhea")
+            if hhea is not None:
+                ascent = float(getattr(hhea, "ascent", 0) or 0)
+                descent = float(getattr(hhea, "descent", 0) or 0)
+                line_gap = float(getattr(hhea, "lineGap", 0) or 0)
+            if ascent is None or descent is None:
+                os2_table = ttf.get("OS/2")
+                if os2_table is not None:
+                    ascent = float(getattr(os2_table, "usWinAscent", 0) or 0)
+                    descent = -float(getattr(os2_table, "usWinDescent", 0) or 0)
+                    line_gap = float(getattr(os2_table, "sTypoLineGap", 0) or 0)
+
+            if ascent is not None and descent is not None:
+                if line_gap is None:
+                    line_gap = 0.0
+                scale = size / float(units_per_em)
+                metadata["ascent"] = float(ascent * scale)
+                metadata["descent"] = float(descent * scale)
+                metadata["line_spacing"] = float((ascent - descent + line_gap) * scale)
+    except Exception:
+        return metadata
+
+    return metadata
+
+
+def apply_ttf_metadata_to_font(
+    font: Any,
+    ttf_data: bytes,
+    fallback_name: str = "",
+) -> JsonDict:
+    metadata = read_ttf_font_metadata(
+        ttf_data,
+        fallback_name=fallback_name,
+        font_size=getattr(font, "m_FontSize", 16.0),
+    )
+    font_names = metadata.get("font_names")
+    if isinstance(font_names, list) and font_names and hasattr(font, "m_FontNames"):
+        font.m_FontNames = font_names
+    for attr, key in (
+        ("m_Ascent", "ascent"),
+        ("m_Descent", "descent"),
+        ("m_LineSpacing", "line_spacing"),
+    ):
+        value = metadata.get(key)
+        if value is not None and hasattr(font, attr):
+            setattr(font, attr, float(value))
+    return metadata
 
 
 def resolve_charset_source(
@@ -7708,6 +7872,18 @@ def replace_fonts_in_file(
                         f"old_size={len(current_ttf_data)} new_size={len(assets['ttf_data'])}"
                     )
                     font.m_FontData = assets["ttf_data"]
+                    metadata = apply_ttf_metadata_to_font(
+                        font,
+                        assets["ttf_data"],
+                        fallback_name=replacement_font,
+                    )
+                    _log_debug(
+                        f"[replace_ttf] metadata path_id={font_pathid} "
+                        f"font_names={metadata.get('font_names')} "
+                        f"ascent={metadata.get('ascent')} "
+                        f"descent={metadata.get('descent')} "
+                        f"line_spacing={metadata.get('line_spacing')}"
+                    )
                     _safe_save(obj, font)
                     modified = True
 
@@ -9322,6 +9498,8 @@ def create_batch_replacements(
         exclude_exts=exclude_exts,
         scan_jobs=scan_jobs,
         ps5_swizzle=ps5_swizzle,
+        scan_ttf=replace_ttf,
+        scan_sdf=replace_sdf,
     )
     replacements: dict[str, JsonDict] = {}
 
@@ -9866,6 +10044,8 @@ def run_scan_file_worker(
     output_path: str,
     lang: Language = "ko",
     detect_ps5_swizzle: bool = False,
+    scan_ttf: bool = True,
+    scan_sdf: bool = True,
 ) -> int:
     """KR: 단일 파일 파싱 워커입니다. 결과를 JSON 파일로 저장합니다.
     EN: Single-file parsing worker. Saves results to a JSON file.
@@ -9882,6 +10062,8 @@ def run_scan_file_worker(
             generator,
             lang=lang,
             detect_ps5_swizzle=detect_ps5_swizzle,
+            scan_ttf=scan_ttf,
+            scan_sdf=scan_sdf,
         )
         payload: JsonDict = {
             "ttf": scanned.get("ttf", []),
@@ -10079,6 +10261,16 @@ Examples:
         metavar="OUTPUT_JSON_PATH",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--_scan-ttf-only",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--_scan-sdf-only",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
     args = parser.parse_args()
     if isinstance(args.gamepath, str):
@@ -10232,6 +10424,8 @@ Examples:
                 args._scan_file_worker_output,
                 lang=lang,
                 detect_ps5_swizzle=args.ps5_swizzle,
+                scan_ttf=not args._scan_sdf_only,
+                scan_sdf=not args._scan_ttf_only,
             )
         )
 

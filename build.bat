@@ -54,6 +54,7 @@ if exist make_sdf.spec del make_sdf.spec
   --collect-all TypeTreeGeneratorAPI ^
   --collect-all fmod_toolkit ^
   --collect-all archspec ^
+  --collect-all fontTools ^
   unity_font_replacer_ko.py
 
 "%VENV_PY%" -m PyInstaller --onefile --name export_fonts_ko ^
@@ -72,6 +73,7 @@ if exist make_sdf.spec del make_sdf.spec
   --collect-all TypeTreeGeneratorAPI ^
   --collect-all fmod_toolkit ^
   --collect-all archspec ^
+  --collect-all fontTools ^
   unity_font_replacer_en.py
 
 "%VENV_PY%" -m PyInstaller --onefile --name export_fonts_en ^
