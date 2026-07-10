@@ -10,7 +10,8 @@
       - 프리뷰 내보내기: 교체 전후 미리보기 이미지 출력
 TMP 스키마 경계:
       - 구 스키마 (old): Unity <=2018.3.14, m_glyphInfoList 사용, top-origin Y 좌표계
-      - 신 스키마 (new): Unity >=2018.4.2, m_GlyphTable 사용, bottom-origin Y 좌표계
+      - 신/하이브리드 스키마: Unity >=2018.4.2, m_GlyphTable 사용, bottom-origin Y 좌표계
+        (2018.4.2~2019.1은 legacy 필드도 함께 존재할 수 있음)
 
 EN: Core CLI and processing pipeline for Unity font replacement.
 This module includes scanning, parsing, replacement, preview export,
@@ -24,7 +25,8 @@ Key features:
       - Preview export: output before/after preview images
 TMP schema boundaries:
       - Old schema: Unity <=2018.3.14, uses m_glyphInfoList, top-origin Y coordinates
-      - New schema: Unity >=2018.4.2, uses m_GlyphTable, bottom-origin Y coordinates
+      - New/hybrid schema: Unity >=2018.4.2, uses m_GlyphTable, bottom-origin Y coordinates
+        (2018.4.2~2019.1 may also retain legacy fields)
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import gc
+import hashlib
 import inspect
 import io
 import json
@@ -47,17 +50,27 @@ import tempfile
 import time
 import traceback as tb_module
 import copy
+import errno
 import struct as struct_module
+import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
+from contextvars import ContextVar
+from functools import lru_cache, wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Literal, NoReturn, cast
 
-import UnityPy
 from PIL import Image, ImageOps
+from unitypy_runtime import (
+    UnityPy,
+    cleanup_unitypy_environments,
+    close_unitypy_env,
+    load_unitypy,
+    missing_low_memory_features,
+)
 from UnityPy.enums.BundleFile import CompressionFlags
 from UnityPy.files.SerializedFile import SerializedType
+from UnityPy.files.replacers import Replacer
 from UnityPy.helpers import CompressionHelper
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 try:
@@ -89,6 +102,7 @@ _AUTO_SPLIT_ONESHOT_TEXTURE_BYTES = 1536 * 1024 * 1024
 # KR: 텍스처 배치 분할 목표 바이트 수
 # EN: Texture batch split target byte count
 _AUTO_SPLIT_TEXTURE_BATCH_TARGET_BYTES = 768 * 1024 * 1024
+_UNITY_SPLIT_FILE_RE = re.compile(r"\.split\d+$", re.IGNORECASE)
 # KR: PS5 swizzle 비트 마스크: X축 인터리브 패턴
 # EN: PS5 swizzle bit mask: X-axis interleave pattern
 PS5_SWIZZLE_MASK_X = 0x385F0
@@ -2265,7 +2279,7 @@ def get_unity_version(game_path: str, lang: Language = "ko") -> str:
     for candidate in existing_candidates:
         env = None
         try:
-            env = UnityPy.load(candidate)
+            env = load_unitypy(candidate)
 
             # KR: 1) 빠른 경로: 최상위 파일에서 unity_version을 바로 확인한다
             # EN: 1) Fast path: check unity_version directly on top-level file
@@ -2455,6 +2469,7 @@ def prepare_output_only_dependencies(
     data_path: str,
     output_root: str,
     lang: Language = "ko",
+    transaction: _DeferredPatchTransaction | None = None,
 ) -> None:
     """KR: output-only 모드에서 핵심 의존 파일을 출력 루트에 미리 복사한다.
     EN: Pre-copy essential dependency files to the output root in output-only mode.
@@ -2477,6 +2492,8 @@ def prepare_output_only_dependencies(
         output_dir = os.path.dirname(output_path)
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
+        if transaction is not None:
+            transaction.backup(output_path, allow_missing=True)
         shutil.copy2(source_path, output_path)
         copied.append(rel_path)
 
@@ -2518,59 +2535,360 @@ def cleanup_registered_temp_dirs() -> None:
 atexit.register(cleanup_registered_temp_dirs)
 
 
-def _close_unitypy_reader(obj: Any) -> None:
-    """KR: UnityPy 내부 reader/object를 안전하게 dispose한다.
-    EN: Safely dispose UnityPy internal reader/object.
-
-    BundleFile의 mmap/temp 파일과 SerializedFile의 spill store도 정리한다.
-    """
-    if obj is None:
+def _atomic_replace_validated_file(source: str, destination: str) -> None:
+    """Atomically install a validated file, including cross-volume temp roots."""
+    try:
+        os.replace(source, destination)
         return
-    # KR: BundleFile의 mmap/temp 블록 저장소 정리
-    # EN: Clean up BundleFile's mmap/temp block storage
-    cleanup_fn = getattr(obj, "_cleanup_temp_blocks_storage", None)
-    if callable(cleanup_fn):
+    except OSError as error:
+        if error.errno != errno.EXDEV and getattr(error, "winerror", None) != 17:
+            raise
+
+    destination_dir = os.path.dirname(os.path.abspath(destination)) or os.curdir
+    os.makedirs(destination_dir, exist_ok=True)
+    fd, staged_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".validated.tmp",
+        dir=destination_dir,
+    )
+    try:
+        with open(source, "rb") as source_stream, os.fdopen(fd, "wb") as staged:
+            fd = -1
+            shutil.copyfileobj(source_stream, staged, length=1024 * 1024)
+            staged.flush()
+            os.fsync(staged.fileno())
         try:
-            cleanup_fn()
-        except Exception:
+            shutil.copystat(source, staged_path)
+        except OSError:
             pass
-    # KR: SerializedFile의 spill store (temp 파일) 정리
-    # EN: Clean up SerializedFile's spill store (temp file)
-    close_fn = getattr(obj, "close", None)
-    if callable(close_fn):
+        os.replace(staged_path, destination)
         try:
-            close_fn()
-        except Exception:
+            os.remove(source)
+        except OSError:
             pass
-    reader = getattr(obj, "reader", None)
-    if reader is not None and hasattr(reader, "dispose"):
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
-            reader.dispose()
-        except Exception:
+            os.remove(staged_path)
+        except OSError:
             pass
-    if hasattr(obj, "dispose"):
-        try:
-            obj.dispose()
-        except Exception:
-            pass
+        raise
 
 
-def close_unitypy_env(environment: Any) -> None:
-    """KR: Environment에 연결된 UnityPy 파일 리소스를 순회하며 종료한다.
-    EN: Traverse and close UnityPy file resources connected to the Environment.
-    """
-    if environment is None:
-        return
-    stack: list[Any] = []
-    files = getattr(environment, "files", None)
-    if isinstance(files, dict):
-        stack.extend(files.values())
-    while stack:
-        item = stack.pop()
-        _close_unitypy_reader(item)
-        sub_files = getattr(item, "files", None)
-        if isinstance(sub_files, dict):
-            stack.extend(sub_files.values())
+def _hash_file_contents(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _hash_pil_image_rows(image: Image.Image) -> str:
+    digest = hashlib.sha256()
+    digest.update(f"{image.mode}:{image.width}x{image.height}".encode("ascii"))
+    for row in range(image.height):
+        with image.crop((0, row, image.width, row + 1)) as row_image:
+            digest.update(row_image.tobytes())
+    return digest.hexdigest()
+
+
+def _deferred_patch_fingerprint(patch_kind: str, payload: Any) -> str:
+    """Build a stable content fingerprint without loading spilled atlases into RAM."""
+    if not isinstance(payload, dict):
+        return hashlib.sha256(repr(payload).encode("utf-8", errors="replace")).hexdigest()
+    ignored = {
+        "source_entry",
+        "font_name",
+        "replacement_font",
+        "preview_sdf_data",
+        "source_atlas",
+        "source_atlas_path",
+        "alpha8_linear_source",
+        "alpha8_linear_source_path",
+    }
+    stable_payload = {key: value for key, value in payload.items() if key not in ignored}
+    digest = hashlib.sha256()
+    digest.update(str(patch_kind).encode("utf-8"))
+    digest.update(
+        json.dumps(
+            stable_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=repr,
+        ).encode("utf-8")
+    )
+    for image_key, path_key in (
+        ("source_atlas", "source_atlas_path"),
+        ("alpha8_linear_source", "alpha8_linear_source_path"),
+    ):
+        path = str(payload.get(path_key, "") or "").strip()
+        image = payload.get(image_key)
+        if path and os.path.isfile(path):
+            image_hash = _hash_file_contents(path)
+        elif isinstance(image, Image.Image):
+            image_hash = _hash_pil_image_rows(image)
+        else:
+            image_hash = "missing"
+        digest.update(f"{image_key}:{image_hash}".encode("ascii"))
+    return digest.hexdigest()
+
+
+class DeferredPatchAtomicityError(RuntimeError):
+    """Raised when a cross-file TMP patch cannot be completed atomically."""
+
+
+class _DeferredPatchTransaction:
+    """Disk-backed rollback for a group of cross-file TMP patches."""
+
+    def __init__(self, backup_root: str | None = None) -> None:
+        normalized_root = (
+            os.path.abspath(backup_root) if backup_root is not None else None
+        )
+        self._remove_backup_root_when_empty = bool(
+            normalized_root is not None and not os.path.exists(normalized_root)
+        )
+        self._backup_root = normalized_root
+        if normalized_root is not None:
+            os.makedirs(normalized_root, exist_ok=True)
+        self._backup_dir = tempfile.mkdtemp(
+            prefix="unity_font_replacer_rollback_",
+            dir=normalized_root,
+        )
+        self._backups: dict[str, str] = {}
+        self._plan_fingerprints: dict[tuple[str, str, str], str] = {}
+        self._payload_fingerprints: dict[tuple[int, str], tuple[Any, str]] = {}
+        self._plan_conflicts: list[str] = []
+        self._failures: list[str] = []
+        self._active = True
+        atexit.register(self.rollback)
+
+    @property
+    def has_backups(self) -> bool:
+        return bool(self._backups)
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+    @property
+    def backup_count(self) -> int:
+        return len(self._backups)
+
+    @property
+    def backup_directory(self) -> str:
+        return self._backup_dir
+
+    @property
+    def has_conflicts(self) -> bool:
+        return bool(self._plan_conflicts)
+
+    @property
+    def has_failures(self) -> bool:
+        return bool(self._failures or self._plan_conflicts)
+
+    def fail(self, reason: str) -> None:
+        if reason not in self._failures:
+            self._failures.append(reason)
+
+    def register_plan(
+        self,
+        patch_kind: str,
+        target_file_key: str,
+        object_key: str,
+        payload: Any,
+    ) -> bool:
+        normalized_file = _normalize_asset_file_key(target_file_key) or str(
+            target_file_key
+        )
+        plan_key = (str(patch_kind), normalized_file, str(object_key).lower())
+        payload_cache_key = (id(payload), str(patch_kind))
+        cached_payload = self._payload_fingerprints.get(payload_cache_key)
+        if cached_payload is not None and cached_payload[0] is payload:
+            fingerprint = cached_payload[1]
+        else:
+            fingerprint = _deferred_patch_fingerprint(patch_kind, payload)
+            self._payload_fingerprints[payload_cache_key] = (payload, fingerprint)
+        previous = self._plan_fingerprints.get(plan_key)
+        if previous is None:
+            self._plan_fingerprints[plan_key] = fingerprint
+            return True
+        if previous == fingerprint:
+            return True
+        conflict = (
+            f"kind={patch_kind} file={normalized_file} key={object_key} "
+            f"previous={previous} new={fingerprint}"
+        )
+        self._plan_conflicts.append(conflict)
+        _log_warning(f"[deferred_transaction] conflicting target plan: {conflict}")
+        return False
+
+    def backup(
+        self,
+        destination: str,
+        *,
+        allow_missing: bool = False,
+        replace_only: bool = False,
+    ) -> None:
+        if not self._active:
+            raise RuntimeError("deferred patch transaction is no longer active")
+        normalized = os.path.normcase(os.path.abspath(destination))
+        if normalized in self._backups:
+            return
+        if not os.path.exists(destination):
+            if allow_missing:
+                self._backups[normalized] = ""
+                return
+            raise FileNotFoundError(destination)
+        if not os.path.isfile(destination):
+            raise IsADirectoryError(destination)
+
+        fd, backup_path = tempfile.mkstemp(
+            prefix=f"{len(self._backups):04d}_",
+            suffix=".rollback",
+            dir=self._backup_dir,
+        )
+        try:
+            os.close(fd)
+            fd = -1
+            os.remove(backup_path)
+            try:
+                if not replace_only:
+                    raise OSError(errno.ENOTSUP, "copy-safe snapshot required")
+                # Replacing the destination later leaves this original inode
+                # intact, so same-volume snapshots consume almost no space.
+                os.link(destination, backup_path)
+            except OSError:
+                with open(destination, "rb") as source_stream, open(
+                    backup_path, "xb"
+                ) as backup_stream:
+                    shutil.copyfileobj(
+                        source_stream, backup_stream, length=1024 * 1024
+                    )
+                    backup_stream.flush()
+                    os.fsync(backup_stream.fileno())
+                try:
+                    shutil.copystat(destination, backup_path)
+                except OSError:
+                    pass
+            self._backups[normalized] = backup_path
+        except BaseException:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.remove(backup_path)
+            except OSError:
+                pass
+            raise
+
+    def _remove_backup_directory(self) -> bool:
+        try:
+            shutil.rmtree(self._backup_dir)
+        except FileNotFoundError:
+            return True
+        except Exception as error:
+            _log_warning(
+                f"[deferred_transaction] could not remove backup directory "
+                f"{self._backup_dir}: {type(error).__name__}: {error}"
+            )
+            return False
+        if self._remove_backup_root_when_empty and self._backup_root:
+            try:
+                os.rmdir(self._backup_root)
+            except OSError:
+                pass
+        return True
+
+    def commit(self) -> None:
+        if not self._active:
+            return
+        self._active = False
+        self._plan_fingerprints.clear()
+        self._payload_fingerprints.clear()
+        self._plan_conflicts.clear()
+        self._failures.clear()
+        if self._remove_backup_directory():
+            self._backups.clear()
+
+    def rollback(self) -> bool:
+        if not self._active:
+            return True
+        restored = True
+        for destination, backup_path in reversed(list(self._backups.items())):
+            if not backup_path:
+                try:
+                    if os.path.isfile(destination):
+                        os.remove(destination)
+                    self._backups.pop(destination, None)
+                except Exception as error:
+                    restored = False
+                    _log_warning(
+                        f"[deferred_transaction] rollback delete failed: {destination}: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                continue
+            if not os.path.isfile(backup_path):
+                restored = False
+                _log_warning(
+                    f"[deferred_transaction] rollback backup missing: {backup_path}"
+                )
+                continue
+            try:
+                _atomic_replace_validated_file(backup_path, destination)
+                self._backups.pop(destination, None)
+            except Exception as error:
+                restored = False
+                _log_warning(
+                    f"[deferred_transaction] rollback failed: {destination}: "
+                    f"{type(error).__name__}: {error}"
+                )
+        if restored:
+            self._active = False
+            self._backups.clear()
+            self._plan_fingerprints.clear()
+            self._payload_fingerprints.clear()
+            self._plan_conflicts.clear()
+            self._failures.clear()
+            self._remove_backup_directory()
+        return restored
+
+
+_ACTIVE_DEFERRED_TRANSACTION: ContextVar[_DeferredPatchTransaction | None] = (
+    ContextVar("unity_font_replacer_deferred_transaction", default=None)
+)
+
+
+def _rollback_deferred_transaction_on_exit(
+    func: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Immediately roll back an unfinished CLI transaction on every exit path."""
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        token = _ACTIVE_DEFERRED_TRANSACTION.set(None)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            transaction = _ACTIVE_DEFERRED_TRANSACTION.get()
+            if transaction is not None and transaction.is_active:
+                if not transaction.rollback():
+                    _log_warning(
+                        "[deferred_transaction] automatic rollback failed; "
+                        f"backups remain at {transaction.backup_directory}"
+                    )
+            _ACTIVE_DEFERRED_TRANSACTION.reset(token)
+
+    return wrapper
 
 
 def normalize_font_name(name: str) -> str:
@@ -3023,12 +3341,31 @@ def _prepare_texture_replacement_for_target(
     )
     if not isinstance(source_atlas, Image.Image):
         return None
+    owned_images: list[Image.Image] = []
+    if not isinstance(texture_plan.get("source_atlas"), Image.Image):
+        owned_images.append(source_atlas)
 
-    alpha8_linear_source = _load_spilled_plan_image(
-        texture_plan,
-        image_key="alpha8_linear_source",
-        path_key="alpha8_linear_source_path",
-    )
+    source_path = str(texture_plan.get("source_atlas_path", "")).strip()
+    alpha_path = str(texture_plan.get("alpha8_linear_source_path", "")).strip()
+    if (
+        source_path
+        and alpha_path
+        and os.path.normcase(os.path.abspath(source_path))
+        == os.path.normcase(os.path.abspath(alpha_path))
+    ):
+        alpha8_linear_source = source_atlas
+    else:
+        alpha8_linear_source = _load_spilled_plan_image(
+            texture_plan,
+            image_key="alpha8_linear_source",
+            path_key="alpha8_linear_source_path",
+        )
+        if (
+            isinstance(alpha8_linear_source, Image.Image)
+            and alpha8_linear_source is not source_atlas
+            and not isinstance(texture_plan.get("alpha8_linear_source"), Image.Image)
+        ):
+            owned_images.append(alpha8_linear_source)
     atlas_linear_for_alpha8 = (
         alpha8_linear_source
         if isinstance(alpha8_linear_source, Image.Image)
@@ -3165,6 +3502,8 @@ def _prepare_texture_replacement_for_target(
                 atlas_for_write = apply_ps5_swizzle_to_image(source_atlas)
             else:
                 atlas_for_write = apply_ps5_unswizzle_to_image(source_atlas)
+            if atlas_for_write is not source_atlas:
+                owned_images.append(atlas_for_write)
         except Exception as swizzle_error:
             atlas_for_write = source_atlas
             if lang == "ko":
@@ -3181,6 +3520,8 @@ def _prepare_texture_replacement_for_target(
         if ps5_swizzle and desired_swizzle_state:
             try:
                 preview_image = apply_ps5_unswizzle_to_image(atlas_for_write)
+                if preview_image is not atlas_for_write:
+                    owned_images.append(preview_image)
             except Exception as preview_unswizzle_error:
                 preview_image = atlas_for_write
                 if lang == "ko":
@@ -3226,6 +3567,7 @@ def _prepare_texture_replacement_for_target(
             int(atlas_metadata_width),
             int(atlas_metadata_height),
         ),
+        "_owned_images": owned_images,
     }
 
 
@@ -4325,10 +4667,8 @@ def _resolve_creation_settings_key(
     for key in _TMP_CREATION_SETTINGS_KEYS:
         if isinstance(data.get(key), dict):
             return key
-    expected_fields = _get_tmp_info_fields_for_unity(unity_version)
-    for key in _TMP_CREATION_SETTINGS_KEYS:
-        if key in expected_fields and key in data and isinstance(data.get(key), dict):
-            return key
+    # TMP_Info is analysis evidence, not a runtime dependency. The parsed key
+    # shape is authoritative and avoids loading the multi-megabyte report.
     return None
 
 
@@ -4352,6 +4692,26 @@ def _sync_creation_settings_payload(
             creation_settings[key] = int(padding)
         elif normalized.endswith("pointsize") or normalized == "pointsize":
             creation_settings[key] = int(point_size)
+
+
+def _sync_existing_record_table(target: Any, replacement: Any) -> None:
+    """Sync only existing record-list fields, clearing stale glyph references."""
+    if not isinstance(target, dict):
+        return
+    replacement_dict = replacement if isinstance(replacement, dict) else {}
+    for key in list(target.keys()):
+        current_value = target.get(key)
+        replacement_value = replacement_dict.get(key)
+        if isinstance(current_value, list):
+            target[key] = (
+                copy.deepcopy(replacement_value)
+                if isinstance(replacement_value, list)
+                else []
+            )
+        elif isinstance(current_value, dict) and isinstance(
+            replacement_value, dict
+        ):
+            _sync_existing_record_table(current_value, replacement_value)
 
 
 def _tmp_version_hint(unity_version: str | None) -> Literal["new", "old"] | None:
@@ -4730,11 +5090,9 @@ def _resolve_target_outer_file_key(
     source_bundle_signature: str | None,
     asset_file_index: dict[str, Any] | None,
 ) -> str | None:
-    """KR: FileID와 에셋 이름을 조합하여 대상 외부 파일의 정규화된 키를 확인합니다. 번들 서명이 있으면 현재 파일 키를 반환합니다.
-    EN: Resolves the normalized key of the target external file by combining FileID and asset name. Returns the current file key if a bundle signature is present.
+    """KR: FileID와 에셋 이름으로 실제 대상 outer 파일 키를 확인합니다.
+    EN: Resolve the actual target outer-file key from FileID and asset name.
     """
-    if source_bundle_signature in BUNDLE_SIGNATURES:
-        return str(current_file_key)
     try:
         resolved_file_id = int(file_id or 0)
     except Exception:
@@ -4748,6 +5106,34 @@ def _resolve_target_outer_file_key(
         normalized_assets_name = _normalize_assets_basename(target_assets_name)
         if normalized_assets_name:
             candidates.append(normalized_assets_name.lower())
+
+    if source_bundle_signature in BUNDLE_SIGNATURES:
+        environment = getattr(source_assets_file, "environment", None)
+        roots = getattr(environment, "files", None)
+        stack = list(roots.values()) if isinstance(roots, dict) else []
+        internal_names: set[str] = set()
+        seen: set[int] = set()
+        while stack:
+            item = stack.pop()
+            if item is None or id(item) in seen:
+                continue
+            seen.add(id(item))
+            item_name = _normalize_assets_basename(getattr(item, "name", None))
+            if item_name:
+                internal_names.add(item_name.lower())
+            children = getattr(item, "files", None)
+            if isinstance(children, dict):
+                for child_name, child in children.items():
+                    normalized_child = _normalize_assets_basename(child_name)
+                    if normalized_child:
+                        internal_names.add(normalized_child.lower())
+                    stack.append(child)
+        if any(
+            _normalize_assets_basename(candidate).lower() in internal_names
+            for candidate in candidates
+            if _normalize_assets_basename(candidate)
+        ):
+            return str(current_file_key)
 
     for candidate in candidates:
         matches = _collect_asset_file_index_matches(asset_file_index, candidate)
@@ -4785,10 +5171,48 @@ def _store_patch_value(mapping: dict[str, Any], key: str, value: Any) -> None:
     """KR: 패치 맵에 값을 저장합니다. 원본 키와 소문자 키 양쪽에 동시 저장합니다.
     EN: Stores a value in the patch map. Saves to both the original key and its lowercase variant.
     """
-    mapping[key] = value
     lowered = key.lower()
-    if lowered != key:
-        mapping[lowered] = value
+    for existing_key in list(mapping):
+        if str(existing_key).lower() == lowered:
+            mapping[existing_key] = value
+    mapping[key] = value
+    mapping[lowered] = value
+
+
+def _store_consistent_patch_value(
+    mapping: dict[str, Any],
+    key: str,
+    value: Any,
+    *,
+    patch_kind: str,
+    target_file_key: str,
+    transaction: _DeferredPatchTransaction | None,
+) -> tuple[Any | None, bool]:
+    """Store a consistent plan and report whether this call inserted it."""
+    existing = _lookup_patch_value(mapping, key)
+    if existing is not None and _deferred_patch_fingerprint(
+        patch_kind, existing
+    ) != _deferred_patch_fingerprint(patch_kind, value):
+        conflict = (
+            f"kind={patch_kind} file={target_file_key} key={key} "
+            "contains incompatible payloads"
+        )
+        _log_warning(f"[patch_plan_conflict] {conflict}")
+        if transaction is not None:
+            transaction.fail(conflict)
+        return None, False
+    retained_value = existing if existing is not None else value
+    if transaction is not None and not transaction.register_plan(
+        patch_kind,
+        target_file_key,
+        key,
+        retained_value,
+    ):
+        return None, False
+    if existing is not None and existing is not value:
+        _cleanup_superseded_patch_payload(value, existing)
+    _store_patch_value(mapping, key, retained_value)
+    return retained_value, existing is None
 
 
 def _copy_patch_bucket(
@@ -4802,6 +5226,48 @@ def _copy_patch_bucket(
         return {}
     bucket = patch_map.get(str(file_key), {})
     return dict(bucket) if isinstance(bucket, dict) else {}
+
+
+def _patch_payload_ids(bucket: dict[str, Any] | None) -> set[int]:
+    """Return unique payload identities from a bucket containing alias keys."""
+    if not isinstance(bucket, dict):
+        return set()
+    return {id(payload) for payload in bucket.values()}
+
+
+def _consume_deferred_patch_payloads(
+    patch_map: dict[str, dict[str, Any]] | None,
+    file_key: str,
+    consumed_payload_ids: set[int],
+) -> int:
+    """Remove only payloads that were successfully handled for one target file."""
+    if not (isinstance(patch_map, dict) and consumed_payload_ids):
+        return 0
+    normalized_file = _normalize_asset_file_key(file_key) or str(file_key)
+    bucket = patch_map.get(normalized_file)
+    if not isinstance(bucket, dict):
+        return 0
+
+    removed: dict[str, Any] = {}
+    removed_payload_ids: set[int] = set()
+    for object_key, payload in list(bucket.items()):
+        payload_id = id(payload)
+        if payload_id not in consumed_payload_ids:
+            continue
+        removed[object_key] = payload
+        removed_payload_ids.add(payload_id)
+        del bucket[object_key]
+    if not bucket:
+        patch_map.pop(normalized_file, None)
+    _cleanup_deferred_patch_bucket(removed)
+    return len(removed_payload_ids)
+
+
+def _resolve_current_file_key(assets_file: str, logical_file_key: str | None) -> str:
+    """Keep deferred-patch identity separate from an output-only copy path."""
+    return (
+        _normalize_asset_file_key(logical_file_key) if logical_file_key else None
+    ) or _normalize_asset_file_key(assets_file) or os.path.abspath(assets_file)
 
 
 def _spill_image_to_temp_file(
@@ -4822,6 +5288,18 @@ def _spill_image_to_temp_file(
     os.close(fd)
     image.save(spill_path, format="PNG")
     return spill_path
+
+
+def _close_unique_images(*images: Any) -> None:
+    seen: set[int] = set()
+    for image in images:
+        if not isinstance(image, Image.Image) or id(image) in seen:
+            continue
+        seen.add(id(image))
+        try:
+            image.close()
+        except Exception:
+            pass
 
 
 def _spill_deferred_texture_plan_to_disk(
@@ -4911,6 +5389,22 @@ def _cleanup_deferred_patch_bucket(bucket: dict[str, Any] | None) -> None:
             pass
 
 
+def _cleanup_superseded_patch_payload(payload: Any, retained: Any) -> None:
+    """Delete spill files unique to an equivalent payload that was deduplicated."""
+    if not isinstance(payload, dict) or payload is retained:
+        return
+    retained_paths = {
+        str(retained.get(path_key, "")).strip()
+        for path_key in ("source_atlas_path", "alpha8_linear_source_path")
+        if isinstance(retained, dict) and str(retained.get(path_key, "")).strip()
+    }
+    disposable = dict(payload)
+    for path_key in ("source_atlas_path", "alpha8_linear_source_path"):
+        if str(disposable.get(path_key, "")).strip() in retained_paths:
+            disposable.pop(path_key, None)
+    _cleanup_deferred_patch_bucket({"payload": disposable})
+
+
 def _register_deferred_patch(
     patch_map: dict[str, dict[str, Any]] | None,
     target_file_key: str | None,
@@ -4919,13 +5413,14 @@ def _register_deferred_patch(
     *,
     pending_files: set[str] | None,
     patch_kind: str,
-) -> None:
+    transaction: _DeferredPatchTransaction | None = None,
+) -> bool:
     """KR: 지연 패치(deferred patch)를 패치 맵에 등록합니다. 1패스에서 변경사항을 수집하고 2패스에서 적용하는 구조입니다. 충돌 시 경고를 기록합니다.
     EN: Registers a deferred patch in the patch map. Changes are collected in pass 1 and applied in pass 2. Logs a warning on conflicts.
     """
     normalized_file = _normalize_asset_file_key(target_file_key)
     if not (isinstance(patch_map, dict) and normalized_file and object_key):
-        return
+        return False
     bucket = patch_map.setdefault(normalized_file, {})
     existing = _lookup_patch_value(bucket, object_key)
     existing_font = (
@@ -4948,35 +5443,78 @@ def _register_deferred_patch(
         if isinstance(payload, dict)
         else ""
     )
-    if existing is not None and existing_font and new_font and (
-        existing_font != new_font or existing_source != new_source
-    ):
-        _log_warning(
+    if existing is not None and _deferred_patch_fingerprint(
+        patch_kind, existing
+    ) != _deferred_patch_fingerprint(patch_kind, payload):
+        conflict = (
             f"[patch_plan_conflict] kind={patch_kind} file={normalized_file} "
             f"key={object_key} existing={existing_font}@{existing_source} "
             f"new={new_font}@{new_source}"
         )
-    _store_patch_value(bucket, object_key, payload)
-    if isinstance(pending_files, set) and (
-        existing is None
-        or existing_font != new_font
-        or existing_source != new_source
+        _log_warning(conflict)
+        if transaction is not None:
+            transaction.fail(conflict)
+        return False
+    retained_payload = existing if existing is not None else payload
+    if transaction is not None and not transaction.register_plan(
+        patch_kind,
+        normalized_file,
+        object_key,
+        retained_payload,
     ):
+        return False
+    if existing is not None and existing is not payload:
+        _cleanup_superseded_patch_payload(payload, existing)
+    _store_patch_value(bucket, object_key, retained_payload)
+    if isinstance(pending_files, set) and existing is None:
         pending_files.add(normalized_file)
+    return True
+
+
+def _commit_staged_deferred_patches(
+    staged: dict[str, dict[str, Any]],
+    target: dict[str, dict[str, Any]] | None,
+    *,
+    pending_files: set[str] | None,
+    patch_kind: str,
+    transaction: _DeferredPatchTransaction | None = None,
+) -> None:
+    if not isinstance(target, dict):
+        for bucket in staged.values():
+            _cleanup_deferred_patch_bucket(bucket)
+        return
+    for file_key, bucket in staged.items():
+        if not isinstance(bucket, dict):
+            continue
+        seen_object_keys: set[str] = set()
+        for object_key, payload in bucket.items():
+            canonical_object_key = str(object_key).lower()
+            if canonical_object_key in seen_object_keys:
+                continue
+            seen_object_keys.add(canonical_object_key)
+            if transaction is not None and not transaction.register_plan(
+                patch_kind,
+                file_key,
+                object_key,
+                payload,
+            ):
+                _cleanup_deferred_patch_bucket({object_key: payload})
+                continue
+            _register_deferred_patch(
+                target,
+                file_key,
+                object_key,
+                payload,
+                pending_files=pending_files,
+                patch_kind=patch_kind,
+            )
 
 
 def _unitypy_supports_streaming_save() -> bool:
     """KR: 현재 UnityPy가 메모리 절감용 save_to() 스트리밍 저장 API를 지원하는지 확인합니다.
     EN: Checks whether the current UnityPy supports the memory-saving save_to() streaming save API.
     """
-    try:
-        from UnityPy.files.BundleFile import BundleFile as _BundleFile
-        from UnityPy.files.SerializedFile import SerializedFile as _SerializedFile
-    except Exception:
-        return False
-    return callable(getattr(_BundleFile, "save_to", None)) and callable(
-        getattr(_SerializedFile, "save_to", None)
-    )
+    return not missing_low_memory_features()
 
 
 def _ensure_custom_unitypy_streaming_save(lang: Language = "ko") -> None:
@@ -4986,16 +5524,20 @@ def _ensure_custom_unitypy_streaming_save(lang: Language = "ko") -> None:
     if _unitypy_supports_streaming_save():
         return
     unitypy_path = getattr(UnityPy, "__file__", "")
+    unitypy_version = getattr(UnityPy, "__version__", "unknown")
+    missing = ", ".join(missing_low_memory_features())
     if lang == "ko":
         raise RuntimeError(
-            "현재 UnityPy에는 메모리 절감용 save_to() 구현이 없습니다.\n"
-            "커스텀 UnityPy를 다시 설치해 주세요.\n"
-            f"현재 로드 경로: {unitypy_path}"
+            "현재 UnityPy에는 필요한 저메모리 로드/저장 구현이 없습니다.\n"
+            "커스텀 UnityPy 1.25.2 이상을 다시 설치해 주세요.\n"
+            f"누락 기능: {missing}\n"
+            f"현재 버전/경로: {unitypy_version} / {unitypy_path}"
         )
     raise RuntimeError(
-        "The currently loaded UnityPy does not provide the memory-saving save_to() APIs.\n"
-        "Reinstall the custom UnityPy build.\n"
-        f"Loaded from: {unitypy_path}"
+        "The loaded UnityPy does not provide the required low-memory load/save APIs.\n"
+        "Reinstall custom UnityPy 1.25.2 or newer.\n"
+        f"Missing features: {missing}\n"
+        f"Loaded version/path: {unitypy_version} / {unitypy_path}"
     )
 
 
@@ -5029,6 +5571,12 @@ def _best_atlas_ref(
     """
     new_any = _first_atlas_ref(data.get("m_AtlasTextures"))
     new_valid = _first_valid_atlas_ref(data.get("m_AtlasTextures"))
+    singular_any = (
+        cast(JsonDict | None, data.get("m_AtlasTexture"))
+        if isinstance(data.get("m_AtlasTexture"), dict)
+        else None
+    )
+    singular_valid = singular_any if _has_real_atlas_path(singular_any) else None
     old_any = (
         cast(JsonDict | None, data.get("atlas"))
         if isinstance(data.get("atlas"), dict)
@@ -5037,9 +5585,9 @@ def _best_atlas_ref(
     old_valid = old_any if _has_real_atlas_path(old_any) else None
 
     ordered = (
-        (new_valid, old_valid, new_any, old_any)
+        (new_valid, singular_valid, old_valid, new_any, singular_any, old_any)
         if prefer_new
-        else (old_valid, new_valid, old_any, new_any)
+        else (old_valid, new_valid, singular_valid, old_any, new_any, singular_any)
     )
     for ref in ordered:
         if isinstance(ref, dict):
@@ -5483,7 +6031,10 @@ def detect_tmp_version(
 
     has_new_face = isinstance(data.get("m_FaceInfo"), dict)
     has_old_face = isinstance(data.get("m_fontInfo"), dict)
-    has_new_atlas = _first_atlas_ref(data.get("m_AtlasTextures")) is not None
+    has_new_atlas = (
+        _first_atlas_ref(data.get("m_AtlasTextures")) is not None
+        or isinstance(data.get("m_AtlasTexture"), dict)
+    )
     has_old_atlas = isinstance(data.get("atlas"), dict)
 
     # KR: 두 포맷 키가 동시에 있어도 실제 글리프가 있는 쪽을 우선합니다.
@@ -5499,6 +6050,20 @@ def detect_tmp_version(
         return "new" if has_new_face else "old"
     if has_new_atlas != has_old_atlas:
         return "new" if has_new_atlas else "old"
+
+    # KR: 실제 신형 필드가 있으면 Unity 버전 힌트보다 우선합니다.
+    # EN: Actual new-schema fields take priority over the Unity version hint.
+    if any(
+        key in data
+        for key in (
+            "m_GlyphTable",
+            "m_CharacterTable",
+            "m_AtlasTextures",
+            "m_AtlasTexture",
+            "m_AtlasWidth",
+        )
+    ):
+        return "new"
 
     # KR: Unity-Runtime-Libraries 기준 버전 힌트(2018.3.14 / 2018.4.2)를 사용합니다.
     # EN: Uses version hints based on Unity-Runtime-Libraries (2018.3.14 / 2018.4.2).
@@ -5530,6 +6095,11 @@ def inspect_tmp_font_schema(
     has_new_face = isinstance(data.get("m_FaceInfo"), dict)
     has_old_face = isinstance(data.get("m_fontInfo"), dict)
     new_atlas_ref = _first_atlas_ref(data.get("m_AtlasTextures"))
+    singular_atlas_ref = (
+        cast(JsonDict | None, data.get("m_AtlasTexture"))
+        if isinstance(data.get("m_AtlasTexture"), dict)
+        else None
+    )
     old_atlas_ref = (
         cast(JsonDict | None, data.get("atlas"))
         if isinstance(data.get("atlas"), dict)
@@ -5551,6 +6121,7 @@ def inspect_tmp_font_schema(
         or has_new_face
         or has_old_face
         or new_atlas_ref is not None
+        or singular_atlas_ref is not None
         or old_atlas_ref is not None
     )
 
@@ -5595,6 +6166,7 @@ def convert_face_info_new_to_old(
     atlas_padding: int = 0,
     atlas_width: int = 0,
     atlas_height: int = 0,
+    character_count: int = 0,
 ) -> JsonDict:
     """KR: 신형 m_FaceInfo를 구형 m_fontInfo 구조로 변환합니다.
     EN: Converts new-format m_FaceInfo to old-format m_fontInfo structure.
@@ -5603,7 +6175,7 @@ def convert_face_info_new_to_old(
         "Name": face_info.get("m_FamilyName", ""),
         "PointSize": face_info.get("m_PointSize", 0),
         "Scale": face_info.get("m_Scale", 1.0),
-        "CharacterCount": 0,
+        "CharacterCount": int(character_count),
         "LineHeight": face_info.get("m_LineHeight", 0),
         "Baseline": face_info.get("m_Baseline", 0),
         "Ascender": face_info.get("m_AscentLine", 0),
@@ -5695,7 +6267,7 @@ def convert_glyphs_new_to_old(
     result: list[JsonDict] = []
     for char in char_table:
         unicode_val = char.get("m_Unicode", 0)
-        glyph_idx = char.get("m_GlyphIndex", 0)
+        glyph_idx = int(char.get("m_GlyphIndex", 0) or 0)
         g = glyph_by_index.get(glyph_idx, {})
         metrics = g.get("m_Metrics", {})
         rect = g.get("m_GlyphRect", {})
@@ -5710,8 +6282,10 @@ def convert_glyphs_new_to_old(
                 "id": int(unicode_val),
                 "x": float(rect.get("m_X", 0)),
                 "y": rect_y,
-                "width": float(metrics.get("m_Width", 0)),
-                "height": float(metrics.get("m_Height", 0)),
+                # TMP legacy width/height describe the packed atlas rect, not
+                # the advance/bearing metrics.
+                "width": float(rect.get("m_Width", 0)),
+                "height": float(rect.get("m_Height", 0)),
                 "xOffset": float(metrics.get("m_HorizontalBearingX", 0)),
                 "yOffset": float(metrics.get("m_HorizontalBearingY", 0)),
                 "xAdvance": float(metrics.get("m_HorizontalAdvance", 0)),
@@ -5813,7 +6387,10 @@ def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
         # KR: 구형 atlas 참조를 신형 atlas 배열 필드로 보정합니다.
         # EN: Adjusts old-format atlas references to new-format atlas array fields.
         if "m_AtlasTextures" not in result or not result["m_AtlasTextures"]:
-            atlas_ref = result.get("atlas", {"m_FileID": 0, "m_PathID": 0})
+            atlas_ref = _best_atlas_ref(result, prefer_new=False) or {
+                "m_FileID": 0,
+                "m_PathID": 0,
+            }
             result["m_AtlasTextures"] = [atlas_ref]
         result.setdefault("m_AtlasWidth", int(atlas_width))
         result.setdefault("m_AtlasHeight", int(atlas_height))
@@ -5863,8 +6440,11 @@ def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
                         "m_PathID": int(tex.get("m_PathID", 0) or 0),
                     }
                 )
-    if not atlas_textures and isinstance(result.get("atlas"), dict):
-        atlas_ref = cast(JsonDict, result.get("atlas"))
+    if not atlas_textures:
+        atlas_ref = _best_atlas_ref(result, prefer_new=True)
+    else:
+        atlas_ref = None
+    if not atlas_textures and isinstance(atlas_ref, dict):
         atlas_textures.append(
             {
                 "m_FileID": int(atlas_ref.get("m_FileID", 0) or 0),
@@ -5921,6 +6501,7 @@ def find_assets_files(
     """
     data_path = get_data_path(game_path, lang=lang)
     assets_files: list[str] = []
+    skipped_split_files: list[str] = []
     normalized_targets = (
         {os.path.basename(name) for name in target_files} if target_files else None
     )
@@ -5953,6 +6534,8 @@ def find_assets_files(
         ".map",
         ".resource",
         ".resources",
+        ".rollback",
+        ".tmp",
     }
     if exclude_exts:
         blacklist_exts.update({str(ext).lower() for ext in exclude_exts if ext})
@@ -5963,8 +6546,17 @@ def find_assets_files(
         )
     ]
 
+    normalized_data_root = os.path.normcase(os.path.normpath(data_path))
     for root, dirs, files in os.walk(data_path):
         normalized_root = os.path.normcase(os.path.normpath(root))
+        excluded_tool_dirs = {".unity_font_replacer_rollback"}
+        if normalized_root == normalized_data_root:
+            excluded_tool_dirs.add("temp")
+        dirs[:] = [
+            directory
+            for directory in dirs
+            if directory.lower() not in excluded_tool_dirs
+        ]
         if any(
             normalized_root == prefix
             or normalized_root.startswith(prefix + os.sep)
@@ -5975,11 +6567,28 @@ def find_assets_files(
         for fn in files:
             if normalized_targets is not None and fn not in normalized_targets:
                 continue
+            if _UNITY_SPLIT_FILE_RE.search(fn):
+                # UnityPy can merge split files for reading, but save_to() emits
+                # one complete file and cannot safely reconstruct the pieces.
+                skipped_split_files.append(os.path.join(root, fn))
+                continue
             ext = os.path.splitext(fn)[1].lower()
             if ext in blacklist_exts:
                 continue
             assets_files.append(os.path.join(root, fn))
     assets_files.sort()
+    if skipped_split_files:
+        if lang == "ko":
+            _log_console(
+                "경고: 안전한 재분할 저장을 지원하지 않아 Unity .splitN 파일 "
+                f"{len(skipped_split_files)}개를 건너뜁니다."
+            )
+        else:
+            _log_console(
+                "Warning: skipped "
+                f"{len(skipped_split_files)} Unity .splitN file(s); safe split-file "
+                "saving is not supported."
+            )
     return assets_files
 
 
@@ -6170,7 +6779,7 @@ def _scan_fonts_from_env(
 
 def _scan_fonts_in_asset_file(
     assets_file: str,
-    generator: TypeTreeGenerator,
+    generator: TypeTreeGenerator | None,
     lang: Language = "ko",
     detect_ps5_swizzle: bool = False,
     scan_ttf: bool = True,
@@ -6184,7 +6793,7 @@ def _scan_fonts_in_asset_file(
 
     env = None
     try:
-        env = UnityPy.load(assets_file)
+        env = load_unitypy(assets_file)
         env.typetree_generator = generator
     except Exception as e:
         if lang == "ko":
@@ -6390,20 +6999,27 @@ def scan_fonts(
     If isolate_files=True, scans via per-file worker processes to isolate crashes.
     If scan_jobs>1, runs workers in parallel on the isolate_files path.
     """
-    data_path = get_data_path(game_path, lang=lang)
     scan_ttf = bool(scan_ttf)
     scan_sdf = bool(scan_sdf)
-    unity_version = get_unity_version(game_path, lang=lang)
+    if not scan_ttf and not scan_sdf:
+        return {"ttf": [], "sdf": []}
+
+    data_path = get_data_path(game_path, lang=lang)
     assets_files = find_assets_files(
         game_path,
         lang=lang,
         target_files=target_files,
         exclude_exts=exclude_exts,
     )
-    compile_method = get_compile_method(data_path)
-    generator = _create_generator(
-        unity_version, game_path, data_path, compile_method, lang=lang
-    )
+    generator: TypeTreeGenerator | None = None
+    # KR: 격리 워커는 자체 generator를 만들며, TTF-only 스캔은 TypeTree가 필요 없습니다.
+    # EN: Isolated workers create their own generator, and TTF-only scans need no TypeTree.
+    if not isolate_files and scan_sdf:
+        unity_version = get_unity_version(game_path, lang=lang)
+        compile_method = get_compile_method(data_path)
+        generator = _create_generator(
+            unity_version, game_path, data_path, compile_method, lang=lang
+        )
 
     fonts: dict[str, list[JsonDict]] = {
         "ttf": [],
@@ -6832,6 +7448,50 @@ def _resolve_ttf_source_path(source: str, script_dir: str | None = None) -> str 
     return None
 
 
+def _sync_single_atlas_state(
+    data: JsonDict,
+    file_id: int,
+    path_id: int,
+    *,
+    reference_template: JsonDict | None = None,
+) -> None:
+    """Synchronize only existing TMP atlas fields for one baked atlas."""
+    atlas_ref = copy.deepcopy(reference_template) if reference_template else {}
+    atlas_ref["m_FileID"] = int(file_id)
+    atlas_ref["m_PathID"] = int(path_id)
+    if isinstance(data.get("m_AtlasTextures"), list):
+        data["m_AtlasTextures"] = [copy.deepcopy(atlas_ref)]
+    for singular_key in ("m_AtlasTexture", "atlas"):
+        singular = data.get(singular_key)
+        if isinstance(singular, dict):
+            singular["m_FileID"] = int(file_id)
+            singular["m_PathID"] = int(path_id)
+    if "m_AtlasTextureIndex" in data:
+        data["m_AtlasTextureIndex"] = 0
+    if "m_IsMultiAtlasTexturesEnabled" in data:
+        data["m_IsMultiAtlasTexturesEnabled"] = False
+    if "m_AtlasPopulationMode" in data:
+        data["m_AtlasPopulationMode"] = 0
+    if "InternalDynamicOS" in data:
+        data["InternalDynamicOS"] = False
+
+
+def _get_tmp_material_reference(
+    data: JsonDict,
+) -> tuple[str | None, int, int]:
+    """Return an optional TMP material PPtr without assuming either key exists."""
+    key = next(
+        (
+            candidate
+            for candidate in ("m_Material", "material")
+            if isinstance(data.get(candidate), dict)
+        ),
+        None,
+    )
+    file_id, path_id = _atlas_ref_ids(data.get(key) if key else None)
+    return key, file_id, path_id
+
+
 def _fallback_font_display_name(fallback_name: str) -> str:
     raw = strip_wrapping_quotes_repeated(str(fallback_name)).strip()
     if not raw:
@@ -6877,7 +7537,8 @@ def read_ttf_font_metadata(
 ) -> JsonDict:
     fallback = _fallback_font_display_name(fallback_name)
     metadata: JsonDict = {
-        "font_names": [fallback],
+        "parsed": False,
+        "font_names": [],
         "ascent": None,
         "descent": None,
         "line_spacing": None,
@@ -6933,6 +7594,7 @@ def read_ttf_font_metadata(
                 metadata["ascent"] = float(ascent * scale)
                 metadata["descent"] = float(descent * scale)
                 metadata["line_spacing"] = float((ascent - descent + line_gap) * scale)
+            metadata["parsed"] = True
     except Exception:
         return metadata
 
@@ -6950,7 +7612,12 @@ def apply_ttf_metadata_to_font(
         font_size=getattr(font, "m_FontSize", 16.0),
     )
     font_names = metadata.get("font_names")
-    if isinstance(font_names, list) and font_names and hasattr(font, "m_FontNames"):
+    if (
+        metadata.get("parsed")
+        and isinstance(font_names, list)
+        and font_names
+        and hasattr(font, "m_FontNames")
+    ):
         font.m_FontNames = font_names
     for attr, key in (
         ("m_Ascent", "ascent"),
@@ -6993,7 +7660,7 @@ def resolve_charset_source(
     return raw
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=1)
 def _load_generated_font_assets_cached(
     script_dir: str,
     ttf_path: str,
@@ -7049,11 +7716,28 @@ def _load_generated_font_assets_cached(
     if isinstance(sdf_data, dict) and not isinstance(sdf_data_normalized, dict):
         sdf_data_normalized = normalize_sdf_data(sdf_data, deep_copy=True)
 
+    generated_atlas_path = None
+    generated_atlas = generated.get("sdf_atlas")
+    if isinstance(generated_atlas, Image.Image):
+        atlas_temp_dir = tempfile.mkdtemp(prefix="unity_font_replacer_generated_")
+        register_temp_dir_for_cleanup(atlas_temp_dir)
+        generated_atlas_path = os.path.join(atlas_temp_dir, "atlas.png")
+        try:
+            generated_atlas.save(generated_atlas_path, format="PNG")
+        except Exception:
+            shutil.rmtree(atlas_temp_dir, ignore_errors=True)
+            generated_atlas_path = None
+        finally:
+            try:
+                generated_atlas.close()
+            except Exception:
+                pass
+
     return {
         "ttf_data": generated.get("ttf_data") or ttf_data,
         "sdf_data": sdf_data,
         "sdf_data_normalized": sdf_data_normalized,
-        "sdf_atlas": generated.get("sdf_atlas"),
+        "sdf_atlas_path": generated_atlas_path,
         "sdf_materials": generated.get("sdf_materials"),
         "sdf_swizzle": False,
         "sdf_process_swizzle": False,
@@ -7152,7 +7836,7 @@ def _estimate_sdf_texture_batch_profile(
     }
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=2)
 def _load_font_assets_cached(
     script_dir: str,
     normalized: str,
@@ -7202,17 +7886,17 @@ def _load_font_assets_cached(
         if sdf_data is not None:
             break
 
-    sdf_atlas = None
+    sdf_atlas_path = None
     for name_candidate in name_candidates:
         for asset_root in asset_roots:
-            sdf_atlas_path = os.path.join(asset_root, f"{name_candidate} Atlas.png")
-            if not os.path.exists(sdf_atlas_path):
+            candidate_atlas_path = os.path.join(
+                asset_root, f"{name_candidate} Atlas.png"
+            )
+            if not os.path.exists(candidate_atlas_path):
                 continue
-            with open(sdf_atlas_path, "rb") as f:
-                sdf_atlas = Image.open(f)
-                sdf_atlas.load()
+            sdf_atlas_path = candidate_atlas_path
             break
-        if sdf_atlas is not None:
+        if sdf_atlas_path is not None:
             break
 
     sdf_material_data = None
@@ -7233,7 +7917,9 @@ def _load_font_assets_cached(
         "ttf_data": ttf_data,
         "sdf_data": sdf_data,
         "sdf_data_normalized": sdf_data_normalized,
-        "sdf_atlas": sdf_atlas,
+        # KR: 디코드된 4096x4096 PIL 이미지는 캐시하지 않고 경로만 보관합니다.
+        # EN: Cache only the path, not a decoded 4096x4096 PIL image.
+        "sdf_atlas_path": sdf_atlas_path,
         "sdf_materials": sdf_material_data,
         "sdf_swizzle": sdf_swizzle,
         "sdf_process_swizzle": sdf_process_swizzle,
@@ -7280,7 +7966,10 @@ def load_font_assets(
         and (
             explicit_ttf_source
             or charset_source
-            or not (cached_assets.get("sdf_data") and cached_assets.get("sdf_atlas"))
+            or not (
+                cached_assets.get("sdf_data")
+                and cached_assets.get("sdf_atlas_path")
+            )
         )
     ):
         generated_assets = _load_generated_font_assets_cached(
@@ -7291,12 +7980,27 @@ def load_font_assets(
             resolve_charset_source(charset_source, script_dir),
         )
 
-    if generated_assets.get("sdf_data") and generated_assets.get("sdf_atlas"):
+    generated_atlas = None
+    if generated_assets.get("sdf_data") and generated_assets.get("sdf_atlas_path"):
+        generated_atlas_path = generated_assets.get("sdf_atlas_path")
+        if isinstance(generated_atlas_path, str) and generated_atlas_path:
+            try:
+                with Image.open(generated_atlas_path) as source_atlas:
+                    generated_atlas = source_atlas.copy()
+                    generated_atlas.load()
+            except Exception:
+                generated_atlas = None
+        if generated_atlas is None:
+            generated_assets = {}
+
+    if generated_assets.get("sdf_data") and isinstance(
+        generated_atlas, Image.Image
+    ):
         return {
             "ttf_data": generated_assets.get("ttf_data") or ttf_data,
             "sdf_data": generated_assets.get("sdf_data"),
             "sdf_data_normalized": generated_assets.get("sdf_data_normalized"),
-            "sdf_atlas": generated_assets.get("sdf_atlas"),
+            "sdf_atlas": generated_atlas,
             "sdf_materials": generated_assets.get("sdf_materials"),
             "sdf_swizzle": generated_assets.get("sdf_swizzle"),
             "sdf_process_swizzle": bool(
@@ -7305,7 +8009,15 @@ def load_font_assets(
             "padding_variant": generated_assets.get("padding_variant"),
         }
 
-    atlas = cached_assets["sdf_atlas"]
+    atlas = None
+    atlas_path = cached_assets.get("sdf_atlas_path")
+    if isinstance(atlas_path, str) and atlas_path:
+        try:
+            with Image.open(atlas_path) as source_atlas:
+                atlas = source_atlas.copy()
+                atlas.load()
+        except Exception:
+            atlas = None
     return {
         "ttf_data": ttf_data,
         "sdf_data": cached_assets["sdf_data"],
@@ -7322,7 +8034,114 @@ def load_font_assets(
 
 # KR: TypeTree에 정의되지 않은 trailing bytes를 ObjectReader path_id 기준으로 보존합니다.
 # EN: Preserves trailing bytes not defined in TypeTree, keyed by ObjectReader path_id.
-_trailing_bytes_store: dict[int, bytes] = {}
+_trailing_bytes_store: dict[int, tuple[weakref.ReferenceType[Any], bytes]] = {}
+
+
+def _store_trailing_bytes(obj: Any, trailing: bytes) -> None:
+    obj_id = id(obj)
+    if trailing:
+        def _discard_dead(ref: weakref.ReferenceType[Any], key: int = obj_id) -> None:
+            current = _trailing_bytes_store.get(key)
+            if current is not None and current[0] is ref:
+                _trailing_bytes_store.pop(key, None)
+
+        _trailing_bytes_store[obj_id] = (
+            weakref.ref(obj, _discard_dead),
+            bytes(trailing),
+        )
+    else:
+        _trailing_bytes_store.pop(obj_id, None)
+
+
+def _pop_trailing_bytes(obj: Any) -> bytes:
+    entry = _trailing_bytes_store.pop(id(obj), None)
+    if entry is None:
+        return b""
+    obj_ref, trailing = entry
+    return trailing if obj_ref() is obj else b""
+
+
+class _TrailingBytesReplacer:
+    """Stream a UnityPy Replacer followed by preserved unknown bytes."""
+
+    __slots__ = ("base", "suffix", "size")
+
+    def __init__(self, base: Replacer, suffix: bytes):
+        self.base = base
+        self.suffix = bytes(suffix)
+        self.size = len(base) + len(self.suffix)
+
+    def __len__(self) -> int:
+        return self.size
+
+    def iter_chunks(self, chunk_size: int = 1024 * 1024):
+        yield from self.base.iter_chunks(chunk_size)
+        if self.suffix:
+            yield self.suffix
+
+    def write_to(self, writer: Any, chunk_size: int = 1024 * 1024) -> None:
+        self.base.write_to(writer, chunk_size)
+        if self.suffix:
+            writer.write(self.suffix)
+
+    def read_bytes(self) -> bytes:
+        return self.base.read_bytes() + self.suffix
+
+    def cleanup(self) -> None:
+        self.base.cleanup()
+
+
+class _SegmentedBytesReplacer:
+    """Stream byte segments without joining a full replacement object in memory."""
+
+    __slots__ = ("segments", "size")
+
+    def __init__(self, segments: Iterable[bytes | bytearray | memoryview]):
+        self.segments = [segment for segment in segments if len(segment)]
+        self.size = sum(len(segment) for segment in self.segments)
+
+    def __len__(self) -> int:
+        return self.size
+
+    def iter_chunks(self, chunk_size: int = 1024 * 1024):
+        for segment in self.segments:
+            view = segment if isinstance(segment, memoryview) else memoryview(segment)
+            position = 0
+            while position < len(view):
+                next_position = min(position + chunk_size, len(view))
+                yield view[position:next_position]
+                position = next_position
+
+    def write_to(self, writer: Any, chunk_size: int = 1024 * 1024) -> None:
+        for chunk in self.iter_chunks(chunk_size):
+            writer.write(chunk)
+
+    def read_bytes(self) -> bytes:
+        return b"".join(bytes(segment) for segment in self.segments)
+
+    def cleanup(self) -> None:
+        for segment in self.segments:
+            if isinstance(segment, memoryview):
+                try:
+                    segment.release()
+                except Exception:
+                    pass
+        self.segments.clear()
+
+
+def _append_trailing_bytes(obj: Any, trailing: bytes) -> None:
+    """Append trailing bytes without materializing a file-backed Replacer."""
+    if not trailing:
+        return
+    current = getattr(obj, "data", None)
+    if isinstance(current, Replacer):
+        # Avoid ObjectReader.set_raw_data() cleaning the base replacer that the
+        # composite still needs. Environment cleanup releases it after saving.
+        obj.data = _TrailingBytesReplacer(current, trailing)
+        obj.assets_file.mark_changed()
+        return
+    current_data = obj.get_raw_data()
+    obj.set_raw_data(current_data + trailing)
 
 
 def _capture_trailing_bytes(obj: Any) -> bytes:
@@ -7355,10 +8174,7 @@ def _safe_parse_as_object(obj: Any, **kwargs: Any) -> Any:
         if "Expected to read" in str(e) and "bytes" in str(e):
             result = obj.parse_as_object(check_read=False, **kwargs)
             trailing = _capture_trailing_bytes(obj)
-            if trailing:
-                _trailing_bytes_store[obj_id] = trailing
-            else:
-                _trailing_bytes_store.pop(obj_id, None)
+            _store_trailing_bytes(obj, trailing)
             return result
         raise
 
@@ -7380,10 +8196,7 @@ def _safe_parse_as_dict(obj: Any, **kwargs: Any) -> dict[str, Any]:
         if "Expected to read" in str(e) and "bytes" in str(e):
             result = obj.parse_as_dict(check_read=False, **kwargs)
             trailing = _capture_trailing_bytes(obj)
-            if trailing:
-                _trailing_bytes_store[obj_id] = trailing
-            else:
-                _trailing_bytes_store.pop(obj_id, None)
+            _store_trailing_bytes(obj, trailing)
             return result
         raise
 
@@ -7394,38 +8207,89 @@ def _safe_save(obj: Any, parse_dict: Any) -> None:
     """
     parse_dict.save()
     obj_id = id(obj)
-    trailing = _trailing_bytes_store.pop(obj_id, b"")
-    if trailing:
-        current_data = obj.get_raw_data()
-        obj.set_raw_data(current_data + trailing)
+    trailing = _pop_trailing_bytes(obj)
+    _append_trailing_bytes(obj, trailing)
 
 
 def _has_trailing_bytes(obj: Any) -> bool:
     """KR: 이 오브젝트에 TypeTree로 읽히지 않는 trailing bytes가 있는지 확인합니다.
     EN: Checks whether this object has trailing bytes not read by TypeTree.
     """
-    return id(obj) in _trailing_bytes_store
+    entry = _trailing_bytes_store.get(id(obj))
+    return entry is not None and entry[0]() is obj
 
 
-def _detect_typetree_size_mismatch(obj: Any) -> bool:
-    """KR: TypeTree로 읽은 후 다시 쓰면 원본보다 작아지는지 감지합니다.
-    중국판 Unity 등에서 TypeTree에 없는 추가 필드가 있으면 True를 반환합니다.
-    EN: Detects if re-writing after TypeTree read produces smaller output than the original.
-    Returns True if extra fields not in TypeTree exist (e.g. China Unity).
+class _CountingWriteStream:
+    """Seekable write sink that tracks length without retaining written bytes."""
+
+    def __init__(self) -> None:
+        self._position = 0
+        self._length = 0
+        self.closed = False
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            position = int(offset)
+        elif whence == 1:
+            position = self._position + int(offset)
+        elif whence == 2:
+            position = self._length + int(offset)
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+        if position < 0:
+            raise ValueError("negative seek position")
+        self._position = position
+        return position
+
+    def read(self, size: int = -1) -> bytes:
+        return b""
+
+    def write(self, data: Any) -> int:
+        size = len(data)
+        self._position += size
+        self._length = max(self._length, self._position)
+        return size
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _detect_typetree_size_mismatch(obj: Any, parsed_value: Any | None = None) -> bool:
+    """Detect China-Unity-style fields omitted by TypeTree serialization.
+
+    The previous implementation serialized into an in-memory ``BytesIO`` and
+    re-read the full Texture2D.  Count the serialized bytes instead, and let
+    callers pass the object they already parsed so large atlas data is neither
+    duplicated nor parsed twice.
     """
+    writer = None
     try:
         from UnityPy.helpers.TypeTreeHelper import write_typetree
         from UnityPy.streams import EndianBinaryWriter
-        original_raw = obj.get_raw_data()
-        d = obj.read_typetree(check_read=False)
+
+        value = (
+            parsed_value
+            if parsed_value is not None
+            else obj.read_typetree(check_read=False)
+        )
         node = obj._get_typetree_node()
-        w = EndianBinaryWriter(endian=obj.reader.endian)
-        write_typetree(d, node, w, obj.assets_file)
-        rewritten_size = w.Length
-        w.dispose()
-        return rewritten_size < len(original_raw)
+        writer = EndianBinaryWriter(
+            _CountingWriteStream(),
+            endian=obj.reader.endian,
+        )
+        write_typetree(value, node, writer, obj.assets_file)
+        return int(writer.Length) < int(obj.byte_size)
     except Exception:
         return False
+    finally:
+        if writer is not None:
+            try:
+                writer.dispose()
+            except Exception:
+                pass
 
 
 def _binary_patch_texture2d(
@@ -7475,18 +8339,6 @@ def _binary_patch_texture2d(
             except Exception:
                 continue
 
-    # KR: TypeTree로 파싱하여 image data 위치와 trailing bytes를 정확히 파악합니다.
-    # EN: Parses with TypeTree to precisely identify image data position and trailing bytes.
-    try:
-        d_temp = obj.read_typetree(check_read=False)
-        orig_w = int(d_temp.get("m_Width", 0))
-        orig_h = int(d_temp.get("m_Height", 0))
-        orig_cis = int(d_temp.get("m_CompleteImageSize", 0))
-        orig_img_data = d_temp.get("image data", b"")
-        orig_img_len = len(orig_img_data) if isinstance(orig_img_data, (bytes, bytearray, memoryview)) else 0
-    except Exception:
-        return False
-
     if stream_path_marker is not None:
         # KR: 스트리밍 모드 — 경로 문자열 기준으로 필드 위치를 역추적합니다.
         # EN: Streaming mode -- traces back field positions based on the path string.
@@ -7497,79 +8349,92 @@ def _binary_patch_texture2d(
         orig_stream_end = path_str_start + path_len
         orig_stream_end += (4 - orig_stream_end % 4) % 4
     else:
-        # KR: 이미 인라인 모드 (이전 교체로 .resS 참조가 제거됨) —
-        # raw 끝에서 trailing + empty StreamData + image data 역순으로 위치를 계산합니다.
-        # EN: Already inline mode (.resS reference removed by previous replacement) --
-        # Calculates positions in reverse from raw end: trailing + empty StreamData + image data.
-        #
-        # KR: 레이아웃 (인라인, 빈 StreamData):
-        #   ... 메타데이터 ...
-        # EN: Layout (inline, empty StreamData):
-        #   ... metadata ...
-        #   int image_data_size
-        #   byte[] image_data (+ 4바이트 정렬)
-        #   uint64 stream_offset = 0
-        #   uint32 stream_size = 0
-        #   int path_len = 0
-        #   (4바이트 정렬)
-        #   [trailing bytes]
-        #
-        # KR: StreamData (빈 상태) = 8 + 4 + 4 = 16바이트 (이미 정렬됨)
-        # Image data 블록 = 4 (크기 prefix) + orig_img_len + 정렬 패딩
-        # EN: StreamData (empty) = 8 + 4 + 4 = 16 bytes (already aligned)
-        # Image data block = 4 (size prefix) + orig_img_len + alignment padding
-
-        # KR: TypeTree가 읽은 바이트 수를 계산합니다
-        # EN: Calculates the number of bytes read by TypeTree
-        obj.reset()
-        pos0 = obj.reader.Position
-        obj.read_typetree(check_read=False)
-        pos1 = obj.reader.Position
-        typetree_bytes = pos1 - pos0
-
-        trailing_size = len(original_raw) - typetree_bytes
-        # KR: StreamData (빈 상태) 크기: uint64(8) + uint32(4) + int32(4) = 16
-        # EN: StreamData (empty state) size: uint64(8) + uint32(4) + int32(4) = 16
-        empty_stream_data_size = 16
-        # KR: image data 블록: 4 (크기 prefix) + 데이터 + 패딩
-        # EN: image data block: 4 (size prefix) + data + padding
-        img_block_size = 4 + orig_img_len
-        img_block_padded = img_block_size + (4 - img_block_size % 4) % 4
-
-        image_data_size_pos = typetree_bytes - trailing_size - empty_stream_data_size - img_block_padded
-        if image_data_size_pos < 0:
-            # KR: 위치 계산 실패 — 대안: metadata 크기를 직접 계산
-            # 메타데이터 = total_raw - trailing - empty_stream - img_block
-            # EN: Position calculation failed -- fallback: compute metadata size directly
-            # metadata = total_raw - trailing - empty_stream - img_block
-            image_data_size_pos = len(original_raw) - trailing_size - empty_stream_data_size - img_block_padded
-        orig_stream_end = len(original_raw) - trailing_size
-
-    if image_data_size_pos < 0 or image_data_size_pos >= len(original_raw):
-        return False
+        image_data_size_pos = -1
+        orig_stream_end = len(original_raw)
 
     # KR: TypeTree 파싱으로 정확한 필드 오프셋을 구하고, 원본 raw를 직접 패치합니다.
     # EN: Obtains exact field offsets via TypeTree parsing and directly patches the original raw data.
     from UnityPy.helpers.TypeTreeHelper import TypeTreeConfig as _TTC, read_value as _rv
     from UnityPy.streams import EndianBinaryReader as _EBR
     field_offsets: dict[str, int] = {}
+    typetree_end: int | None = None
+    _tmp_reader = None
+    _root_node = None
     try:
         _tmp_reader = _EBR(original_raw, endian=obj.reader.endian)
         _tmp_config = _TTC(True, obj.assets_file, False)
-        _node = obj._get_typetree_node()
-        for _child in _node.m_Children:
+        _root_node = obj._get_typetree_node()
+        for _child in _root_node.m_Children:
             _pos_before = _tmp_reader.Position
-            _rv(_child, _tmp_reader, _tmp_config)
             field_offsets[_child.m_Name] = _pos_before
+            if _child.m_Name == "image data" and _child.m_Type == "TypelessData":
+                _image_length = int(_tmp_reader.read_int())
+                if _image_length < 0 or _image_length > (
+                    _tmp_reader.Length - _tmp_reader.Position
+                ):
+                    raise ValueError("invalid Texture2D image data length")
+                _tmp_reader.Position += _image_length
+                _tmp_reader.align_stream()
+            else:
+                _rv(_child, _tmp_reader, _tmp_config)
+        typetree_end = int(_tmp_reader.Position)
     except Exception:
         pass
+    finally:
+        if _tmp_reader is not None:
+            try:
+                _tmp_reader.dispose()
+            except Exception:
+                pass
 
     # KR: image data 필드의 시작 오프셋 = image_data_size_pos (TypeTree 기준)
     # EN: Start offset of the image data field = image_data_size_pos (TypeTree basis)
     if "image data" in field_offsets:
         image_data_size_pos = field_offsets["image data"]
 
-    part1 = bytearray(original_raw[:image_data_size_pos])
+    if (
+        stream_path_marker is None
+        and (image_data_size_pos < 0 or typetree_end is None)
+    ):
+        # Rare fallback for TypeTrees whose child traversal failed. This path
+        # may materialize the old image once, but the normal binary fallback
+        # stays segmented and streaming.
+        try:
+            d_temp = obj.read_typetree(check_read=False)
+            orig_img_data = d_temp.get("image data", b"")
+            orig_img_len = (
+                len(orig_img_data)
+                if isinstance(orig_img_data, (bytes, bytearray, memoryview))
+                else 0
+            )
+            obj.reset()
+            pos0 = obj.reader.Position
+            obj.read_typetree(check_read=False)
+            typetree_bytes = obj.reader.Position - pos0
+            trailing_size = len(original_raw) - typetree_bytes
+            img_block_size = 4 + orig_img_len
+            img_block_padded = img_block_size + (4 - img_block_size % 4) % 4
+            if image_data_size_pos < 0:
+                image_data_size_pos = (
+                    len(original_raw) - trailing_size - 16 - img_block_padded
+                )
+            orig_stream_end = len(original_raw) - trailing_size
+            del orig_img_data, d_temp
+        except Exception:
+            return False
+
+    if image_data_size_pos < 0 or image_data_size_pos >= len(original_raw):
+        return False
+
+    part4_start = (
+        typetree_end
+        if "image data" in field_offsets and typetree_end is not None
+        else orig_stream_end
+    )
+    if part4_start < image_data_size_pos or part4_start > len(original_raw):
+        return False
+
+    part1 = bytearray(memoryview(original_raw)[:image_data_size_pos])
 
     # KR: 정확한 오프셋으로 필드 패치 (패턴 검색 대신 직접 오프셋 사용)
     # EN: Patches fields at exact offsets (uses direct offsets instead of pattern search)
@@ -7580,53 +8445,114 @@ def _binary_patch_texture2d(
     if "m_CompleteImageSize" in field_offsets and field_offsets["m_CompleteImageSize"] + 4 <= len(part1):
         _struct.pack_into("<I", part1, field_offsets["m_CompleteImageSize"], len(image_data))
 
-    part1 = bytes(part1)
+    image_size_prefix = _struct.pack("<i", len(image_data))
+    image_block_size = len(image_size_prefix) + len(image_data)
+    image_padding = b"\x00" * ((4 - image_block_size % 4) % 4)
+    empty_stream_data = b""
+    stream_node = next(
+        (
+            child
+            for child in getattr(_root_node, "m_Children", [])
+            if child.m_Name == "m_StreamData"
+        ),
+        None,
+    )
+    if stream_node is not None:
+        from UnityPy.helpers.TypeTreeHelper import write_typetree as _write_typetree
+        from UnityPy.streams import EndianBinaryWriter as _EBW
 
-    # KR: Part 2+3 — inline image data + 빈 StreamingInfo
-    # EN: Part 2+3 -- inline image data + empty StreamingInfo
-    from UnityPy.streams import EndianBinaryWriter
-    w = EndianBinaryWriter(endian="<")
-    w.write_int(len(image_data))
-    w.write(image_data)
-    pos = w.Length
-    pad = (4 - pos % 4) % 4
-    if pad:
-        w.write(b"\x00" * pad)
-    # KR: 빈 StreamingInfo
-    # EN: Empty StreamingInfo
-    w.write_u_long(0)   # offset
-    w.write_u_int(0)    # size
-    w.write_int(0)      # empty path (length=0)
-    pos = w.Length
-    pad = (4 - pos % 4) % 4
-    if pad:
-        w.write(b"\x00" * pad)
-    part2_3 = w.bytes
-    w.dispose()
-
-    # KR: Part 4 — trailing bytes (TypeTree가 읽은 이후의 바이트)
-    # EN: Part 4 -- trailing bytes (bytes after what TypeTree read)
-    if "image data" in field_offsets and _tmp_reader is not None:
-        # KR: TypeTree가 읽은 총 바이트 수를 사용
-        # EN: Uses the total number of bytes read by TypeTree
-        typetree_end = _tmp_reader.Position
-        part4 = original_raw[typetree_end:]
-    else:
-        part4 = original_raw[orig_stream_end:]
-
-    new_raw = part1 + part2_3 + part4
-    obj.set_raw_data(new_raw)
-    obj.assets_file.mark_changed()
+        stream_writer = _EBW(endian=obj.reader.endian)
+        try:
+            empty_stream_value = {
+                child.m_Name: "" if child.m_Type == "string" else 0
+                for child in stream_node.m_Children
+            }
+            _write_typetree(
+                empty_stream_value,
+                stream_node,
+                stream_writer,
+                obj.assets_file,
+            )
+            empty_stream_data = stream_writer.bytes
+        except Exception:
+            return False
+        finally:
+            stream_writer.dispose()
+    # Copy only the normally-small unknown tail so the segmented replacer does
+    # not keep the entire old Texture2D payload alive through a memoryview.
+    trailing_bytes = bytes(memoryview(original_raw)[part4_start:])
+    replacement = _SegmentedBytesReplacer(
+        (
+            part1,
+            image_size_prefix,
+            image_data,
+            image_padding,
+            empty_stream_data,
+            trailing_bytes,
+        )
+    )
+    obj.set_raw_data(replacement)
 
     if lang == "ko":
         _log_debug(
             f"[binary_patch_texture2d] PathID={obj.path_id} "
-            f"orig_raw={len(original_raw)}B new_raw={len(new_raw):,}B "
-            f"trailing={len(part4)}B"
+            f"orig_raw={len(original_raw)}B new_raw={len(replacement):,}B "
+            f"trailing={len(trailing_bytes)}B"
         )
     return True
 
 
+def _cleanup_replace_call_resources(func: Callable[..., bool]) -> Callable[..., bool]:
+    """Remove per-call save and newly spilled payload files on exceptions."""
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> bool:
+        tmp_path: str | None = None
+        deferred_payload_dir: str | None = None
+        created_payload_dir = False
+        try:
+            bound = inspect.signature(func).bind_partial(*args, **kwargs)
+            game_path = str(bound.arguments.get("game_path", ""))
+            temp_root_dir = bound.arguments.get("temp_root_dir")
+            tmp_root = (
+                os.path.abspath(str(temp_root_dir))
+                if temp_root_dir is not None
+                else os.path.join(get_data_path(game_path), "temp")
+            )
+            tmp_path = os.path.join(tmp_root, "unity_font_replacer_temp")
+            supplied_payload_dir = bound.arguments.get("_deferred_payload_dir")
+            if supplied_payload_dir:
+                deferred_payload_dir = os.path.abspath(str(supplied_payload_dir))
+            else:
+                deferred_payload_root = os.path.join(
+                    tmp_root, "deferred_patch_payloads"
+                )
+                os.makedirs(deferred_payload_root, exist_ok=True)
+                deferred_payload_dir = tempfile.mkdtemp(
+                    prefix="call_", dir=deferred_payload_root
+                )
+                kwargs["_deferred_payload_dir"] = deferred_payload_dir
+                created_payload_dir = True
+        except Exception:
+            tmp_path = None
+        try:
+            return func(*args, **kwargs)
+        except BaseException:
+            if created_payload_dir and deferred_payload_dir:
+                shutil.rmtree(deferred_payload_dir, ignore_errors=True)
+            raise
+        finally:
+            if tmp_path and os.path.isdir(tmp_path):
+                try:
+                    shutil.rmtree(tmp_path)
+                except Exception:
+                    pass
+
+    return wrapper
+
+
+@cleanup_unitypy_environments
+@_cleanup_replace_call_resources
 def replace_fonts_in_file(
     unity_version: str,
     game_path: str,
@@ -7653,8 +8579,12 @@ def replace_fonts_in_file(
     deferred_material_plans: dict[str, dict[str, Any]] | None = None,
     deferred_material_atlas_plans: dict[str, dict[str, Any]] | None = None,
     pending_external_patch_files: set[str] | None = None,
+    logical_file_key: str | None = None,
     phase_callback: Callable[[str, JsonDict], None] | None = None,
     lang: Language = "ko",
+    deferred_transaction: _DeferredPatchTransaction | None = None,
+    operation_outcome: JsonDict | None = None,
+    _deferred_payload_dir: str | None = None,
 ) -> bool:
     """KR: 단일 assets 파일의 TTF/SDF 폰트를 교체하고 저장합니다.
 
@@ -7684,9 +8614,9 @@ def replace_fonts_in_file(
     temp_root_dir, if specified, is used as the temp storage directory root.
     """
     fn_without_path = os.path.basename(assets_file)
-    current_file_key = _normalize_asset_file_key(assets_file) or os.path.abspath(
-        assets_file
-    )
+    if operation_outcome is not None:
+        operation_outcome.clear()
+    current_file_key = _resolve_current_file_key(assets_file, logical_file_key)
     data_path = get_data_path(game_path, lang=lang)
     using_custom_temp_root = temp_root_dir is not None
     tmp_root = (
@@ -7708,8 +8638,11 @@ def replace_fonts_in_file(
     if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
     os.makedirs(tmp_path, exist_ok=True)
-    deferred_payload_dir = os.path.join(tmp_root, "deferred_patch_payloads")
+    deferred_payload_dir = _deferred_payload_dir or os.path.join(
+        tmp_root, "deferred_patch_payloads"
+    )
     os.makedirs(deferred_payload_dir, exist_ok=True)
+    register_temp_dir_for_cleanup(deferred_payload_dir)
 
     phase_started_at = time.perf_counter()
     _emit_phase_callback(
@@ -7718,7 +8651,7 @@ def replace_fonts_in_file(
         file=fn_without_path,
         path=assets_file,
     )
-    env = UnityPy.load(assets_file)
+    env = load_unitypy(assets_file)
     _emit_phase_callback(
         phase_callback,
         "load_end",
@@ -7736,7 +8669,7 @@ def replace_fonts_in_file(
         )
     if not preview_export:
         _ensure_custom_unitypy_streaming_save(lang=lang)
-    if generator is None:
+    if generator is None and replace_sdf:
         compile_method = get_compile_method(data_path)
         generator = _create_generator(
             unity_version, game_path, data_path, compile_method, lang=lang
@@ -7783,7 +8716,15 @@ def replace_fonts_in_file(
                 material_object_count_by_pathid.get(material_path_id, 0) + 1
             )
 
+    target_ttf_targets: set[tuple[str, int]] = set()
+    satisfied_ttf_targets: set[tuple[str, int]] = set()
+    if replace_ttf:
+        for key in replacement_lookup:
+            if len(key) == 4 and key[0] == "TTF" and key[1] == fn_without_path:
+                target_ttf_targets.add((str(key[2]), int(key[3])))
+
     target_sdf_targets: set[tuple[str, int]] = set()
+    replacement_sdf_targets: set[tuple[str, int]] = set()
     target_sdf_pathids: set[int] = set()
     target_sdf_font_by_target: dict[tuple[str, int], str] = {}
     old_line_metric_keys = _OLD_LINE_METRIC_KEYS
@@ -7800,6 +8741,7 @@ def replace_fonts_in_file(
                 path_id = key[3]
                 target_key = (str(assets_key), int(path_id))
                 target_sdf_targets.add(target_key)
+                replacement_sdf_targets.add(target_key)
                 target_sdf_pathids.add(path_id)
                 target_sdf_font_by_target.setdefault(target_key, value)
         if preview_export:
@@ -7811,22 +8753,46 @@ def replace_fonts_in_file(
                 target_sdf_pathids.add(int(path_id))
     matched_sdf_targets = 0
     patched_sdf_targets = 0
+    patched_sdf_target_keys: set[tuple[str, int]] = set()
     sdf_parse_failure_reasons: list[str] = []
 
-    texture_patch_plans: dict[str, Any] = _copy_patch_bucket(
+    incoming_texture_plans = _copy_patch_bucket(
         deferred_texture_plans, current_file_key
     )
+    incoming_material_plans = _copy_patch_bucket(
+        deferred_material_plans, current_file_key
+    )
+    incoming_material_atlas_plans = _copy_patch_bucket(
+        deferred_material_atlas_plans, current_file_key
+    )
+    incoming_texture_ids = _patch_payload_ids(incoming_texture_plans)
+    incoming_material_ids = _patch_payload_ids(incoming_material_plans)
+    incoming_material_atlas_ids = _patch_payload_ids(incoming_material_atlas_plans)
+    consumed_texture_ids: set[int] = set()
+    consumed_material_ids: set[int] = set()
+    handled_material_atlas_ids: set[int] = set()
+    required_local_texture_ids: set[int] = set()
+    required_local_material_ids: set[int] = set()
+    required_resolution_errors: list[str] = []
+
+    texture_patch_plans: dict[str, Any] = dict(incoming_texture_plans)
+    owned_texture_patch_plans: dict[str, Any] = {}
     material_replacements: dict[str, JsonDict] = cast(
         dict[str, JsonDict],
-        _copy_patch_bucket(deferred_material_plans, current_file_key),
+        dict(incoming_material_plans),
     )
     material_replacements_by_pathid: dict[int, JsonDict] = {}
     material_replacements_by_atlas: dict[str, JsonDict] = cast(
         dict[str, JsonDict],
-        _copy_patch_bucket(deferred_material_atlas_plans, current_file_key),
+        dict(incoming_material_atlas_plans),
     )
+    staged_texture_plans: dict[str, dict[str, Any]] = {}
+    staged_material_plans: dict[str, dict[str, Any]] = {}
+    staged_material_atlas_plans: dict[str, dict[str, Any]] = {}
+    staged_pending_files: set[str] = set()
     ambiguous_material_fallback_warned: set[int] = set()
     modified = False
+    save_success = False
 
     for obj in env.objects:
         assets_name = obj.assets_file.name
@@ -7842,7 +8808,28 @@ def replace_fonts_in_file(
                     font = _safe_parse_as_object(obj)
                     _raw_font_data = getattr(font, "m_FontData", b"")
                     current_ttf_data = _raw_font_data if isinstance(_raw_font_data, bytes) else bytes(_raw_font_data)
-                    if current_ttf_data == assets["ttf_data"]:
+                    metadata_before = {
+                        attr: copy.deepcopy(getattr(font, attr, None))
+                        for attr in (
+                            "m_FontNames",
+                            "m_Ascent",
+                            "m_Descent",
+                            "m_LineSpacing",
+                        )
+                    }
+                    metadata = apply_ttf_metadata_to_font(
+                        font,
+                        assets["ttf_data"],
+                        fallback_name=replacement_font,
+                    )
+                    metadata_after = {
+                        attr: copy.deepcopy(getattr(font, attr, None))
+                        for attr in metadata_before
+                    }
+                    metadata_changed = metadata_before != metadata_after
+                    same_font_data = current_ttf_data == assets["ttf_data"]
+                    if same_font_data and not metadata_changed:
+                        satisfied_ttf_targets.add((str(assets_name), int(font_pathid)))
                         _log_debug(
                             f"[replace_ttf] file={fn_without_path} assets={assets_name} path_id={font_pathid} "
                             f"name={font.m_Name} target={replacement_font} action=skip_same size={len(current_ttf_data)}"
@@ -7856,11 +8843,21 @@ def replace_fonts_in_file(
                             _log_console(
                                 f"TTF already same (skip): {assets_name} | {font.m_Name} | "
                                 f"(PathID: {font_pathid} == {replacement_font})"
-                            )
+                        )
                         continue
-                    if lang == "ko":
+                    if lang == "ko" and same_font_data:
+                        _log_console(
+                            f"TTF 메타데이터 갱신: {assets_name} | {font.m_Name} | "
+                            f"(PathID: {font_pathid} == {replacement_font})"
+                        )
+                    elif lang == "ko":
                         _log_console(
                             f"TTF 폰트 교체: {assets_name} | {font.m_Name} | (PathID: {font_pathid} -> {replacement_font})"
+                        )
+                    elif same_font_data:
+                        _log_console(
+                            f"TTF metadata updated: {assets_name} | {font.m_Name} | "
+                            f"(PathID: {font_pathid} == {replacement_font})"
                         )
                     else:
                         _log_console(
@@ -7871,12 +8868,8 @@ def replace_fonts_in_file(
                         f"name={font.m_Name} target={replacement_font} "
                         f"old_size={len(current_ttf_data)} new_size={len(assets['ttf_data'])}"
                     )
-                    font.m_FontData = assets["ttf_data"]
-                    metadata = apply_ttf_metadata_to_font(
-                        font,
-                        assets["ttf_data"],
-                        fallback_name=replacement_font,
-                    )
+                    if not same_font_data:
+                        font.m_FontData = assets["ttf_data"]
                     _log_debug(
                         f"[replace_ttf] metadata path_id={font_pathid} "
                         f"font_names={metadata.get('font_names')} "
@@ -7885,6 +8878,7 @@ def replace_fonts_in_file(
                         f"line_spacing={metadata.get('line_spacing')}"
                     )
                     _safe_save(obj, font)
+                    satisfied_ttf_targets.add((str(assets_name), int(font_pathid)))
                     modified = True
 
         if obj.type.name == "MonoBehaviour" and replace_sdf:
@@ -8133,16 +9127,18 @@ def replace_fonts_in_file(
                         m_SourceFontFile_FileID = 0
                         m_SourceFontFile_PathID = 0
 
-                    if parse_dict.get("m_Material") is not None:
-                        m_Material_FileID = parse_dict["m_Material"]["m_FileID"]
-                        m_Material_PathID = parse_dict["m_Material"]["m_PathID"]
-                    else:
-                        m_Material_FileID = parse_dict["material"]["m_FileID"]
-                        m_Material_PathID = parse_dict["material"]["m_PathID"]
+                    (
+                        material_ref_key,
+                        m_Material_FileID,
+                        m_Material_PathID,
+                    ) = _get_tmp_material_reference(
+                        parse_dict
+                    )
 
-                    target_new_atlas_ref = _first_valid_atlas_ref(
-                        parse_dict.get("m_AtlasTextures")
-                    ) or _first_atlas_ref(parse_dict.get("m_AtlasTextures"))
+                    target_new_atlas_ref = _best_atlas_ref(
+                        parse_dict,
+                        prefer_new=True,
+                    )
                     target_old_atlas_ref = (
                         cast(JsonDict, parse_dict.get("atlas"))
                         if isinstance(parse_dict.get("atlas"), dict)
@@ -8229,16 +9225,29 @@ def replace_fonts_in_file(
                         )
                         parse_dict["m_FaceInfo"] = target_face_info
 
-                    replacement_glyph_table = (
+                    replacement_glyph_table = copy.deepcopy(
                         replace_data.get("m_GlyphTable", [])
                         if isinstance(replace_data.get("m_GlyphTable", []), list)
                         else []
                     )
-                    replacement_character_table = (
+                    replacement_character_table = copy.deepcopy(
                         replace_data.get("m_CharacterTable", [])
                         if isinstance(replace_data.get("m_CharacterTable", []), list)
                         else []
                     )
+                    nonzero_atlas_indexes = sorted(
+                        {
+                            int(glyph.get("m_AtlasIndex", 0) or 0)
+                            for glyph in replacement_glyph_table
+                            if isinstance(glyph, dict)
+                            and int(glyph.get("m_AtlasIndex", 0) or 0) != 0
+                        }
+                    )
+                    if nonzero_atlas_indexes:
+                        raise ValueError(
+                            "Multi-atlas replacement data is not supported; "
+                            f"found m_AtlasIndex values {nonzero_atlas_indexes}."
+                        )
 
                     if target_has_new_glyphs:
                         parse_dict["m_GlyphTable"] = replacement_glyph_table
@@ -8256,6 +9265,8 @@ def replace_fonts_in_file(
                                 parse_dict[glyph_index_key] = list(
                                     replacement_glyph_indexes
                                 )
+                    if "m_GlyphIndexListNewlyAdded" in parse_dict:
+                        parse_dict["m_GlyphIndexListNewlyAdded"] = []
 
                     if "m_AtlasWidth" in parse_dict:
                         parse_dict["m_AtlasWidth"] = int(
@@ -8292,6 +9303,12 @@ def replace_fonts_in_file(
                         parse_dict["m_FontWeightTable"] = replace_data.get(
                             "m_FontWeightTable", parse_dict.get("m_FontWeightTable", [])
                         )
+                    for record_table_key in ("m_FontFeatureTable", "m_KerningTable"):
+                        if record_table_key in parse_dict:
+                            _sync_existing_record_table(
+                                parse_dict.get(record_table_key),
+                                replace_data.get(record_table_key),
+                            )
 
                     if target_has_old_face or target_has_old_glyphs:
                         game_font_info = parse_dict.get("m_fontInfo", {})
@@ -8423,7 +9440,7 @@ def replace_fonts_in_file(
                     # KR: 신형/구형 필드가 공존하면 신형 face 기준으로 legacy face도 동기화합니다.
                     # EN: When both new and old fields coexist, synchronize the legacy face based on the new face info.
                     if target_has_new_face and target_has_old_face:
-                        parse_dict["m_fontInfo"] = convert_face_info_new_to_old(
+                        synced_old_face = convert_face_info_new_to_old(
                             parse_dict["m_FaceInfo"],
                             int(
                                 parse_dict.get(
@@ -8445,7 +9462,15 @@ def replace_fonts_in_file(
                                 )
                                 or 0
                             ),
+                            character_count=len(
+                                parse_dict.get("m_glyphInfoList", [])
+                                if isinstance(
+                                    parse_dict.get("m_glyphInfoList"), list
+                                )
+                                else []
+                            ),
                         )
+                        parse_dict["m_fontInfo"] = synced_old_face
 
                     for dirty_key in _TMP_DIRTY_FLAG_KEYS:
                         if dirty_key in parse_dict:
@@ -8458,12 +9483,9 @@ def replace_fonts_in_file(
                     parse_dict["m_Script"]["m_FileID"] = m_Script_FileID
                     parse_dict["m_Script"]["m_PathID"] = m_Script_PathID
 
-                    if parse_dict.get("m_Material") is not None:
-                        parse_dict["m_Material"]["m_FileID"] = m_Material_FileID
-                        parse_dict["m_Material"]["m_PathID"] = m_Material_PathID
-                    else:
-                        parse_dict["material"]["m_FileID"] = m_Material_FileID
-                        parse_dict["material"]["m_PathID"] = m_Material_PathID
+                    if material_ref_key is not None:
+                        parse_dict[material_ref_key]["m_FileID"] = m_Material_FileID
+                        parse_dict[material_ref_key]["m_PathID"] = m_Material_PathID
 
                     if has_source_font_ref and isinstance(
                         parse_dict.get("m_SourceFontFile"), dict
@@ -8475,15 +9497,12 @@ def replace_fonts_in_file(
                             "m_PathID"
                         ] = m_SourceFontFile_PathID
 
-                    current_new_atlas_ref = _first_valid_atlas_ref(
-                        parse_dict.get("m_AtlasTextures")
-                    ) or _first_atlas_ref(parse_dict.get("m_AtlasTextures"))
-                    if current_new_atlas_ref is not None:
-                        current_new_atlas_ref["m_FileID"] = m_AtlasTextures_FileID
-                        current_new_atlas_ref["m_PathID"] = m_AtlasTextures_PathID
-                    if isinstance(parse_dict.get("atlas"), dict):
-                        parse_dict["atlas"]["m_FileID"] = m_AtlasTextures_FileID
-                        parse_dict["atlas"]["m_PathID"] = m_AtlasTextures_PathID
+                    _sync_single_atlas_state(
+                        parse_dict,
+                        m_AtlasTextures_FileID,
+                        m_AtlasTextures_PathID,
+                        reference_template=target_new_atlas_ref,
+                    )
 
                     atlas_metadata_width = int(source_atlas.width)
                     atlas_metadata_height = int(source_atlas.height)
@@ -8526,28 +9545,76 @@ def replace_fonts_in_file(
                             "alpha8_linear_source": atlas_linear_for_alpha8,
                             "metadata_width": atlas_metadata_width,
                             "metadata_height": atlas_metadata_height,
-                            "preview_sdf_data": replace_data,
                         }
+                        if preview_export:
+                            texture_plan["preview_sdf_data"] = replace_data
+                        # KR: 같은 파일 대상도 PNG로 스필해 MonoBehaviour 패스 동안
+                        #     여러 4096x4096 디코드 이미지를 동시에 보유하지 않습니다.
+                        # EN: Spill same-file plans too, avoiding many decoded 4096x4096
+                        #     images being retained throughout the MonoBehaviour pass.
+                        texture_plan = _spill_deferred_texture_plan_to_disk(
+                            texture_plan,
+                            deferred_payload_dir,
+                        )
+                        _close_unique_images(source_atlas, atlas_linear_for_alpha8)
+                        assets["sdf_atlas"] = None
+                        source_atlas = None
+                        atlas_linear_for_alpha8 = None
                         if texture_target_file_key == current_file_key:
-                            _store_patch_value(
+                            (
+                                stored_texture_plan,
+                                inserted_texture_plan,
+                            ) = _store_consistent_patch_value(
                                 texture_patch_plans,
                                 texture_key,
                                 texture_plan,
+                                patch_kind="texture",
+                                target_file_key=current_file_key,
+                                transaction=deferred_transaction,
                             )
+                            if stored_texture_plan is not None:
+                                # Incoming deferred payloads are owned by the
+                                # caller and must survive a failed split retry.
+                                # Only plans inserted by this invocation belong
+                                # in the local cleanup bucket.
+                                if inserted_texture_plan:
+                                    _store_patch_value(
+                                        owned_texture_patch_plans,
+                                        texture_key,
+                                        stored_texture_plan,
+                                    )
+                                required_local_texture_ids.add(
+                                    id(stored_texture_plan)
+                                )
+                            else:
+                                required_resolution_errors.append(
+                                    f"conflicting texture target {texture_key}"
+                                )
+                                _cleanup_deferred_patch_bucket(
+                                    {texture_key: texture_plan}
+                                )
                         else:
-                            texture_plan = _spill_deferred_texture_plan_to_disk(
-                                texture_plan,
-                                deferred_payload_dir,
-                            )
-                            _register_deferred_patch(
-                                deferred_texture_plans,
+                            if not _register_deferred_patch(
+                                staged_texture_plans,
                                 texture_target_file_key,
                                 texture_key,
                                 texture_plan,
-                                pending_files=pending_external_patch_files,
+                                pending_files=staged_pending_files,
                                 patch_kind="texture",
-                            )
+                                transaction=deferred_transaction,
+                            ):
+                                required_resolution_errors.append(
+                                    f"conflicting deferred texture target {texture_key}"
+                                )
+                                _cleanup_deferred_patch_bucket(
+                                    {texture_key: texture_plan}
+                                )
                     elif int(m_AtlasTextures_PathID) != 0:
+                        resolution_error = (
+                            f"atlas {m_AtlasTextures_FileID}:{m_AtlasTextures_PathID} "
+                            "target could not be resolved"
+                        )
+                        required_resolution_errors.append(resolution_error)
                         _log_warning(
                             f"[replace_sdf] file={fn_without_path} assets={assets_name} "
                             f"path_id={pathid} atlas_ref={m_AtlasTextures_FileID}:{m_AtlasTextures_PathID} "
@@ -8569,19 +9636,23 @@ def replace_fonts_in_file(
                     }
                     if texture_key and texture_target_file_key:
                         if texture_target_file_key == current_file_key:
-                            _store_patch_value(
+                            _store_consistent_patch_value(
                                 material_replacements_by_atlas,
                                 texture_key,
                                 atlas_fallback_payload,
+                                patch_kind="material_atlas",
+                                target_file_key=current_file_key,
+                                transaction=deferred_transaction,
                             )
                         else:
                             _register_deferred_patch(
-                                deferred_material_atlas_plans,
+                                staged_material_atlas_plans,
                                 texture_target_file_key,
                                 texture_key,
                                 atlas_fallback_payload,
-                                pending_files=pending_external_patch_files,
+                                pending_files=staged_pending_files,
                                 patch_kind="material_atlas",
+                                transaction=deferred_transaction,
                             )
                     if m_Material_PathID != 0:
                         gradient_scale = None
@@ -8758,41 +9829,110 @@ def replace_fonts_in_file(
                                 int(m_Material_PathID),
                             )
                             if material_target_file_key == current_file_key:
-                                _store_patch_value(
+                                (
+                                    stored_material_plan,
+                                    _inserted_material_plan,
+                                ) = _store_consistent_patch_value(
                                     material_replacements,
                                     material_key_exact,
                                     material_payload,
+                                    patch_kind="material",
+                                    target_file_key=current_file_key,
+                                    transaction=deferred_transaction,
                                 )
+                                if stored_material_plan is not None:
+                                    required_local_material_ids.add(
+                                        id(stored_material_plan)
+                                    )
+                                else:
+                                    required_resolution_errors.append(
+                                        f"conflicting material target {material_key_exact}"
+                                    )
                             else:
-                                _register_deferred_patch(
-                                    deferred_material_plans,
+                                if not _register_deferred_patch(
+                                    staged_material_plans,
                                     material_target_file_key,
                                     material_key_exact,
                                     material_payload,
-                                    pending_files=pending_external_patch_files,
+                                    pending_files=staged_pending_files,
                                     patch_kind="material",
-                                )
+                                    transaction=deferred_transaction,
+                                ):
+                                    required_resolution_errors.append(
+                                        "conflicting deferred material target "
+                                        f"{material_key_exact}"
+                                    )
                         elif material_target_file_key == current_file_key:
-                            material_replacements_by_pathid[int(m_Material_PathID)] = (
-                                material_payload
+                            fallback_path_id = int(m_Material_PathID)
+                            fallback_key = f"pathid|{fallback_path_id}"
+                            existing_fallback = material_replacements_by_pathid.get(
+                                fallback_path_id
                             )
+                            fallback_consistent = not (
+                                existing_fallback is not None
+                                and _deferred_patch_fingerprint(
+                                    "material", existing_fallback
+                                )
+                                != _deferred_patch_fingerprint(
+                                    "material", material_payload
+                                )
+                            )
+                            retained_fallback = (
+                                existing_fallback
+                                if existing_fallback is not None
+                                else material_payload
+                            )
+                            if (
+                                fallback_consistent
+                                and (
+                                    deferred_transaction is None
+                                    or deferred_transaction.register_plan(
+                                        "material",
+                                        current_file_key,
+                                        fallback_key,
+                                        retained_fallback,
+                                    )
+                                )
+                            ):
+                                if (
+                                    existing_fallback is not None
+                                    and existing_fallback is not material_payload
+                                ):
+                                    _cleanup_superseded_patch_payload(
+                                        material_payload,
+                                        existing_fallback,
+                                    )
+                                material_replacements_by_pathid[fallback_path_id] = (
+                                    retained_fallback
+                                )
+                                required_local_material_ids.add(id(retained_fallback))
+                            else:
+                                conflict = (
+                                    f"conflicting material fallback target {fallback_key}"
+                                )
+                                required_resolution_errors.append(conflict)
+                                if deferred_transaction is not None:
+                                    deferred_transaction.fail(conflict)
                             _log_warning(
                                 f"[replace_sdf] file={fn_without_path} assets={assets_name} path_id={pathid} "
                                 f"material_ref={m_Material_FileID}:{m_Material_PathID} "
                                 "could_not_resolve_material_assets_name=True; fallback_to_pathid_only=True"
                             )
                         else:
+                            required_resolution_errors.append(
+                                f"material {m_Material_FileID}:{m_Material_PathID} "
+                                "target could not be resolved"
+                            )
                             _log_warning(
                                 f"[replace_sdf] file={fn_without_path} assets={assets_name} path_id={pathid} "
                                 f"material_ref={m_Material_FileID}:{m_Material_PathID} "
                                 "could_not_resolve_material_target=True"
                             )
                     obj.patch(parse_dict)
-                    trailing = _trailing_bytes_store.pop(id(obj), b"")
-                    if trailing:
-                        current_data = obj.get_raw_data()
-                        obj.set_raw_data(current_data + trailing)
+                    trailing = _pop_trailing_bytes(obj)
+                    _append_trailing_bytes(obj, trailing)
                     patched_sdf_targets += 1
+                    patched_sdf_target_keys.add(target_key)
                     modified = True
                 else:
                     missing_parts: list[str] = []
@@ -8829,6 +9969,10 @@ def replace_fonts_in_file(
             texture_plan = _lookup_patch_value(texture_patch_plans, replacement_key)
             if isinstance(texture_plan, dict):
                 parse_dict = _safe_parse_as_object(obj)
+                typetree_size_mismatch = _detect_typetree_size_mismatch(
+                    obj,
+                    parse_dict,
+                )
                 if lang == "ko":
                     _log_console(
                         f"텍스처 교체: {obj.peek_name()} (PathID: {obj.path_id})"
@@ -8956,7 +10100,7 @@ def replace_fonts_in_file(
                 # KR: 바이너리 패치를 사용하여 extra bytes를 보존합니다.
                 # EN: For Texture2D that becomes smaller than original on TypeTree re-serialization (e.g. China Unity),
                 # EN: use binary patching to preserve extra bytes.
-                if _has_trailing_bytes(obj) or _detect_typetree_size_mismatch(obj):
+                if _has_trailing_bytes(obj) or typetree_size_mismatch:
                     tex_w = int(getattr(parse_dict, "m_Width", 0) or 0)
                     tex_h = int(getattr(parse_dict, "m_Height", 0) or 0)
                     tex_image_data = getattr(parse_dict, "image_data", b"")
@@ -8984,8 +10128,15 @@ def replace_fonts_in_file(
                         _safe_save(obj, parse_dict)
                 else:
                     _safe_save(obj, parse_dict)
+                consumed_texture_ids.add(id(texture_plan))
                 modified = True
                 parse_dict = None
+                for owned_image in prepared_texture.get("_owned_images", []):
+                    if isinstance(owned_image, Image.Image):
+                        try:
+                            owned_image.close()
+                        except Exception:
+                            pass
         if obj.type.name == "Material":
             parse_dict = None
             material_key = _make_assets_object_key(assets_name, int(obj.path_id))
@@ -9038,6 +10189,15 @@ def replace_fonts_in_file(
                     parse_dict = _safe_parse_as_object(obj)
                 if _apply_material_replacement_to_object(parse_dict, mat_info):
                     _safe_save(obj, parse_dict)
+                    if id(mat_info) in (
+                        incoming_material_ids | required_local_material_ids
+                    ):
+                        consumed_material_ids.add(id(mat_info))
+                    modified = True
+
+    # Atlas-keyed material plans are compatibility fallbacks. They are
+    # best-effort and may legitimately have no Material in the texture file.
+    handled_material_atlas_ids.update(incoming_material_atlas_ids)
 
     _emit_phase_callback(
         phase_callback,
@@ -9047,13 +10207,76 @@ def replace_fonts_in_file(
         modified=bool(modified),
     )
 
-    if modified:
+    unresolved_texture_ids = (
+        incoming_texture_ids | required_local_texture_ids
+    ) - consumed_texture_ids
+    unresolved_material_ids = (
+        incoming_material_ids | required_local_material_ids
+    ) - consumed_material_ids
+    unsatisfied_ttf_targets = target_ttf_targets - satisfied_ttf_targets
+    unsatisfied_sdf_targets = replacement_sdf_targets - patched_sdf_target_keys
+    unstaged_transaction_required = bool(
+        deferred_transaction is None
+        and (staged_texture_plans or staged_material_plans)
+    )
+    unavailable_deferred_target_map = bool(
+        (staged_texture_plans and not isinstance(deferred_texture_plans, dict))
+        or (staged_material_plans and not isinstance(deferred_material_plans, dict))
+    )
+    deferred_plan_conflict = bool(
+        deferred_transaction is not None and deferred_transaction.has_failures
+    )
+    save_blocked_by_deferred_patch = bool(
+        required_resolution_errors
+        or unresolved_texture_ids
+        or unresolved_material_ids
+        or unstaged_transaction_required
+        or unavailable_deferred_target_map
+        or deferred_plan_conflict
+        or unsatisfied_ttf_targets
+        or unsatisfied_sdf_targets
+    )
+    if save_blocked_by_deferred_patch:
+        details = "; ".join(required_resolution_errors)
+        _log_warning(
+            f"[deferred_patch] refusing partial save for {fn_without_path}: "
+            f"unmatched_textures={len(unresolved_texture_ids)} "
+            f"unmatched_materials={len(unresolved_material_ids)}"
+            f" transaction_missing={unstaged_transaction_required}"
+            f" target_map_missing={unavailable_deferred_target_map}"
+            f" plan_conflict={deferred_plan_conflict}"
+            f" unmatched_ttf={len(unsatisfied_ttf_targets)}"
+            f" unmatched_sdf={len(unsatisfied_sdf_targets)}"
+            + (f" details={details}" if details else "")
+        )
+        if lang == "ko":
+            _log_console(
+                "  오류: 요청한 폰트 또는 외부 TMP 패치 일부를 확인할 수 없어 "
+                "이 파일의 저장을 취소합니다."
+            )
+        else:
+            _log_console(
+                "  Error: cancelled this save because one or more requested font "
+                "or external TMP patches could not be verified."
+            )
+        failure_reason = (
+            f"{fn_without_path}: unmatched requested/deferred patch "
+            f"(textures={len(unresolved_texture_ids)}, "
+            f"materials={len(unresolved_material_ids)}, "
+            f"ttf={len(unsatisfied_ttf_targets)}, "
+            f"sdf={len(unsatisfied_sdf_targets)})"
+        )
+        if deferred_transaction is not None:
+            deferred_transaction.fail(failure_reason)
+        else:
+            raise DeferredPatchAtomicityError(failure_reason)
+
+    if modified and not save_blocked_by_deferred_patch:
         if lang == "ko":
             _log_console(f"'{fn_without_path}' 저장 중...")
         else:
             _log_console(f"Saving '{fn_without_path}'...")
 
-        save_success = False
         last_save_failure_reason: str | None = None
 
         def _save_env_file(
@@ -9103,14 +10326,12 @@ def replace_fonts_in_file(
             return typed_save(packer=packer)
 
         def _validate_saved_file(saved_path: str) -> tuple[bool, str | None]:
-            """KR: 저장 결과 파일이 Unity bundle로 다시 열리는지 검증합니다.
-            EN: Validates that the saved file can be re-opened as a Unity bundle.
+            """KR: 저장 결과 Unity 파일이 다시 열리는지 검증합니다.
+            EN: Validates that the saved Unity file can be re-opened.
             """
             signature = source_bundle_signature or getattr(env_file, "signature", None)
-            if signature not in bundle_signatures:
-                return True, None
             saved_signature = _read_bundle_signature(saved_path, bundle_signatures)
-            if saved_signature != signature:
+            if signature in bundle_signatures and saved_signature != signature:
                 reason = (
                     f"번들 시그니처 불일치 (기대: {signature}, 결과: {saved_signature or 'None'})"
                     if lang == "ko"
@@ -9206,7 +10427,6 @@ def replace_fonts_in_file(
             nonlocal save_success, last_save_failure_reason
             tmp_file = os.path.join(tmp_path, fn_without_path)
             has_save_to = callable(getattr(env_file, "save_to", None))
-            saved_blob: bytes | None = None
             try:
                 _emit_phase_callback(
                     phase_callback,
@@ -9216,83 +10436,20 @@ def replace_fonts_in_file(
                     method=log_label,
                 )
                 save_started_at = time.perf_counter()
-                use_stream_fallback = False
-                if has_save_to and source_bundle_signature in bundle_signatures:
-                    # KR: 번들은 기본적으로 save_to()를 우선 사용해 최종 bytes blob 생성을 피합니다.
-                    #     save_to() 실패 시에만 legacy save()로 폴백합니다.
-                    # EN: Bundles prefer save_to() by default to avoid creating a final bytes blob.
-                    #     Fall back to legacy save() only when save_to() fails.
-                    try:
-                        _save_env_file(
-                            packer_label, save_path=tmp_file, use_save_to=True
-                        )
-                    except Exception as primary_save_error:
-                        use_stream_fallback = True
-                        if lang == "ko":
-                            _log_console(
-                                "  save_to() 저장 실패로 legacy save()로 폴백합니다... "
-                                f"({type(primary_save_error).__name__}: {primary_save_error})"
-                            )
-                        else:
-                            _log_console(
-                                "  save_to() failed; falling back to legacy save()... "
-                                f"({type(primary_save_error).__name__}: {primary_save_error})"
-                            )
-
-                    if use_stream_fallback:
-                        saved_blob = _save_env_file(packer_label, use_save_to=False)
-                        with open(tmp_file, "wb") as f:
-                            f.write(cast(bytes, saved_blob))
-                        saved_blob = None
-                elif has_save_to:
-                    # KR: save_to()로 파일에 직접 저장 — bytes 중간 변수 없음 (메모리 절약)
-                    # EN: Save directly to file via save_to() — no intermediate bytes variable (saves memory)
-                    _save_env_file(packer_label, save_path=tmp_file, use_save_to=True)
-                else:
-                    # KR: 기존 bytes 반환 방식 폴백
-                    # EN: Fallback to legacy bytes-returning approach
-                    saved_blob = _save_env_file(packer_label, use_save_to=False)
-                    with open(tmp_file, "wb") as f:
-                        f.write(cast(bytes, saved_blob))
-                    # KR: 검증 전에 큰 메모리 블록을 해제하여 피크 메모리 사용량을 낮춥니다.
-                    # EN: Free large memory blocks before validation to reduce peak memory usage.
-                    saved_blob = None
+                if not has_save_to:
+                    raise RuntimeError(
+                        "The loaded UnityPy file object does not expose save_to()."
+                    )
+                # KR: save_to() 실패 시 bytes 기반 save()로 되돌아가지 않습니다.
+                #     현재 packer는 실패 처리하고 바깥 전략이 다음 packer를 시도합니다.
+                # EN: Never fall back to bytes-returning save() after save_to() fails;
+                #     fail this packer and let the outer strategy try the next one.
+                _save_env_file(packer_label, save_path=tmp_file, use_save_to=True)
                 gc.collect()
                 is_valid, validation_reason = _validate_saved_file(tmp_file)
                 if not is_valid:
-                    try:
-                        saved_size = os.path.getsize(tmp_file)
-                    except Exception:
-                        saved_size = 0
-                    if saved_size > 0:
-                        if lang == "ko":
-                            _log_console(
-                                "  경고: 저장 검증에 실패했지만 무검증 저장으로 계속 진행합니다."
-                            )
-                            if validation_reason:
-                                _log_console(f"  검증 실패 원인: {validation_reason}")
-                        else:
-                            _log_console(
-                                "  Warning: save validation failed, continuing with unvalidated save."
-                            )
-                            if validation_reason:
-                                _log_console(
-                                    f"  Validation failure reason: {validation_reason}"
-                                )
-                        save_success = True
-                        _emit_phase_callback(
-                            phase_callback,
-                            "save_end",
-                            file=fn_without_path,
-                            packer=packer_label,
-                            method=log_label,
-                            elapsed_sec=(time.perf_counter() - save_started_at),
-                            ok=True,
-                            validated=False,
-                        )
-                        return True
                     last_save_failure_reason = (
-                        validation_reason or "validation failed (empty output file)"
+                        validation_reason or "saved file validation failed"
                     )
                     try:
                         if os.path.exists(tmp_file):
@@ -9342,7 +10499,6 @@ def replace_fonts_in_file(
                 )
                 return False
             finally:
-                saved_blob = None
                 gc.collect()
 
         dataflags = getattr(env_file, "dataflags", None)
@@ -9416,7 +10572,9 @@ def replace_fonts_in_file(
             saved_file_path = os.path.join(tmp_path, fn_without_path)
             if os.path.exists(saved_file_path):
                 saved_size = os.path.getsize(saved_file_path)
-                shutil.move(saved_file_path, assets_file)
+                if deferred_transaction is not None:
+                    deferred_transaction.backup(assets_file, replace_only=True)
+                _atomic_replace_validated_file(saved_file_path, assets_file)
                 _log_debug(
                     f"[save] file={fn_without_path} output={assets_file} temp={saved_file_path} bytes={saved_size}"
                 )
@@ -9460,6 +10618,87 @@ def replace_fonts_in_file(
             )
             if sdf_parse_failure_reasons:
                 _log_console(f"  Parse error: {sdf_parse_failure_reasons[-1]}")
+
+    if modified and save_success:
+        _commit_staged_deferred_patches(
+            staged_texture_plans,
+            deferred_texture_plans,
+            pending_files=pending_external_patch_files,
+            patch_kind="texture",
+            transaction=deferred_transaction,
+        )
+        _commit_staged_deferred_patches(
+            staged_material_plans,
+            deferred_material_plans,
+            pending_files=pending_external_patch_files,
+            patch_kind="material",
+            transaction=deferred_transaction,
+        )
+        _commit_staged_deferred_patches(
+            staged_material_atlas_plans,
+            deferred_material_atlas_plans,
+            pending_files=pending_external_patch_files,
+            patch_kind="material_atlas",
+            transaction=deferred_transaction,
+        )
+    else:
+        for staged_map in (
+            staged_texture_plans,
+            staged_material_plans,
+            staged_material_atlas_plans,
+        ):
+            for staged_bucket in staged_map.values():
+                _cleanup_deferred_patch_bucket(staged_bucket)
+
+    deferred_target_handled = (modified and save_success) or (
+        not modified and not save_blocked_by_deferred_patch
+    )
+    if deferred_target_handled:
+        _consume_deferred_patch_payloads(
+            deferred_texture_plans,
+            current_file_key,
+            consumed_texture_ids & incoming_texture_ids,
+        )
+        _consume_deferred_patch_payloads(
+            deferred_material_plans,
+            current_file_key,
+            consumed_material_ids & incoming_material_ids,
+        )
+        _consume_deferred_patch_payloads(
+            deferred_material_atlas_plans,
+            current_file_key,
+            handled_material_atlas_ids,
+        )
+
+    # Only delete plans spilled by this call. Incoming deferred buckets belong
+    # to the caller and must survive a failed one-shot save for split retries.
+    _cleanup_deferred_patch_bucket(owned_texture_patch_plans)
+    try:
+        os.rmdir(deferred_payload_dir)
+    except OSError:
+        pass
+
+    if operation_outcome is not None:
+        requested_target_count = len(target_ttf_targets) + len(
+            replacement_sdf_targets
+        )
+        satisfied_target_count = len(satisfied_ttf_targets) + len(
+            patched_sdf_target_keys & replacement_sdf_targets
+        )
+        operation_outcome.update(
+            {
+                "requested_targets": requested_target_count,
+                "satisfied_targets": satisfied_target_count,
+                "modified": bool(modified),
+                "save_success": bool(save_success),
+                "already_satisfied": bool(
+                    requested_target_count > 0
+                    and satisfied_target_count == requested_target_count
+                    and not modified
+                    and not save_blocked_by_deferred_patch
+                ),
+            }
+        )
 
     if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
@@ -9977,6 +11216,7 @@ def _collect_validation_inner_names(env_file: Any) -> list[str]:
     return sorted(set(names))
 
 
+@cleanup_unitypy_environments
 def run_validation_worker(
     bundle_path: str,
     lang: Language = "ko",
@@ -10007,7 +11247,7 @@ def run_validation_worker(
                 _log_console(f"[validate] Structural validation failed: {reason}")
             return 2
 
-        env = UnityPy.load(bundle_path)
+        env = load_unitypy(bundle_path)
         files = getattr(env, "files", None)
         if not isinstance(files, dict) or len(files) == 0:
             if lang == "ko":
@@ -10052,11 +11292,13 @@ def run_scan_file_worker(
     """
     try:
         game_path, data_path = resolve_game_path(game_path, lang=lang)
-        unity_version = get_unity_version(game_path, lang=lang)
-        compile_method = get_compile_method(data_path)
-        generator = _create_generator(
-            unity_version, game_path, data_path, compile_method, lang=lang
-        )
+        generator: TypeTreeGenerator | None = None
+        if scan_sdf:
+            unity_version = get_unity_version(game_path, lang=lang)
+            compile_method = get_compile_method(data_path)
+            generator = _create_generator(
+                unity_version, game_path, data_path, compile_method, lang=lang
+            )
         scanned, load_error = _scan_fonts_in_asset_file(
             assets_file,
             generator,
@@ -10083,6 +11325,7 @@ def run_scan_file_worker(
         return 2
 
 
+@_rollback_deferred_transaction_on_exit
 def main_cli(lang: Language = "ko") -> None:
     """KR: 언어별 공통 CLI 진입점입니다.
     EN: Common CLI entry point per language.
@@ -10806,7 +12049,7 @@ Examples:
         f"replace_ttf={replace_ttf} replace_sdf={replace_sdf}"
     )
 
-    if compile_method == "Il2cpp" and not os.path.exists(
+    if replace_sdf and compile_method == "Il2cpp" and not os.path.exists(
         os.path.join(data_path, "Managed")
     ):
         binary_path = os.path.join(game_path, "GameAssembly.dll")
@@ -11051,8 +12294,16 @@ Examples:
         _ensure_custom_unitypy_streaming_save(lang=lang)
 
     unity_version = detected_unity_version
-    generator = _create_generator(
-        unity_version, game_path, data_path, compile_method, lang=lang
+    generator = (
+        _create_generator(
+            unity_version,
+            game_path,
+            data_path,
+            compile_method,
+            lang=lang,
+        )
+        if replace_sdf
+        else None
     )
     replacement_lookup, files_to_process = build_replacement_lookup(replacements)
     _log_debug(
@@ -11100,11 +12351,38 @@ Examples:
         for asset_key, asset_path in asset_path_by_key.items()
         if os.path.basename(asset_path) in process_files
     ]
+    matched_process_files = {
+        os.path.basename(asset_path_by_key[key])
+        for key in asset_file_queue
+        if key in asset_path_by_key
+    }
+    missing_process_files = sorted(process_files - matched_process_files)
+    if missing_process_files:
+        raise FileNotFoundError(
+            "Replacement target asset file(s) were not found or are not safely writable: "
+            + ", ".join(missing_process_files)
+        )
     _log_debug(
         f"[runtime] matched_asset_files={len(asset_file_queue)} all_candidates={len(all_assets_files)}"
     )
+    deferred_transaction = (
+        _DeferredPatchTransaction(
+            os.path.join(
+                args.temp_dir or game_path,
+                ".unity_font_replacer_rollback",
+            )
+        )
+        if mode != "preview_export"
+        else None
+    )
+    _ACTIVE_DEFERRED_TRANSACTION.set(deferred_transaction)
     if output_only_root and mode != "preview_export":
-        prepare_output_only_dependencies(data_path, output_only_root, lang=lang)
+        prepare_output_only_dependencies(
+            data_path,
+            output_only_root,
+            lang=lang,
+            transaction=deferred_transaction,
+        )
 
     deferred_texture_plans: dict[str, dict[str, Any]] = {}
     deferred_material_plans: dict[str, dict[str, Any]] = {}
@@ -11112,6 +12390,7 @@ Examples:
     pending_external_patch_files: set[str] = set()
     pending_queue_keys: set[str] = set(asset_file_queue)
     prepared_output_targets: set[str] = set()
+    terminal_failures: list[str] = []
     modified_count = 0
     queue_index = 0
     while queue_index < len(asset_file_queue):
@@ -11135,6 +12414,10 @@ Examples:
                 _normalize_asset_file_key(working_assets_file) or working_assets_file
             )
             if working_assets_key not in prepared_output_targets:
+                if deferred_transaction is not None:
+                    deferred_transaction.backup(
+                        working_assets_file, allow_missing=True
+                    )
                 shutil.copy2(assets_file, working_assets_file)
                 prepared_output_targets.add(working_assets_key)
                 if is_ko:
@@ -11193,6 +12476,7 @@ Examples:
                 # EN: First attempt a one-shot save; fall back to adaptive split save only on failure.
                 file_lookup, _ = build_replacement_lookup(file_replacements)
                 one_shot_ok = False
+                one_shot_outcome: JsonDict = {}
                 if args.split_save_force:
                     if is_ko:
                         _log_console(
@@ -11230,6 +12514,9 @@ Examples:
                             deferred_material_plans=deferred_material_plans,
                             deferred_material_atlas_plans=deferred_material_atlas_plans,
                             pending_external_patch_files=pending_external_patch_files,
+                            logical_file_key=asset_file_key,
+                            deferred_transaction=deferred_transaction,
+                            operation_outcome=one_shot_outcome,
                             lang=lang,
                         )
                     except MemoryError as e:
@@ -11253,6 +12540,8 @@ Examples:
 
                 if one_shot_ok:
                     file_modified = True
+                elif deferred_transaction is not None and deferred_transaction.has_failures:
+                    pass
                 else:
                     auto_split_profile: JsonDict | None = None
                     suggested_sdf_batch_size = 0
@@ -11261,8 +12550,9 @@ Examples:
                         file_ttf_lookup, _ = build_replacement_lookup(
                             file_ttf_replacements
                         )
+                        ttf_outcome: JsonDict = {}
                         try:
-                            if replace_fonts_in_file(
+                            ttf_ok = replace_fonts_in_file(
                                 unity_version,
                                 game_path,
                                 working_assets_file,
@@ -11288,9 +12578,19 @@ Examples:
                                 deferred_material_plans=deferred_material_plans,
                                 deferred_material_atlas_plans=deferred_material_atlas_plans,
                                 pending_external_patch_files=pending_external_patch_files,
+                                logical_file_key=asset_file_key,
+                                deferred_transaction=deferred_transaction,
+                                operation_outcome=ttf_outcome,
                                 lang=lang,
-                            ):
+                            )
+                            if ttf_ok:
                                 file_modified = True
+                            elif not bool(ttf_outcome.get("already_satisfied")):
+                                split_stopped = True
+                                failure = f"{fn}: terminal TTF split save failure"
+                                terminal_failures.append(failure)
+                                if deferred_transaction is not None:
+                                    deferred_transaction.fail(failure)
                         except Exception as e:
                             if is_ko:
                                 _log_console(
@@ -11300,6 +12600,18 @@ Examples:
                                 _log_console(
                                     f"  TTF split save failed [{type(e).__name__}]: {e!r}"
                                 )
+                            split_stopped = True
+                            failure = (
+                                f"{fn}: terminal TTF split exception: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            terminal_failures.append(failure)
+                            if deferred_transaction is not None:
+                                deferred_transaction.fail(failure)
+                        if (
+                            deferred_transaction is not None
+                            and deferred_transaction.has_failures
+                        ):
                             split_stopped = True
 
                     if replace_sdf and not split_stopped:
@@ -11356,6 +12668,7 @@ Examples:
                                 current_batch = min(batch_size, sdf_total - idx)
                                 batch_dict = dict(sdf_items[idx : idx + current_batch])
                                 batch_lookup, _ = build_replacement_lookup(batch_dict)
+                                batch_outcome: JsonDict = {}
 
                                 try:
                                     ok = replace_fonts_in_file(
@@ -11384,6 +12697,9 @@ Examples:
                                         deferred_material_plans=deferred_material_plans,
                                         deferred_material_atlas_plans=deferred_material_atlas_plans,
                                         pending_external_patch_files=pending_external_patch_files,
+                                        logical_file_key=asset_file_key,
+                                        deferred_transaction=deferred_transaction,
+                                        operation_outcome=batch_outcome,
                                         lang=lang,
                                     )
                                 except Exception as e:
@@ -11397,8 +12713,16 @@ Examples:
                                             f"  SDF batch save failed [{type(e).__name__}]: {e!r}"
                                         )
 
+                                if not ok and bool(
+                                    batch_outcome.get("already_satisfied")
+                                ):
+                                    ok = True
+
                                 if ok:
-                                    file_modified = True
+                                    if not bool(
+                                        batch_outcome.get("already_satisfied")
+                                    ):
+                                        file_modified = True
                                     idx += current_batch
                                     gc.collect()
                                     if idx < sdf_total:
@@ -11429,6 +12753,12 @@ Examples:
                                                     f"  SDF batch progress: {idx}/{sdf_total} (next batch: {batch_size})"
                                                 )
                                 else:
+                                    if (
+                                        deferred_transaction is not None
+                                        and deferred_transaction.has_failures
+                                    ):
+                                        split_stopped = True
+                                        break
                                     if is_ko:
                                         _log_console(
                                             "  SDF 배치 저장 실패: 내부 저장 단계가 False를 반환했습니다. 위 오류 로그를 확인하세요."
@@ -11439,6 +12769,12 @@ Examples:
                                         )
                                     if current_batch <= 1:
                                         split_stopped = True
+                                        failure = (
+                                            f"{fn}: terminal SDF split save failure"
+                                        )
+                                        terminal_failures.append(failure)
+                                        if deferred_transaction is not None:
+                                            deferred_transaction.fail(failure)
                                         if is_ko:
                                             _log_console(
                                                 "  SDF 분할 저장 중단: 배치 1개에서도 저장 실패"
@@ -11473,8 +12809,9 @@ Examples:
                         _log_console(
                             "  Note: --oneshot-save-force disables split-save fallback and may increase memory peak."
                         )
+                direct_outcome: JsonDict = {}
                 try:
-                    if replace_fonts_in_file(
+                    direct_ok = replace_fonts_in_file(
                         unity_version,
                         game_path,
                         working_assets_file,
@@ -11500,9 +12837,28 @@ Examples:
                         deferred_material_plans=deferred_material_plans,
                         deferred_material_atlas_plans=deferred_material_atlas_plans,
                         pending_external_patch_files=pending_external_patch_files,
+                        logical_file_key=asset_file_key,
+                        deferred_transaction=deferred_transaction,
+                        operation_outcome=direct_outcome,
                         lang=lang,
-                    ):
+                    )
+                    if direct_ok:
                         file_modified = True
+                    elif (
+                        (
+                            int(direct_outcome.get("requested_targets", 0) or 0)
+                            > 0
+                            and not bool(direct_outcome.get("already_satisfied"))
+                        )
+                        or (
+                            bool(direct_outcome.get("modified"))
+                            and not bool(direct_outcome.get("save_success"))
+                        )
+                    ):
+                        failure = f"{fn}: requested font save failed"
+                        terminal_failures.append(failure)
+                        if deferred_transaction is not None:
+                            deferred_transaction.fail(failure)
                 except Exception as e:
                     if is_ko:
                         _log_console(f"  파일 처리 실패 [{type(e).__name__}]: {e!r}")
@@ -11510,18 +12866,22 @@ Examples:
                         _log_console(
                             f"  File processing failed [{type(e).__name__}]: {e!r}"
                         )
+                    failure = (
+                        f"{fn}: file processing exception: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    terminal_failures.append(failure)
+                    if deferred_transaction is not None:
+                        deferred_transaction.fail(failure)
 
             if file_modified:
                 modified_count += 1
-                _cleanup_deferred_patch_bucket(
-                    deferred_texture_plans.pop(asset_file_key, None)
-                )
-                _cleanup_deferred_patch_bucket(
-                    deferred_material_plans.pop(asset_file_key, None)
-                )
-                _cleanup_deferred_patch_bucket(
-                    deferred_material_atlas_plans.pop(asset_file_key, None)
-                )
+
+            if (
+                deferred_transaction is not None
+                and deferred_transaction.has_failures
+            ):
+                break
 
         if pending_external_patch_files:
             queued_from_external = sorted(pending_external_patch_files)
@@ -11541,6 +12901,53 @@ Examples:
                     f"[runtime] queued_deferred_patch_file={pending_path} "
                     f"queue_size={len(asset_file_queue)}"
                 )
+
+    pending_required_deferred = bool(
+        deferred_texture_plans
+        or deferred_material_plans
+        or (
+            deferred_transaction is not None
+            and deferred_transaction.has_failures
+        )
+    )
+    deferred_failure_message: str | None = None
+    if deferred_transaction is not None:
+        if pending_required_deferred:
+            rollback_count = deferred_transaction.backup_count
+            rollback_directory = deferred_transaction.backup_directory
+            rollback_ok = deferred_transaction.rollback()
+            modified_count = max(0, modified_count - rollback_count)
+            message = (
+                "요청한 폰트/TMP 패치가 완결되지 않아 관련 파일을 원래 상태로 되돌렸습니다."
+                if is_ko
+                else "A requested font/TMP patch was incomplete; related files were rolled back."
+            )
+            _log_console(f"\n오류: {message}" if is_ko else f"\nError: {message}")
+            deferred_failure_message = message
+            if not rollback_ok:
+                deferred_failure_message = (
+                    "외부 TMP 패치 롤백에 실패했습니다. "
+                    f"로그와 rollback 백업을 확인하세요: {rollback_directory}"
+                    if is_ko
+                    else "Failed to roll back an external TMP patch. "
+                    f"Check the log and rollback backups: {rollback_directory}"
+                )
+        else:
+            deferred_transaction.commit()
+
+    for deferred_map in (
+        deferred_texture_plans,
+        deferred_material_plans,
+        deferred_material_atlas_plans,
+    ):
+        for remaining_bucket in deferred_map.values():
+            _cleanup_deferred_patch_bucket(remaining_bucket)
+        deferred_map.clear()
+
+    if deferred_failure_message:
+        raise DeferredPatchAtomicityError(deferred_failure_message)
+    if terminal_failures:
+        raise RuntimeError("; ".join(terminal_failures))
 
     if mode == "preview_export":
         if is_ko:

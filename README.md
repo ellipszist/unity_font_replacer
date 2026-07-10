@@ -391,12 +391,16 @@ EXE 대신 Python 소스로 실행하려면:
 ### 요구 사항
 
 - Python 3.12 권장
-- 패키지: `UnityPy(포크)`, `TypeTreeGeneratorAPI`, `Pillow`, `numpy`, `scipy`
+- 패키지: `UnityPy 1.25.2 커스텀 포크`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`
 
 ```bash
-pip install TypeTreeGeneratorAPI Pillow numpy scipy
-pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
+pip install TypeTreeGeneratorAPI Pillow fonttools numpy scipy
+pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@4018e7600357e185f9986af536d6f105729f0950
 ```
+
+이 저장소와 `UnityPy` 저장소가 같은 상위 폴더에 있으면 소스 실행 시 sibling
+`UnityPy`를 자동으로 우선 사용합니다. 필요한 저메모리 API가 없으면 저장 전에
+오류를 내고 중단합니다.
 
 ### 실행 예시
 
@@ -413,6 +417,8 @@ python export_fonts_ko.py "D:\MyGame"
 
 - 저장 기본 모드는 무압축 계열 우선(`safe-none -> legacy-none`)이며, 실패 시 `original -> lz4` 순으로 폴백합니다.
 - 저장 시 원본 압축 우선이 필요하면 `--original-compress`를 사용하세요.
+- 외부 파일의 TMP Atlas/Material 패치는 모두 검증된 경우에만 확정되며, 대상 누락·충돌·저장 실패 시 관련 파일을 실행 전 상태로 롤백합니다.
+- Unity `.split0/.split1` 분할 에셋은 안전한 재분할 저장을 지원하지 않아 교체 대상에서 제외됩니다. 추출기는 `.split0`을 통해 한 번만 읽습니다.
 - 저장 속도가 느리면 `--temp-dir`로 빠른 SSD/NVMe 경로를 지정해 보세요.
 - 프로그램 종료 시 임시 폴더는 자동 정리됩니다.
 - 대형 SDF 다건 교체에서는 기본적으로 one-shot 실패 시 적응형 분할 저장(배치 크기 자동 조절)으로 폴백합니다.

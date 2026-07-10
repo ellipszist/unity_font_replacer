@@ -9,7 +9,7 @@
 
 TMP 스키마 경계 (TMP_Info 기준):
   구형 전용 마지막 : Unity 2018.3.14 (TMP git 1.3.0 이하)
-  신형 시작         : Unity 2018.4.2  (TMP git 1.4.0 이상)
+  신형/hybrid 시작  : Unity 2018.4.2  (TMP git 1.4.0 이상)
   구형은 m_glyphInfoList + m_fontInfo + atlas(단일 참조),
   신형은 m_GlyphTable + m_CharacterTable + m_FaceInfo + m_AtlasTextures(리스트).
 
@@ -29,7 +29,7 @@ Workflow:
 
 TMP schema boundary (per TMP_Info):
   Last old-only  : Unity 2018.3.14 (TMP git <= 1.3.0)
-  First new      : Unity 2018.4.2  (TMP git >= 1.4.0)
+  First new/hybrid: Unity 2018.4.2 (TMP git >= 1.4.0)
   Old uses m_glyphInfoList + m_fontInfo + atlas (single ref),
   New uses m_GlyphTable + m_CharacterTable + m_FaceInfo + m_AtlasTextures (list).
 
@@ -50,40 +50,15 @@ import sys
 from functools import lru_cache
 from typing import Any, Literal, NoReturn, cast
 
-import UnityPy
+from unitypy_runtime import (
+    cleanup_unitypy_environments,
+    close_unitypy_env as _close_env,
+    load_unitypy,
+)
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 
 logger = logging.getLogger(__name__)
-
-
-def _close_env(environment: Any) -> None:
-    """KR: UnityPy Environment가 보유한 리소스(mmap, 임시 블록 파일)를 정리한다.
-    UnityPy는 BundleFile 내부에 mmap이나 임시 파일을 보유할 수 있으며,
-    이를 명시적으로 해제하지 않으면 파일 핸들 누수가 발생한다.
-    스택 기반 DFS로 중첩된 files 딕셔너리까지 순회한다.
-
-    EN: Clean up resources (mmap, temp block files) held by a UnityPy Environment.
-    UnityPy may hold mmaps or temp files inside BundleFile objects;
-    failing to release them explicitly causes file handle leaks.
-    Uses stack-based DFS to traverse nested files dicts."""
-    if environment is None:
-        return
-    stack: list[Any] = []
-    files = getattr(environment, "files", None)
-    if isinstance(files, dict):
-        stack.extend(files.values())
-    while stack:
-        item = stack.pop()
-        for attr in ("_cleanup_temp_blocks_storage", "close"):
-            fn = getattr(item, attr, None)
-            if callable(fn):
-                try:
-                    fn()
-                except Exception:
-                    pass
-        sub_files = getattr(item, "files", None)
-        if isinstance(sub_files, dict):
-            stack.extend(sub_files.values())
+_UNITY_SPLIT_FILE_RE = re.compile(r"\.split(\d+)$", re.IGNORECASE)
 
 
 Language = Literal["ko", "en"]
@@ -97,6 +72,18 @@ JsonDict = dict[str, Any]
 #     New: m_GlyphTable + m_FaceInfo, GlyphRect.y is used directly as bottom-origin.
 _TMP_OLD_ONLY_LAST = (2018, 3, 14)
 _TMP_NEW_SCHEMA_FIRST = (2018, 4, 2)
+_TMP_CREATION_SETTINGS_KEYS = (
+    "m_CreationSettings",
+    "m_FontAssetCreationSettings",
+    "m_fontAssetCreationEditorSettings",
+)
+
+
+def _resolve_creation_settings_key(data: JsonDict) -> str | None:
+    for key in _TMP_CREATION_SETTINGS_KEYS:
+        if isinstance(data.get(key), dict):
+            return key
+    return None
 
 
 def _configure_logging(level: int = logging.INFO) -> None:
@@ -230,13 +217,14 @@ def resolve_game_path(lang: Language, path: str | None = None) -> tuple[str, str
     return game_path, data_path
 
 
+@cleanup_unitypy_environments
 def get_unity_version(data_path: str) -> str:
     """KR: globalgamemanagers를 로드하여 Unity 빌드 버전 문자열을 반환한다.
     EN: Load globalgamemanagers and return the Unity build version string."""
     ggm_path = find_ggm_file(data_path)
     if not ggm_path:
         raise FileNotFoundError(f"globalgamemanagers not found in '{data_path}'")
-    return str(UnityPy.load(ggm_path).objects[0].assets_file.unity_version)
+    return str(load_unitypy(ggm_path).objects[0].assets_file.unity_version)
 
 
 def find_assets_files(data_path: str) -> list[str]:
@@ -266,9 +254,26 @@ def find_assets_files(data_path: str) -> list[str]:
         ".mp4",
         ".avi",
         ".mov",
+        ".rollback",
+        ".tmp",
     }
-    for root, _, files in os.walk(data_path):
+    normalized_data_root = os.path.normcase(os.path.normpath(data_path))
+    for root, dirs, files in os.walk(data_path):
+        normalized_root = os.path.normcase(os.path.normpath(root))
+        excluded_tool_dirs = {".unity_font_replacer_rollback"}
+        if normalized_root == normalized_data_root:
+            excluded_tool_dirs.add("temp")
+        dirs[:] = [
+            directory
+            for directory in dirs
+            if directory.lower() not in excluded_tool_dirs
+        ]
         for fn in files:
+            split_match = _UNITY_SPLIT_FILE_RE.search(fn)
+            if split_match and int(split_match.group(1)) != 0:
+                # Loading .split0 merges the complete set; later pieces would
+                # only duplicate the read-only export scan.
+                continue
             ext = os.path.splitext(fn)[1].lower()
             if ext not in exclude_exts:
                 assets_files.append(os.path.join(root, fn))
@@ -814,6 +819,12 @@ def _best_atlas_ref(
     If prefer_new=True, try new schema first."""
     new_any = _first_atlas_ref(data.get("m_AtlasTextures"))
     new_valid = _first_valid_atlas_ref(data.get("m_AtlasTextures"))
+    singular_any = (
+        cast(JsonDict | None, data.get("m_AtlasTexture"))
+        if isinstance(data.get("m_AtlasTexture"), dict)
+        else None
+    )
+    singular_valid = singular_any if _has_real_atlas_path(singular_any) else None
     old_any = (
         cast(JsonDict | None, data.get("atlas"))
         if isinstance(data.get("atlas"), dict)
@@ -822,9 +833,9 @@ def _best_atlas_ref(
     old_valid = old_any if _has_real_atlas_path(old_any) else None
 
     ordered = (
-        (new_valid, old_valid, new_any, old_any)
+        (new_valid, singular_valid, old_valid, new_any, singular_any, old_any)
         if prefer_new
-        else (old_valid, new_valid, old_any, new_any)
+        else (old_valid, new_valid, singular_valid, old_any, new_any, singular_any)
     )
     for ref in ordered:
         if isinstance(ref, dict):
@@ -858,7 +869,10 @@ def detect_tmp_version(
 
     has_new_face = isinstance(data.get("m_FaceInfo"), dict)
     has_old_face = isinstance(data.get("m_fontInfo"), dict)
-    has_new_atlas = _first_atlas_ref(data.get("m_AtlasTextures")) is not None
+    has_new_atlas = (
+        _first_atlas_ref(data.get("m_AtlasTextures")) is not None
+        or isinstance(data.get("m_AtlasTexture"), dict)
+    )
     has_old_atlas = isinstance(data.get("atlas"), dict)
 
     if has_new_glyphs != has_old_glyphs:
@@ -869,6 +883,18 @@ def detect_tmp_version(
         return "new" if has_new_face else "old"
     if has_new_atlas != has_old_atlas:
         return "new" if has_new_atlas else "old"
+
+    if any(
+        key in data
+        for key in (
+            "m_GlyphTable",
+            "m_CharacterTable",
+            "m_AtlasTextures",
+            "m_AtlasTexture",
+            "m_AtlasWidth",
+        )
+    ):
+        return "new"
 
     hint = _tmp_version_hint(unity_version)
     if hint is not None:
@@ -905,6 +931,11 @@ def inspect_tmp_font_schema(
     has_new_face = isinstance(data.get("m_FaceInfo"), dict)
     has_old_face = isinstance(data.get("m_fontInfo"), dict)
     new_atlas_ref = _first_atlas_ref(data.get("m_AtlasTextures"))
+    singular_atlas_ref = (
+        cast(JsonDict | None, data.get("m_AtlasTexture"))
+        if isinstance(data.get("m_AtlasTexture"), dict)
+        else None
+    )
     old_atlas_ref = (
         cast(JsonDict | None, data.get("atlas"))
         if isinstance(data.get("atlas"), dict)
@@ -926,6 +957,7 @@ def inspect_tmp_font_schema(
         or has_new_face
         or has_old_face
         or new_atlas_ref is not None
+        or singular_atlas_ref is not None
         or old_atlas_ref is not None
     )
     return {
@@ -1020,7 +1052,10 @@ def extract_tmp_refs(parse_dict: JsonDict) -> dict[str, int] | None:
         material_ref = alt_material if isinstance(alt_material, dict) else {}
     material_file_id, material_path_id = _atlas_ref_ids(material_ref)
 
-    creation_settings = parse_dict.get("m_CreationSettings")
+    creation_settings_key = _resolve_creation_settings_key(parse_dict)
+    creation_settings = (
+        parse_dict.get(creation_settings_key) if creation_settings_key else None
+    )
     if isinstance(creation_settings, dict):
         # KR: 교체/추출 시 문자열 시퀀스 잡음을 방지하기 위해 빈 문자열로 정규화합니다.
         # EN: Normalize characterSequence to empty to avoid noisy serialized diffs.
@@ -1034,6 +1069,7 @@ def extract_tmp_refs(parse_dict: JsonDict) -> dict[str, int] | None:
     }
 
 
+@cleanup_unitypy_environments
 def export_fonts(
     game_path: str,
     data_path: str,
@@ -1116,7 +1152,7 @@ def export_fonts(
         outer_name = os.path.basename(assets_file)
         outer_display_by_key.setdefault(outer_key, outer_name)
         try:
-            env = UnityPy.load(assets_file)
+            env = load_unitypy(assets_file)
             env.typetree_generator = generator
         except Exception as e:  # pragma: no cover
             if lang == "ko":
@@ -1268,7 +1304,7 @@ def export_fonts(
             continue
 
         try:
-            env = UnityPy.load(assets_file)
+            env = load_unitypy(assets_file)
             env.typetree_generator = generator
         except Exception as e:  # pragma: no cover
             if lang == "ko":
