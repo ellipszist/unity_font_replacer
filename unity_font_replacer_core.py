@@ -4995,6 +4995,48 @@ def _resolve_target_assets_name(
     return _resolve_assets_name_from_file_id(source_assets_file, resolved_file_id)
 
 
+def _resolve_material_main_texture_key(
+    source_assets_file: Any,
+    current_assets_name: str,
+    material: Any,
+) -> str | None:
+    """Resolve a Material's _MainTex reference across asset files."""
+    saved_props = getattr(material, "m_SavedProperties", None)
+    tex_envs = getattr(saved_props, "m_TexEnvs", None)
+    if not isinstance(tex_envs, list):
+        return None
+    for entry in tex_envs:
+        if not (
+            isinstance(entry, (list, tuple))
+            and len(entry) >= 2
+            and str(entry[0]) == "_MainTex"
+        ):
+            continue
+        tex_env = entry[1]
+        tex_ref = (
+            tex_env.get("m_Texture")
+            if isinstance(tex_env, dict)
+            else getattr(tex_env, "m_Texture", None)
+        )
+        if isinstance(tex_ref, dict):
+            file_id = int(tex_ref.get("m_FileID", 0) or 0)
+            path_id = int(tex_ref.get("m_PathID", 0) or 0)
+        else:
+            file_id = int(getattr(tex_ref, "m_FileID", 0) or 0)
+            path_id = int(getattr(tex_ref, "m_PathID", 0) or 0)
+        if path_id <= 0:
+            return None
+        target_assets_name = _resolve_target_assets_name(
+            source_assets_file,
+            current_assets_name,
+            file_id,
+        )
+        if not target_assets_name:
+            return None
+        return _make_assets_object_key(target_assets_name, path_id)
+    return None
+
+
 def _collect_asset_file_index_matches(
     asset_file_index: dict[str, Any] | None,
     reference: Any,
@@ -5226,6 +5268,21 @@ def _copy_patch_bucket(
         return {}
     bucket = patch_map.get(str(file_key), {})
     return dict(bucket) if isinstance(bucket, dict) else {}
+
+
+def _build_material_atlas_reconciliation_buckets(
+    file_keys: Iterable[str],
+    material_atlas_plans: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Broadcast collected atlas fallbacks for a final material-only pass."""
+    buckets: dict[str, dict[str, Any]] = {}
+    if not material_atlas_plans:
+        return buckets
+    for file_key in file_keys:
+        normalized_file = _normalize_asset_file_key(file_key)
+        if normalized_file and normalized_file not in buckets:
+            buckets[normalized_file] = dict(material_atlas_plans)
+    return buckets
 
 
 def _patch_payload_ids(bucket: dict[str, Any] | None) -> set[int]:
@@ -8578,6 +8635,7 @@ def replace_fonts_in_file(
     deferred_texture_plans: dict[str, dict[str, Any]] | None = None,
     deferred_material_plans: dict[str, dict[str, Any]] | None = None,
     deferred_material_atlas_plans: dict[str, dict[str, Any]] | None = None,
+    collected_material_atlas_plans: dict[str, JsonDict] | None = None,
     pending_external_patch_files: set[str] | None = None,
     logical_file_key: str | None = None,
     phase_callback: Callable[[str, JsonDict], None] | None = None,
@@ -9635,16 +9693,15 @@ def replace_fonts_in_file(
                         "source_entry": f"{fn_without_path}|{assets_name}|{pathid}",
                     }
                     if texture_key and texture_target_file_key:
-                        if texture_target_file_key == current_file_key:
-                            _store_consistent_patch_value(
-                                material_replacements_by_atlas,
-                                texture_key,
-                                atlas_fallback_payload,
-                                patch_kind="material_atlas",
-                                target_file_key=current_file_key,
-                                transaction=deferred_transaction,
-                            )
-                        else:
+                        _store_consistent_patch_value(
+                            material_replacements_by_atlas,
+                            texture_key,
+                            atlas_fallback_payload,
+                            patch_kind="material_atlas",
+                            target_file_key=current_file_key,
+                            transaction=deferred_transaction,
+                        )
+                        if texture_target_file_key != current_file_key:
                             _register_deferred_patch(
                                 staged_material_atlas_plans,
                                 texture_target_file_key,
@@ -9653,6 +9710,15 @@ def replace_fonts_in_file(
                                 pending_files=staged_pending_files,
                                 patch_kind="material_atlas",
                                 transaction=deferred_transaction,
+                            )
+                        if collected_material_atlas_plans is not None:
+                            _store_consistent_patch_value(
+                                collected_material_atlas_plans,
+                                texture_key,
+                                atlas_fallback_payload,
+                                patch_kind="material_atlas",
+                                target_file_key="material_reconciliation",
+                                transaction=None,
                             )
                     if m_Material_PathID != 0:
                         gradient_scale = None
@@ -10155,31 +10221,12 @@ def replace_fonts_in_file(
             if mat_info is None:
                 if parse_dict is None:
                     parse_dict = _safe_parse_as_object(obj)
-                saved_props = getattr(parse_dict, "m_SavedProperties", None)
-                tex_envs = getattr(saved_props, "m_TexEnvs", None)
-                main_tex_path_id = 0
-                if isinstance(tex_envs, list):
-                    for entry in tex_envs:
-                        if (
-                            isinstance(entry, (list, tuple))
-                            and len(entry) >= 2
-                            and str(entry[0]) == "_MainTex"
-                        ):
-                            tex_env_val = entry[1]
-                            tex_ref = (
-                                tex_env_val.get("m_Texture")
-                                if isinstance(tex_env_val, dict)
-                                else getattr(tex_env_val, "m_Texture", None)
-                            )
-                            if isinstance(tex_ref, dict):
-                                main_tex_path_id = int(tex_ref.get("m_PathID", 0) or 0)
-                            else:
-                                main_tex_path_id = int(
-                                    getattr(tex_ref, "m_PathID", 0) or 0
-                                )
-                            break
-                if main_tex_path_id > 0:
-                    atlas_key = _make_assets_object_key(assets_name, main_tex_path_id)
+                atlas_key = _resolve_material_main_texture_key(
+                    obj.assets_file,
+                    assets_name,
+                    parse_dict,
+                )
+                if atlas_key is not None:
                     mat_info = _lookup_patch_value(
                         material_replacements_by_atlas,
                         atlas_key,
@@ -12387,6 +12434,7 @@ Examples:
     deferred_texture_plans: dict[str, dict[str, Any]] = {}
     deferred_material_plans: dict[str, dict[str, Any]] = {}
     deferred_material_atlas_plans: dict[str, dict[str, Any]] = {}
+    collected_material_atlas_plans: dict[str, JsonDict] = {}
     pending_external_patch_files: set[str] = set()
     pending_queue_keys: set[str] = set(asset_file_queue)
     prepared_output_targets: set[str] = set()
@@ -12513,6 +12561,7 @@ Examples:
                             deferred_texture_plans=deferred_texture_plans,
                             deferred_material_plans=deferred_material_plans,
                             deferred_material_atlas_plans=deferred_material_atlas_plans,
+                            collected_material_atlas_plans=collected_material_atlas_plans,
                             pending_external_patch_files=pending_external_patch_files,
                             logical_file_key=asset_file_key,
                             deferred_transaction=deferred_transaction,
@@ -12577,6 +12626,7 @@ Examples:
                                 deferred_texture_plans=deferred_texture_plans,
                                 deferred_material_plans=deferred_material_plans,
                                 deferred_material_atlas_plans=deferred_material_atlas_plans,
+                                collected_material_atlas_plans=collected_material_atlas_plans,
                                 pending_external_patch_files=pending_external_patch_files,
                                 logical_file_key=asset_file_key,
                                 deferred_transaction=deferred_transaction,
@@ -12696,6 +12746,7 @@ Examples:
                                         deferred_texture_plans=deferred_texture_plans,
                                         deferred_material_plans=deferred_material_plans,
                                         deferred_material_atlas_plans=deferred_material_atlas_plans,
+                                        collected_material_atlas_plans=collected_material_atlas_plans,
                                         pending_external_patch_files=pending_external_patch_files,
                                         logical_file_key=asset_file_key,
                                         deferred_transaction=deferred_transaction,
@@ -12836,6 +12887,7 @@ Examples:
                         deferred_texture_plans=deferred_texture_plans,
                         deferred_material_plans=deferred_material_plans,
                         deferred_material_atlas_plans=deferred_material_atlas_plans,
+                        collected_material_atlas_plans=collected_material_atlas_plans,
                         pending_external_patch_files=pending_external_patch_files,
                         logical_file_key=asset_file_key,
                         deferred_transaction=deferred_transaction,
@@ -12901,6 +12953,91 @@ Examples:
                     f"[runtime] queued_deferred_patch_file={pending_path} "
                     f"queue_size={len(asset_file_queue)}"
                 )
+
+    reconciliation_buckets = _build_material_atlas_reconciliation_buckets(
+        asset_file_queue,
+        collected_material_atlas_plans,
+    )
+    if (
+        mode != "preview_export"
+        and reconciliation_buckets
+        and not (
+            deferred_transaction is not None
+            and deferred_transaction.has_failures
+        )
+    ):
+        if is_ko:
+            _log_console("\n외부 아틀라스 머티리얼 프리셋 재검사 중...")
+        else:
+            _log_console("\nReconciling external-atlas Material presets...")
+        for asset_file_key in list(reconciliation_buckets):
+            assets_file = asset_path_by_key.get(asset_file_key)
+            if not assets_file:
+                continue
+            working_assets_file = assets_file
+            if output_only_root:
+                working_assets_file = resolve_output_only_path(
+                    assets_file,
+                    data_path,
+                    output_only_root,
+                )
+            reconciliation_outcome: JsonDict = {}
+            try:
+                replace_fonts_in_file(
+                    unity_version,
+                    game_path,
+                    working_assets_file,
+                    {},
+                    replace_ttf=False,
+                    replace_sdf=False,
+                    use_game_mat=args.use_game_material,
+                    force_raster=args.force_raster,
+                    use_game_line_metrics=args.use_game_line_metrics,
+                    material_scale_by_padding=material_scale_by_padding,
+                    outline_ratio=args.outline_ratio,
+                    prefer_original_compress=args.original_compress,
+                    temp_root_dir=args.temp_dir,
+                    generator=generator,
+                    replacement_lookup={},
+                    ps5_swizzle=args.ps5_swizzle,
+                    prefer_builtin_padding_variants=prefer_builtin_padding_variants,
+                    charset_source=args.charset,
+                    asset_file_index=asset_file_index,
+                    deferred_material_atlas_plans=reconciliation_buckets,
+                    logical_file_key=asset_file_key,
+                    deferred_transaction=deferred_transaction,
+                    operation_outcome=reconciliation_outcome,
+                    lang=lang,
+                )
+                if bool(reconciliation_outcome.get("modified")) and not bool(
+                    reconciliation_outcome.get("save_success")
+                ):
+                    failure = (
+                        f"{os.path.basename(assets_file)}: "
+                        "material reconciliation save failed"
+                    )
+                    terminal_failures.append(failure)
+                    if deferred_transaction is not None:
+                        deferred_transaction.fail(failure)
+            except Exception as exc:
+                failure = (
+                    f"{os.path.basename(assets_file)}: material reconciliation "
+                    f"exception: {type(exc).__name__}: {exc}"
+                )
+                terminal_failures.append(failure)
+                if deferred_transaction is not None:
+                    deferred_transaction.fail(failure)
+            if (
+                deferred_transaction is not None
+                and deferred_transaction.has_failures
+            ):
+                break
+
+    for remaining_bucket in reconciliation_buckets.values():
+        _cleanup_deferred_patch_bucket(remaining_bucket)
+    reconciliation_buckets.clear()
+    _cleanup_deferred_patch_bucket(collected_material_atlas_plans)
+    collected_material_atlas_plans.clear()
 
     pending_required_deferred = bool(
         deferred_texture_plans

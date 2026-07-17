@@ -55,6 +55,52 @@ class _Object:
 
 
 class TmpAndMemoryRegressionTests(unittest.TestCase):
+    def test_material_main_texture_key_resolves_external_file_id(self) -> None:
+        external = SimpleNamespace(path="sharedassets0.assets")
+        assets_file = SimpleNamespace(
+            name="resources.assets",
+            externals=[
+                SimpleNamespace(path="globalgamemanagers.assets"),
+                SimpleNamespace(path="unity default resources"),
+                external,
+            ],
+        )
+        material = SimpleNamespace(
+            m_SavedProperties=SimpleNamespace(
+                m_TexEnvs=[
+                    (
+                        "_MainTex",
+                        {"m_Texture": {"m_FileID": 3, "m_PathID": 154}},
+                    )
+                ]
+            )
+        )
+
+        self.assertEqual(
+            core._resolve_material_main_texture_key(
+                assets_file,
+                "resources.assets",
+                material,
+            ),
+            core._make_assets_object_key("sharedassets0.assets", 154),
+        )
+
+    def test_material_atlas_reconciliation_includes_earlier_files(self) -> None:
+        atlas_key = core._make_assets_object_key("sharedassets0.assets", 157)
+        payload = {"w": 4096, "h": 4096}
+        resources_key = str(ROOT / "Game_Data" / "resources.assets")
+        shared_key = str(ROOT / "Game_Data" / "sharedassets0.assets")
+
+        buckets = core._build_material_atlas_reconciliation_buckets(
+            [resources_key, shared_key],
+            {atlas_key: payload},
+        )
+
+        normalized_resources = core._normalize_asset_file_key(resources_key)
+        normalized_shared = core._normalize_asset_file_key(shared_key)
+        self.assertIs(buckets[normalized_resources][atlas_key], payload)
+        self.assertIs(buckets[normalized_shared][atlas_key], payload)
+
     def test_only_singular_atlas_reference_is_detected(self) -> None:
         data = {
             "m_GlyphTable": [{"m_Index": 1}],
