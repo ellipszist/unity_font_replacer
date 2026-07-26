@@ -53,7 +53,6 @@ import copy
 import errno
 import struct as struct_module
 import weakref
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from functools import lru_cache, wraps
 from pathlib import Path
@@ -61,6 +60,14 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Literal, NoReturn, cast
 
 from PIL import Image, ImageOps
+from scan_worker_pool import (
+    DEFAULT_MAX_JOBS_PER_WORKER,
+    DEFAULT_STALL_SECONDS,
+    PersistentScanWorkerPool,
+    ScanPoolResult,
+    decode_protocol_message,
+    write_protocol_message,
+)
 from unitypy_runtime import (
     UnityPy,
     cleanup_unitypy_environments,
@@ -3561,7 +3568,11 @@ def _prepare_texture_replacement_for_target(
 
     return {
         "replacement_image": atlas_for_write,
-        "target_swizzled_state": target_is_swizzled,
+        # KR: Alpha8 raw 저장에는 자동 판정값이 아니라 강제 옵션까지 반영된
+        #     최종 저장 상태가 필요합니다.
+        # EN: Alpha8 raw encoding needs the final storage state, including
+        #     process_swizzle overrides, rather than only the detector verdict.
+        "target_swizzled_state": bool(desired_swizzle_state),
         "replacement_linear_source": atlas_linear_for_alpha8,
         "metadata_size": (
             int(atlas_metadata_width),
@@ -6703,6 +6714,7 @@ def _scan_fonts_from_env(
     detect_ps5_swizzle: bool = False,
     scan_ttf: bool = True,
     scan_sdf: bool = True,
+    phase_callback: Callable[[str, JsonDict], None] | None = None,
 ) -> dict[str, list[JsonDict]]:
     """KR: 로드된 UnityPy env에서 TTF/SDF 폰트 정보를 추출합니다.
     EN: Extracts TTF/SDF font information from a loaded UnityPy env.
@@ -6710,13 +6722,41 @@ def _scan_fonts_from_env(
     scanned: dict[str, list[JsonDict]] = {"ttf": [], "sdf": []}
     texture_lookup: dict[tuple[str, int], Any] = {}
     texture_swizzle_cache: dict[str, str | None] = {}
+    objects = env.objects
+    try:
+        object_count = len(objects)
+    except Exception:
+        object_count = None
+    _emit_phase_callback(
+        phase_callback,
+        "object_scan_begin",
+        file=file_name,
+        object_count=object_count,
+    )
+
     if scan_sdf and detect_ps5_swizzle:
-        for item in env.objects:
+        for item_index, item in enumerate(objects):
+            if item_index % 256 == 0:
+                _emit_phase_callback(
+                    phase_callback,
+                    "texture_index_progress",
+                    file=file_name,
+                    object_index=item_index,
+                    object_count=object_count,
+                )
             if item.type.name != "Texture2D":
                 continue
             texture_lookup[(item.assets_file.name, int(item.path_id))] = item
 
-    for obj in env.objects:
+    for object_index, obj in enumerate(objects):
+        if object_index % 256 == 0:
+            _emit_phase_callback(
+                phase_callback,
+                "object_scan_progress",
+                file=file_name,
+                object_index=object_index,
+                object_count=object_count,
+            )
         try:
             if scan_ttf and obj.type.name == "Font":
                 font_name = obj.peek_name()
@@ -6831,6 +6871,14 @@ def _scan_fonts_from_env(
                 )
             continue
 
+    _emit_phase_callback(
+        phase_callback,
+        "object_scan_end",
+        file=file_name,
+        object_count=object_count,
+        ttf_count=len(scanned["ttf"]),
+        sdf_count=len(scanned["sdf"]),
+    )
     return scanned
 
 
@@ -6841,6 +6889,7 @@ def _scan_fonts_in_asset_file(
     detect_ps5_swizzle: bool = False,
     scan_ttf: bool = True,
     scan_sdf: bool = True,
+    phase_callback: Callable[[str, JsonDict], None] | None = None,
 ) -> tuple[dict[str, list[JsonDict]], str | None]:
     """KR: 단일 에셋 파일을 로드해 폰트 정보를 추출합니다.
     EN: Loads a single asset file and extracts font information.
@@ -6849,14 +6898,32 @@ def _scan_fonts_in_asset_file(
     scanned: dict[str, list[JsonDict]] = {"ttf": [], "sdf": []}
 
     env = None
+    _emit_phase_callback(
+        phase_callback,
+        "load_begin",
+        file=file_name,
+        path=assets_file,
+    )
     try:
         env = load_unitypy(assets_file)
         env.typetree_generator = generator
     except Exception as e:
+        _emit_phase_callback(
+            phase_callback,
+            "load_error",
+            file=file_name,
+            path=assets_file,
+        )
         if lang == "ko":
             return scanned, f"UnityPy.load 실패: {assets_file} ({e})"
         return scanned, f"UnityPy.load failed: {assets_file} ({e})"
 
+    _emit_phase_callback(
+        phase_callback,
+        "load_end",
+        file=file_name,
+        path=assets_file,
+    )
     try:
         scanned = _scan_fonts_from_env(
             env,
@@ -6865,6 +6932,7 @@ def _scan_fonts_in_asset_file(
             detect_ps5_swizzle=detect_ps5_swizzle,
             scan_ttf=scan_ttf,
             scan_sdf=scan_sdf,
+            phase_callback=phase_callback,
         )
     finally:
         close_unitypy_env(env)
@@ -6881,155 +6949,84 @@ def _scan_fonts_via_worker(
     detect_ps5_swizzle: bool = False,
     scan_ttf: bool = True,
     scan_sdf: bool = True,
+    scan_stall_seconds: float = DEFAULT_STALL_SECONDS,
 ) -> tuple[dict[str, list[JsonDict]], str | None]:
-    """KR: 파일 단위 서브프로세스 워커로 스캔해 크래시를 격리합니다.
-    EN: Scans via a per-file subprocess worker to isolate crashes.
+    """KR: 호환용 단일 작업 래퍼이며 내부적으로 영구 워커를 사용합니다.
+    EN: Compatibility wrapper for one job, backed by a persistent worker.
     """
-    fd, output_path = tempfile.mkstemp(prefix="scan_worker_", suffix=".json")
-    os.close(fd)
-    worker_exit_hints = {
-        -1073741819: "ACCESS_VIOLATION(0xC0000005)",
-        3221225477: "ACCESS_VIOLATION(0xC0000005)",
+    command = _build_scan_worker_server_command(
+        game_path,
+        lang=lang,
+        detect_ps5_swizzle=detect_ps5_swizzle,
+        scan_ttf=scan_ttf,
+        scan_sdf=scan_sdf,
+    )
+    result = PersistentScanWorkerPool(
+        command,
+        worker_count=1,
+        max_retries=1,
+        stall_seconds=scan_stall_seconds,
+    ).scan([assets_file])[0]
+    return _normalize_scan_pool_result(result)
+
+
+def _build_scan_worker_server_command(
+    game_path: str,
+    *,
+    lang: Language,
+    detect_ps5_swizzle: bool,
+    scan_ttf: bool,
+    scan_sdf: bool,
+) -> list[str]:
+    """KR: 현재 소스/동결 실행 환경에 맞는 영구 워커 명령을 구성합니다.
+    EN: Build the persistent-worker command for source or frozen execution.
+    """
+    if getattr(sys, "frozen", False):
+        command = [sys.executable]
+    else:
+        command = [sys.executable, os.path.abspath(__file__)]
+    command.extend(
+        [
+            "--gamepath",
+            game_path,
+            "--_scan-worker-server",
+            "--_scan-worker-lang",
+            lang,
+        ]
+    )
+    if detect_ps5_swizzle:
+        command.append("--ps5-swizzle")
+    if scan_ttf and not scan_sdf:
+        command.append("--_scan-ttf-only")
+    elif scan_sdf and not scan_ttf:
+        command.append("--_scan-sdf-only")
+    return command
+
+
+def _normalize_scan_pool_result(
+    result: ScanPoolResult,
+) -> tuple[dict[str, list[JsonDict]], str | None]:
+    """KR: 프로토콜 payload를 기존 스캔 반환 형식으로 정규화합니다.
+    EN: Normalize a protocol payload to the legacy scan return shape.
+    """
+    payload = result.payload if isinstance(result.payload, dict) else {}
+    ttf_raw = payload.get("ttf", [])
+    sdf_raw = payload.get("sdf", [])
+    scanned: dict[str, list[JsonDict]] = {
+        "ttf": list(ttf_raw) if isinstance(ttf_raw, list) else [],
+        "sdf": list(sdf_raw) if isinstance(sdf_raw, list) else [],
     }
-    access_violation_codes = set(worker_exit_hints.keys())
-
-    def _run_worker(
-    ) -> tuple[dict[str, list[JsonDict]], str | None, str | None, int | None]:
-        try:
-            try:
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-            except Exception:
-                pass
-
-            if getattr(sys, "frozen", False):
-                cmd = [
-                    sys.executable,
-                    "--gamepath",
-                    game_path,
-                    "--_scan-file-worker",
-                    assets_file,
-                    "--_scan-file-worker-output",
-                    output_path,
-                ]
-            else:
-                cmd = [
-                    sys.executable,
-                    os.path.abspath(__file__),
-                    "--gamepath",
-                    game_path,
-                    "--_scan-file-worker",
-                    assets_file,
-                    "--_scan-file-worker-output",
-                    output_path,
-                ]
-            if detect_ps5_swizzle:
-                cmd.append("--ps5-swizzle")
-            if scan_ttf and not scan_sdf:
-                cmd.append("--_scan-ttf-only")
-            elif scan_sdf and not scan_ttf:
-                cmd.append("--_scan-sdf-only")
-
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=1800,
-            )
-            if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "").strip()
-                hint = worker_exit_hints.get(int(proc.returncode))
-                hint_text = f" [{hint}]" if hint else ""
-                if lang == "ko":
-                    return (
-                        {"ttf": [], "sdf": []},
-                        None,
-                        f"scan worker 실패 (exit={proc.returncode}{hint_text}): {detail}",
-                        int(proc.returncode),
-                    )
-                return (
-                    {"ttf": [], "sdf": []},
-                    None,
-                    f"scan worker failed (exit={proc.returncode}{hint_text}): {detail}",
-                    int(proc.returncode),
-                )
-
-            if not os.path.exists(output_path):
-                if lang == "ko":
-                    return (
-                        {"ttf": [], "sdf": []},
-                        None,
-                        "scan worker 결과 파일이 없습니다.",
-                        None,
-                    )
-                return (
-                    {"ttf": [], "sdf": []},
-                    None,
-                    "scan worker output file is missing.",
-                    None,
-                )
-
-            with open(output_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            scanned = {
-                "ttf": list(payload.get("ttf", []))
-                if isinstance(payload, dict)
-                else [],
-                "sdf": list(payload.get("sdf", []))
-                if isinstance(payload, dict)
-                else [],
-            }
-            worker_error = None
-            if isinstance(payload, dict):
-                worker_error = payload.get("error")
-                if not isinstance(worker_error, str):
-                    worker_error = None
-            return scanned, worker_error, None, int(proc.returncode)
-        except Exception as e:
-            if lang == "ko":
-                return (
-                    {"ttf": [], "sdf": []},
-                    None,
-                    f"scan worker 실행 실패: {e!r}",
-                    None,
-                )
-            return (
-                {"ttf": [], "sdf": []},
-                None,
-                f"failed to run scan worker: {e!r}",
-                None,
-            )
-
-    try:
-        scanned, worker_error, full_error, full_returncode = _run_worker()
-        if full_error is None:
-            return scanned, worker_error
-
-        # KR: ACCESS_VIOLATION은 일시적인 경우가 있어 full 모드 1회 재시도합니다.
-        # EN: ACCESS_VIOLATION can be transient, so retry once in full mode.
-        if full_returncode in access_violation_codes:
-            retry_scanned, retry_worker_error, retry_error, _ = _run_worker()
-            if retry_error is None:
-                if lang == "ko":
-                    recovered = "scan worker 재시도로 크래시를 복구했습니다."
-                else:
-                    recovered = "Recovered scan worker crash by retry."
-                if retry_worker_error:
-                    return retry_scanned, f"{recovered} {retry_worker_error}"
-                return retry_scanned, recovered
-            if lang == "ko":
-                return {"ttf": [], "sdf": []}, f"{full_error} | 재시도 실패: {retry_error}"
-            return {"ttf": [], "sdf": []}, f"{full_error} | retry failed: {retry_error}"
-
-        return {"ttf": [], "sdf": []}, full_error
-    finally:
-        try:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-        except Exception:
-            pass
+    payload_error = payload.get("error")
+    errors = [
+        text
+        for text in (
+            result.error,
+            result.warning,
+            payload_error if isinstance(payload_error, str) else None,
+        )
+        if isinstance(text, str) and text.strip()
+    ]
+    return scanned, " | ".join(errors) if errors else None
 
 
 def scan_fonts(
@@ -7042,19 +7039,24 @@ def scan_fonts(
     ps5_swizzle: bool = False,
     scan_ttf: bool = True,
     scan_sdf: bool = True,
+    scan_stall_seconds: float = DEFAULT_STALL_SECONDS,
 ) -> dict[str, list[JsonDict]]:
     """KR: 게임 에셋을 스캔해 TTF/SDF 폰트 목록을 반환합니다.
 
     target_files가 있으면 해당 파일만 스캔합니다.
     exclude_exts가 있으면 해당 확장자는 스캔에서 제외합니다.
-    isolate_files=True면 파일 단위 워커 프로세스로 스캔해 크래시를 격리합니다.
-    scan_jobs>1이면 isolate_files 경로에서 워커를 병렬 실행합니다.
+    isolate_files=True면 재사용 워커 프로세스로 스캔해 크래시를 격리합니다.
+    scan_jobs는 영구 워커 풀의 크기입니다.
+    scan_stall_seconds는 CPU/I/O/단계 진행이 모두 멈춘 시간만 측정하며,
+    전체 파일 처리 시간에는 제한을 두지 않습니다.
     EN: Scans game assets and returns a list of TTF/SDF fonts.
 
     If target_files is provided, only those files are scanned.
     If exclude_exts is provided, those extensions are excluded from scanning.
-    If isolate_files=True, scans via per-file worker processes to isolate crashes.
-    If scan_jobs>1, runs workers in parallel on the isolate_files path.
+    If isolate_files=True, scans via reusable worker processes to isolate crashes.
+    scan_jobs controls the persistent worker pool size.
+    scan_stall_seconds measures only CPU/I/O/protocol inactivity; it does not
+    impose a total per-file wall-clock limit.
     """
     scan_ttf = bool(scan_ttf)
     scan_sdf = bool(scan_sdf)
@@ -7090,6 +7092,12 @@ def scan_fonts(
         scan_jobs = 1
     if scan_jobs < 1:
         scan_jobs = 1
+    try:
+        scan_stall_seconds = float(scan_stall_seconds)
+    except Exception:
+        scan_stall_seconds = DEFAULT_STALL_SECONDS
+    if scan_stall_seconds < 0:
+        scan_stall_seconds = 0.0
     if lang == "ko":
         if target_files:
             _log_console(
@@ -7105,105 +7113,65 @@ def scan_fonts(
         else:
             _log_console(f"[scan_fonts] Starting full scan: {total_files} file(s)")
 
-    if isolate_files and scan_jobs > 1 and total_files > 1:
+    if isolate_files and total_files > 0:
         max_workers = min(scan_jobs, total_files)
         if lang == "ko":
-            _log_console(f"[scan_fonts] 병렬 워커 모드: {max_workers}개")
+            _log_console(
+                f"[scan_fonts] 영구 워커 모드: {max_workers}개 "
+                f"(워커당 최대 {DEFAULT_MAX_JOBS_PER_WORKER}개 파일 재사용)"
+            )
         else:
-            _log_console(f"[scan_fonts] Parallel worker mode: {max_workers}")
-
-        indexed_results: dict[
-            int, tuple[dict[str, list[JsonDict]], str | None, str]
-        ] = {}
-        retry_candidates: list[tuple[int, str, str]] = []
-        completed = 0
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_meta = {
-                executor.submit(
-                    _scan_fonts_via_worker,
-                    game_path,
-                    assets_file,
-                    lang,
-                    ps5_swizzle,
-                    scan_ttf,
-                    scan_sdf,
-                ): (idx, os.path.basename(assets_file), assets_file)
-                for idx, assets_file in enumerate(assets_files)
-            }
-            for future in as_completed(future_to_meta):
-                idx, fn, assets_file = future_to_meta[future]
-                try:
-                    scanned, worker_error = future.result()
-                except Exception as e:
-                    scanned = {"ttf": [], "sdf": []}
-                    worker_error = (
-                        f"scan worker 실행 실패: {e!r}"
-                        if lang == "ko"
-                        else f"failed to run scan worker: {e!r}"
-                    )
-                indexed_results[idx] = (scanned, worker_error, fn)
-                if _is_scan_retry_candidate(scanned, worker_error):
-                    retry_candidates.append((idx, assets_file, fn))
-                completed += 1
-                if lang == "ko":
-                    _log_console(f"[scan_fonts] 진행 {completed}/{total_files}: {fn}")
-                else:
-                    _log_console(
-                        f"[scan_fonts] Progress {completed}/{total_files}: {fn}"
-                    )
-
-        if retry_candidates:
+            _log_console(
+                f"[scan_fonts] Persistent worker mode: {max_workers} "
+                f"(recycle after {DEFAULT_MAX_JOBS_PER_WORKER} files per worker)"
+            )
+        if scan_stall_seconds > 0:
             if lang == "ko":
                 _log_console(
-                    f"[scan_fonts] 최종 순차 재시도 시작: {len(retry_candidates)}개 파일"
+                    "[scan_fonts] 무활동 정지 판정: "
+                    f"{float(scan_stall_seconds):g}초 "
+                    "(총 처리시간 제한 아님)"
                 )
             else:
                 _log_console(
-                    f"[scan_fonts] Starting final sequential retries: {len(retry_candidates)} file(s)"
+                    "[scan_fonts] Inactivity stall threshold: "
+                    f"{float(scan_stall_seconds):g}s "
+                    "(not a total runtime limit)"
                 )
-            retry_total = len(retry_candidates)
-            for retry_idx, (idx, assets_file, fn) in enumerate(
-                retry_candidates, start=1
-            ):
-                if lang == "ko":
-                    _log_console(f"[scan_fonts] 재시도 {retry_idx}/{retry_total}: {fn}")
-                else:
-                    _log_console(f"[scan_fonts] Retry {retry_idx}/{retry_total}: {fn}")
-                retry_scanned, retry_worker_error = _scan_fonts_via_worker(
-                    game_path,
-                    assets_file,
-                    lang=lang,
-                    detect_ps5_swizzle=ps5_swizzle,
-                    scan_ttf=scan_ttf,
-                    scan_sdf=scan_sdf,
-                )
-                previous_scanned, previous_error, _ = indexed_results.get(
-                    idx, ({"ttf": [], "sdf": []}, None, fn)
-                )
-                if (
-                    retry_worker_error
-                    and not list(retry_scanned.get("ttf", []))
-                    and not list(retry_scanned.get("sdf", []))
-                    and isinstance(previous_error, str)
-                    and previous_error.strip()
-                ):
-                    if lang == "ko":
-                        merged_error = (
-                            f"{previous_error} | 최종 순차 재시도 실패: {retry_worker_error}"
-                        )
-                    else:
-                        merged_error = (
-                            f"{previous_error} | final sequential retry failed: {retry_worker_error}"
-                        )
-                    indexed_results[idx] = (previous_scanned, merged_error, fn)
-                else:
-                    indexed_results[idx] = (retry_scanned, retry_worker_error, fn)
-                gc.collect()
 
-        for idx in range(total_files):
-            scanned, worker_error, processed_file_name = indexed_results.get(
-                idx, ({"ttf": [], "sdf": []}, None, "")
-            )
+        command = _build_scan_worker_server_command(
+            game_path,
+            lang=lang,
+            detect_ps5_swizzle=ps5_swizzle,
+            scan_ttf=scan_ttf,
+            scan_sdf=scan_sdf,
+        )
+
+        def _report_progress(
+            completed: int,
+            total: int,
+            result: ScanPoolResult,
+        ) -> None:
+            file_name = os.path.basename(result.asset_path)
+            if lang == "ko":
+                _log_console(f"[scan_fonts] 진행 {completed}/{total}: {file_name}")
+            else:
+                _log_console(
+                    f"[scan_fonts] Progress {completed}/{total}: {file_name}"
+                )
+
+        pool_results = PersistentScanWorkerPool(
+            command,
+            worker_count=max_workers,
+            max_retries=1,
+            stall_seconds=scan_stall_seconds,
+            max_jobs_per_worker=DEFAULT_MAX_JOBS_PER_WORKER,
+            progress_callback=_report_progress,
+        ).scan(assets_files)
+
+        for result in pool_results:
+            processed_file_name = os.path.basename(result.asset_path)
+            scanned, worker_error = _normalize_scan_pool_result(result)
             if worker_error:
                 if lang == "ko":
                     _log_console(
@@ -7213,7 +7181,10 @@ def scan_fonts(
                     _log_console(
                         f"[scan_fonts] Worker warning: {processed_file_name} | {worker_error}"
                     )
-            _log_scan_result_details(processed_file_name or f"index_{idx}", scanned)
+            _log_scan_result_details(
+                processed_file_name or f"index_{result.index}",
+                scanned,
+            )
             fonts["ttf"].extend(scanned.get("ttf", []))
             fonts["sdf"].extend(scanned.get("sdf", []))
     else:
@@ -7223,27 +7194,6 @@ def scan_fonts(
                 _log_console(f"[scan_fonts] 진행 {idx}/{total_files}: {fn}")
             else:
                 _log_console(f"[scan_fonts] Progress {idx}/{total_files}: {fn}")
-
-            if isolate_files:
-                scanned, worker_error = _scan_fonts_via_worker(
-                    game_path,
-                    assets_file,
-                    lang=lang,
-                    detect_ps5_swizzle=ps5_swizzle,
-                    scan_ttf=scan_ttf,
-                    scan_sdf=scan_sdf,
-                )
-                if worker_error:
-                    if lang == "ko":
-                        _log_console(f"[scan_fonts] 워커 경고: {fn} | {worker_error}")
-                    else:
-                        _log_console(
-                            f"[scan_fonts] Worker warning: {fn} | {worker_error}"
-                        )
-                _log_scan_result_details(fn, scanned)
-                fonts["ttf"].extend(scanned.get("ttf", []))
-                fonts["sdf"].extend(scanned.get("sdf", []))
-                continue
 
             scanned, load_error = _scan_fonts_in_asset_file(
                 assets_file,
@@ -7270,6 +7220,7 @@ def parse_fonts(
     exclude_exts: set[str] | None = None,
     scan_jobs: int = 1,
     ps5_swizzle: bool = False,
+    scan_stall_seconds: float = DEFAULT_STALL_SECONDS,
 ) -> str:
     """KR: 스캔한 폰트를 JSON으로 저장하고 결과 파일 경로를 반환합니다.
 
@@ -7280,8 +7231,8 @@ def parse_fonts(
     If target_files is provided, only those files are parsed.
     If exclude_exts is provided, those extensions are excluded from scanning.
     """
-    # KR: parse 모드는 파일 단위 워커로 스캔해 UnityPy 하드 크래시를 격리합니다.
-    # EN: Parse mode scans via per-file workers to isolate UnityPy hard crashes.
+    # KR: parse 모드는 재사용 워커 풀로 스캔해 UnityPy 하드 크래시를 격리합니다.
+    # EN: Parse mode scans via a reusable worker pool to isolate UnityPy hard crashes.
     fonts = scan_fonts(
         game_path,
         lang=lang,
@@ -7290,6 +7241,7 @@ def parse_fonts(
         isolate_files=True,
         scan_jobs=scan_jobs,
         ps5_swizzle=ps5_swizzle,
+        scan_stall_seconds=scan_stall_seconds,
     )
     game_name = os.path.basename(game_path)
     output_file = os.path.join(get_script_dir(), f"{game_name}.json")
@@ -10768,6 +10720,7 @@ def create_batch_replacements(
     scan_jobs: int = 1,
     lang: Language = "ko",
     ps5_swizzle: bool = False,
+    scan_stall_seconds: float = DEFAULT_STALL_SECONDS,
 ) -> dict[str, JsonDict]:
     """KR: 게임 내 모든 폰트를 지정 폰트로 치환하는 배치 매핑을 생성합니다.
     target_files가 있으면 해당 파일만 대상으로 매핑을 생성합니다.
@@ -10786,6 +10739,7 @@ def create_batch_replacements(
         ps5_swizzle=ps5_swizzle,
         scan_ttf=replace_ttf,
         scan_sdf=replace_sdf,
+        scan_stall_seconds=scan_stall_seconds,
     )
     replacements: dict[str, JsonDict] = {}
 
@@ -10844,6 +10798,7 @@ def create_preview_export_targets(
     scan_jobs: int = 1,
     lang: Language = "ko",
     ps5_swizzle: bool = False,
+    scan_stall_seconds: float = DEFAULT_STALL_SECONDS,
 ) -> dict[str, JsonDict]:
     """KR: preview-export 전용 SDF 대상 매핑(Replace_to 비어 있음)을 생성합니다.
     scan_jobs/target_files/exclude_exts 조건을 그대로 반영합니다.
@@ -10858,6 +10813,7 @@ def create_preview_export_targets(
         exclude_exts=exclude_exts,
         scan_jobs=scan_jobs,
         ps5_swizzle=ps5_swizzle,
+        scan_stall_seconds=scan_stall_seconds,
     )
     targets: dict[str, JsonDict] = {}
     for font in fonts["sdf"]:
@@ -11325,6 +11281,118 @@ def run_validation_worker(
         return 2
 
 
+def run_persistent_scan_worker(
+    game_path: str,
+    lang: Language = "ko",
+    detect_ps5_swizzle: bool = False,
+    scan_ttf: bool = True,
+    scan_sdf: bool = True,
+) -> int:
+    """KR: 여러 파일을 순차 처리하는 JSON-lines 영구 스캔 워커입니다.
+    EN: JSON-lines persistent scan worker that handles multiple files.
+    """
+    try:
+        game_path, data_path = resolve_game_path(game_path, lang=lang)
+        generator: TypeTreeGenerator | None = None
+        if scan_sdf:
+            unity_version = get_unity_version(game_path, lang=lang)
+            compile_method = get_compile_method(data_path)
+            generator = _create_generator(
+                unity_version,
+                game_path,
+                data_path,
+                compile_method,
+                lang=lang,
+            )
+    except Exception as error:
+        write_protocol_message(
+            sys.stdout,
+            {
+                "type": "fatal",
+                "error": repr(error),
+            },
+        )
+        return 2
+
+    write_protocol_message(
+        sys.stdout,
+        {
+            "type": "ready",
+            "pid": os.getpid(),
+        },
+    )
+    for raw_line in sys.stdin:
+        message = decode_protocol_message(raw_line)
+        if message is None:
+            continue
+        message_type = message.get("type")
+        if message_type == "shutdown":
+            return 0
+        if message_type != "scan":
+            continue
+
+        job_id = message.get("job_id")
+        assets_file = str(message.get("path", "")).strip()
+        if not assets_file:
+            write_protocol_message(
+                sys.stdout,
+                {
+                    "type": "result",
+                    "job_id": job_id,
+                    "payload": {
+                        "ttf": [],
+                        "sdf": [],
+                        "error": "scan worker request has an empty asset path",
+                    },
+                },
+            )
+            continue
+
+        def _worker_phase_callback(phase: str, _payload: JsonDict) -> None:
+            write_protocol_message(
+                sys.stdout,
+                {
+                    "type": "activity",
+                    "job_id": job_id,
+                    "phase": phase,
+                },
+            )
+
+        try:
+            scanned, load_error = _scan_fonts_in_asset_file(
+                assets_file,
+                generator,
+                lang=lang,
+                detect_ps5_swizzle=detect_ps5_swizzle,
+                scan_ttf=scan_ttf,
+                scan_sdf=scan_sdf,
+                phase_callback=_worker_phase_callback,
+            )
+            payload: JsonDict = {
+                "ttf": scanned.get("ttf", []),
+                "sdf": scanned.get("sdf", []),
+                "error": load_error,
+            }
+        except Exception as error:
+            if debug_parse_enabled():
+                tb_module.print_exc()
+            payload = {
+                "ttf": [],
+                "sdf": [],
+                "error": f"scan worker caught exception: {error!r}",
+            }
+
+        write_protocol_message(
+            sys.stdout,
+            {
+                "type": "result",
+                "job_id": job_id,
+                "payload": payload,
+            },
+        )
+    return 0
+
+
 def run_scan_file_worker(
     game_path: str,
     assets_file: str,
@@ -11418,6 +11486,10 @@ def main_cli(lang: Language = "ko") -> None:
         )
         preview_help = "모든 SDF 폰트 Atlas/Glyph crop 미리보기를 preview 폴더에 저장 (--ps5-swizzle와 함께면 unswizzle 기준)"
         scan_jobs_help = "폰트 스캔 병렬 워커 수 (기본: 1, parse/일괄교체 스캔에 적용, 별칭: --max-workers)"
+        scan_stall_help = (
+            "CPU/I/O/진행 신호가 모두 멈춘 워커의 정지 판정 시간(초, 기본: 300, "
+            "0이면 비활성화; 파일 총 처리시간 제한이 아님)"
+        )
         split_save_force_help = (
             "대형 SDF 다건 교체에서 one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장"
         )
@@ -11463,6 +11535,10 @@ Examples:
         output_only_help = "Keep originals untouched and write modified files only to this folder (preserve relative paths)"
         preview_help = "Export preview PNGs (Atlas + glyph crops) for all SDF fonts into preview folder (unswizzled when used with --ps5-swizzle)"
         scan_jobs_help = "Number of parallel scan workers (default: 1, used for parse/bulk scan paths, alias: --max-workers)"
+        scan_stall_help = (
+            "Worker inactivity threshold in seconds based on CPU/I/O/progress "
+            "(default: 300, 0 disables; not a total per-file runtime limit)"
+        )
         split_save_force_help = "Skip one-shot and force one-by-one SDF split save for large multi-SDF replacements"
         oneshot_save_force_help = "Force one-shot save even for large multi-SDF targets (disable split-save fallback)"
         ps5_swizzle_help = "Enable PS5 swizzle detect/transform mode (mask_x=0x385F0, mask_y=0x07A0F, rotate=90 compensation)"
@@ -11523,6 +11599,13 @@ Examples:
         help=scan_jobs_help,
     )
     parser.add_argument(
+        "--scan-stall-seconds",
+        type=float,
+        default=DEFAULT_STALL_SECONDS,
+        metavar="SECONDS",
+        help=scan_stall_help,
+    )
+    parser.add_argument(
         "--split-save-force", action="store_true", help=split_save_force_help
     )
     parser.add_argument(
@@ -11543,6 +11626,16 @@ Examples:
         "--_scan-file-worker",
         type=str,
         metavar="ASSET_FILE_PATH",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--_scan-worker-server",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--_scan-worker-lang",
+        choices=("ko", "en"),
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -11670,6 +11763,17 @@ Examples:
             exit_with_error(
                 "--scan-jobs must be an integer greater than or equal to 1.", lang=lang
             )
+    if args.scan_stall_seconds < 0:
+        if is_ko:
+            exit_with_error(
+                "--scan-stall-seconds는 0 이상의 숫자여야 합니다.",
+                lang=lang,
+            )
+        else:
+            exit_with_error(
+                "--scan-stall-seconds must be greater than or equal to 0.",
+                lang=lang,
+            )
     if args.outline_ratio <= 0:
         if is_ko:
             exit_with_error(
@@ -11689,6 +11793,24 @@ Examples:
         or arg.startswith("--max-workers=")
         for arg in sys.argv[1:]
     )
+
+    if args._scan_worker_server:
+        if not args.gamepath:
+            _log_console("[scan_worker] --gamepath is required.")
+            raise SystemExit(2)
+        worker_lang = cast(
+            Language,
+            args._scan_worker_lang if args._scan_worker_lang else lang,
+        )
+        raise SystemExit(
+            run_persistent_scan_worker(
+                args.gamepath,
+                lang=worker_lang,
+                detect_ps5_swizzle=args.ps5_swizzle,
+                scan_ttf=not args._scan_sdf_only,
+                scan_sdf=not args._scan_ttf_only,
+            )
+        )
 
     if args._scan_file_worker:
         if not args.gamepath:
@@ -12064,14 +12186,23 @@ Examples:
         _log_console(f"데이터 경로: {data_path}")
         _log_console(f"컴파일 방식: {compile_method}")
         _log_console(f"스캔 워커 수: {args.scan_jobs}")
+        _log_console(
+            f"스캔 무활동 정지 판정: {args.scan_stall_seconds:g}초 "
+            "(0=비활성화, 총 처리시간 제한 아님)"
+        )
     else:
         _log_console(f"Game path: {game_path}")
         _log_console(f"Data path: {data_path}")
         _log_console(f"Compile method: {compile_method}")
         _log_console(f"Scan workers: {args.scan_jobs}")
+        _log_console(
+            f"Scan inactivity stall threshold: {args.scan_stall_seconds:g}s "
+            "(0=disabled, not a total runtime limit)"
+        )
     _log_debug(
         f"[runtime] input_path={input_path} game_path={game_path} data_path={data_path} "
         f"compile_method={compile_method} scan_jobs={args.scan_jobs} "
+        f"scan_stall_seconds={args.scan_stall_seconds} "
         f"ps5_swizzle={args.ps5_swizzle} preview_export={args.preview_export}"
     )
     _log_debug(f"[runtime] unity_version={detected_unity_version}")
@@ -12176,6 +12307,7 @@ Examples:
             target_files=selected_files if selected_files else None,
             exclude_exts=excluded_exts if excluded_exts else None,
             scan_jobs=args.scan_jobs,
+            scan_stall_seconds=args.scan_stall_seconds,
             ps5_swizzle=args.ps5_swizzle,
         )
         _pause_before_exit(lang=lang, interactive_session=interactive_session)
@@ -12195,6 +12327,7 @@ Examples:
             target_files=selected_files if selected_files else None,
             exclude_exts=excluded_exts if excluded_exts else None,
             scan_jobs=args.scan_jobs,
+            scan_stall_seconds=args.scan_stall_seconds,
             lang=lang,
             ps5_swizzle=args.ps5_swizzle,
         )
@@ -12222,6 +12355,7 @@ Examples:
             target_files=selected_files if selected_files else None,
             exclude_exts=excluded_exts if excluded_exts else None,
             scan_jobs=args.scan_jobs,
+            scan_stall_seconds=args.scan_stall_seconds,
             lang=lang,
             ps5_swizzle=args.ps5_swizzle,
         )
@@ -12244,6 +12378,7 @@ Examples:
             target_files=selected_files if selected_files else None,
             exclude_exts=excluded_exts if excluded_exts else None,
             scan_jobs=args.scan_jobs,
+            scan_stall_seconds=args.scan_stall_seconds,
             lang=lang,
             ps5_swizzle=args.ps5_swizzle,
         )
@@ -12266,6 +12401,7 @@ Examples:
             target_files=selected_files if selected_files else None,
             exclude_exts=excluded_exts if excluded_exts else None,
             scan_jobs=args.scan_jobs,
+            scan_stall_seconds=args.scan_stall_seconds,
             lang=lang,
             ps5_swizzle=args.ps5_swizzle,
         )

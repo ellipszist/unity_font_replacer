@@ -26,7 +26,7 @@ echo [build] Using venv python: %VENV_PY%
 
 "%VENV_PY%" -m pip install --upgrade pip
 if errorlevel 1 exit /b 1
-"%VENV_PY%" -m pip install pyinstaller TypeTreeGeneratorAPI Pillow fmod_toolkit archspec numpy scipy fonttools
+"%VENV_PY%" -m pip install pyinstaller TypeTreeGeneratorAPI Pillow fmod_toolkit archspec numpy scipy fonttools psutil
 if errorlevel 1 exit /b 1
 if exist "%LOCAL_UNITYPY%\pyproject.toml" (
   echo [build] Installing local custom UnityPy: %LOCAL_UNITYPY%

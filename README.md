@@ -107,6 +107,7 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 | `--ps5-swizzle` | PS5 Atlas swizzle 자동 판별/변환 (텍스쳐 크기별 mask 자동 계산, `rotate=90`) |
 | `--preview-export` | `preview/`에 SDF Atlas + 글리프 crop PNG 저장 (`--ps5-swizzle`와 함께 사용 시 unswizzle 기준) |
 | `--scan-jobs <N>`, `--max-workers <N>` | 폰트 스캔 병렬 워커 수 (기본: `1`) |
+| `--scan-stall-seconds <초>` | CPU/I/O/진행 신호가 모두 멈춘 워커의 정지 판정 시간 (기본: `300`, `0`이면 비활성화; 파일 총 처리시간 제한 아님) |
 | `--exclude-ext <목록>` | 추가 스캔 제외 확장자(콤마 구분, 예: `"resS,.resource,.split0"`) |
 
 ### 사용 예시
@@ -391,10 +392,10 @@ EXE 대신 Python 소스로 실행하려면:
 ### 요구 사항
 
 - Python 3.12 권장
-- 패키지: `UnityPy 1.25.2 커스텀 포크`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`
+- 패키지: `UnityPy 1.25.2 커스텀 포크`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`, `psutil`
 
 ```bash
-pip install TypeTreeGeneratorAPI Pillow fonttools numpy scipy
+pip install TypeTreeGeneratorAPI Pillow fonttools numpy scipy psutil
 pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@4018e7600357e185f9986af536d6f105729f0950
 ```
 
@@ -425,8 +426,10 @@ python export_fonts_ko.py "D:\MyGame"
 
 ### 스캔
 
-- `--parse`는 파일 단위 워커 프로세스로 스캔해 단일 파일 크래시가 전체 작업 중단으로 이어지지 않도록 격리합니다.
-- 병렬 스캔에서 실패(빈 결과 + 워커 오류)한 파일은 마지막에 1개씩 순차 재시도합니다.
+- `--parse`는 지정한 수의 영구 워커 프로세스를 재사용합니다. EXE를 파일마다 다시 시작하지 않으므로 대량 스캔의 시작 비용이 크게 줄어듭니다.
+- 워커가 비정상 종료되거나 응답 파이프가 닫히면 당시 처리 중이던 파일을 하드 크래시 대상으로 기록하고, 새 워커에서 한 번 재시도합니다.
+- 살아 있는 워커는 CPU/I/O/진행 신호가 모두 `--scan-stall-seconds` 동안 변하지 않을 때만 `stalled`로 구분합니다. 큰 파일의 총 처리시간만으로 크래시 처리하지 않습니다.
+- 무한 CPU 루프처럼 계속 활동 중인 프로세스에는 총 시간 제한을 강제하지 않습니다. 필요하면 실행을 직접 중단하거나 대상 파일을 `--target-file`로 분리해 확인하세요.
 - 스캔 속도를 높이려면 `--scan-jobs`(별칭: `--max-workers`)로 워커 수를 늘릴 수 있습니다.
 - 스캔은 블랙리스트 기반 제외를 사용합니다 (`*.bak`, `.info`, `.config` 등 제외).
 - 추가 제외 확장자가 필요하면 `--exclude-ext "resS,.resource,.split0"`처럼 지정하세요.

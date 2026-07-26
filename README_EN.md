@@ -107,6 +107,7 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 | `--ps5-swizzle` | PS5 atlas swizzle detect/transform (masks auto-computed per texture size, `rotate=90`) |
 | `--preview-export` | Save SDF atlas + glyph crop PNGs into `preview/` (unswizzled view when used with `--ps5-swizzle`) |
 | `--scan-jobs <N>`, `--max-workers <N>` | Number of parallel scan workers (default: `1`) |
+| `--scan-stall-seconds <seconds>` | Inactivity threshold when CPU/I/O/progress all stop (default: `300`, `0` disables; not a total per-file runtime limit) |
 | `--exclude-ext <list>` | Additional scan-excluded extensions (comma-separated, e.g. `"resS,.resource,.split0"`) |
 
 ### Examples
@@ -391,10 +392,10 @@ If you prefer Python scripts instead of EXEs:
 ### Requirements
 
 - Python 3.12 recommended
-- Packages: `custom UnityPy 1.25.2 fork`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`
+- Packages: `custom UnityPy 1.25.2 fork`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`, `psutil`
 
 ```bash
-pip install TypeTreeGeneratorAPI Pillow fonttools numpy scipy
+pip install TypeTreeGeneratorAPI Pillow fonttools numpy scipy psutil
 pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@4018e7600357e185f9986af536d6f105729f0950
 ```
 
@@ -424,8 +425,10 @@ python export_fonts_en.py "D:\MyGame"
 
 ### Scan
 
-- `--parse` scans via per-file worker processes so a crash in one file does not terminate the whole scan.
-- Files that fail in parallel scan (empty result + worker error) are retried once more sequentially at the end.
+- `--parse` reuses a bounded pool of persistent worker processes. The executable is no longer restarted for every file, removing most startup overhead from large scans.
+- If a worker exits or its response pipe closes, the file assigned at that moment is recorded as a hard-crash target and retried once on a clean worker.
+- A live worker is classified as `stalled` only when CPU, I/O, and progress signals all remain unchanged for `--scan-stall-seconds`. A large file is never failed solely for exceeding a total elapsed time.
+- No total deadline is imposed on a process that remains active, including a possible CPU loop. Stop it manually or isolate the file with `--target-file` when that distinction requires investigation.
 - You can increase scan throughput with `--scan-jobs` (alias: `--max-workers`).
 - Scanning uses blacklist-based exclusion (`*.bak`, `.info`, `.config`, etc.).
 - Add extra exclusion extensions with `--exclude-ext "resS,.resource,.split0"` when needed.
