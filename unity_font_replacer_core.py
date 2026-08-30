@@ -2838,6 +2838,138 @@ def _validate_shared_atlas_owner_records(records: list[JsonDict]) -> None:
             )
 
 
+def _coerce_monoscript_identity(script: Any) -> tuple[str, str, str]:
+    """Validate and normalize the serialized identity of a MonoScript."""
+    raw_namespace = getattr(script, "m_Namespace", None)
+    raw_class_name = getattr(script, "m_ClassName", None)
+    raw_assembly_name = getattr(script, "m_AssemblyName", None)
+    if raw_namespace is None:
+        raise ValueError("MonoScript namespace is unavailable")
+    if raw_class_name is None or not str(raw_class_name).strip():
+        raise ValueError("MonoScript class name is unavailable")
+    if raw_assembly_name is None or not str(raw_assembly_name).strip():
+        raise ValueError("MonoScript assembly name is unavailable")
+    return (
+        str(raw_namespace),
+        str(raw_class_name),
+        str(raw_assembly_name),
+    )
+
+
+def _read_monobehaviour_script_identity(
+    obj: Any,
+    *,
+    current_outer_key: str | None = None,
+    source_bundle_signature: str | None = None,
+    asset_file_index: dict[str, Any] | None = None,
+    identity_cache: dict[tuple[str, str, int], tuple[str, str, str]] | None = None,
+) -> tuple[str, str, str]:
+    """Read script identity without parsing a MonoBehaviour's custom payload."""
+    parse_head = getattr(obj, "parse_monobehaviour_head", None)
+    if not callable(parse_head):
+        raise ValueError("MonoBehaviour header parser is unavailable")
+
+    header = parse_head()
+    script_ref = getattr(header, "m_Script", None)
+    if script_ref is None:
+        raise ValueError("MonoBehaviour header has no MonoScript reference")
+    try:
+        script_path_id = int(getattr(script_ref, "m_PathID"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("MonoScript reference has no valid PathID") from exc
+    if script_path_id == 0:
+        raise ValueError("MonoScript reference is null")
+    try:
+        script_file_id = int(getattr(script_ref, "m_FileID", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("MonoScript reference has no valid FileID") from exc
+
+    read_script = getattr(script_ref, "read", None)
+    if not callable(read_script):
+        read_script = getattr(script_ref, "deref_parse_as_object", None)
+    if not callable(read_script):
+        raise ValueError("MonoScript reference cannot be resolved")
+    source_assets_file = getattr(obj, "assets_file", None)
+    if script_file_id == 0:
+        try:
+            return _coerce_monoscript_identity(read_script())
+        except Exception as exc:
+            raise ValueError("MonoScript reference could not be resolved") from exc
+
+    # UnityPy's generic external PPtr dereference may select the first file
+    # with a matching basename.  Resolve every external script through the
+    # exact outer bundle, inner SerializedFile, signed PathID, and ClassID.
+    if (
+        source_assets_file is None
+        or not current_outer_key
+        or not isinstance(asset_file_index, dict)
+    ):
+        raise ValueError("External MonoScript resolution context is unavailable")
+
+    source_assets_name = str(getattr(source_assets_file, "name", ""))
+    target_assets_name = _resolve_target_assets_name(
+        source_assets_file,
+        source_assets_name,
+        script_file_id,
+    )
+    target_outer_key = _resolve_target_outer_file_key(
+        current_outer_key,
+        source_assets_file,
+        script_file_id,
+        target_assets_name,
+        source_bundle_signature=source_bundle_signature,
+        asset_file_index=asset_file_index,
+    )
+    if not target_assets_name or not target_outer_key:
+        raise ValueError("External MonoScript asset file could not be located")
+
+    cache_key = (
+        _normalize_asset_file_key(target_outer_key) or str(target_outer_key),
+        str(target_assets_name).lower(),
+        script_path_id,
+    )
+    if identity_cache is not None and cache_key in identity_cache:
+        return identity_cache[cache_key]
+
+    path_by_key = cast(dict[str, str], asset_file_index.get("path_by_key", {}))
+    target_path = path_by_key.get(cache_key[0])
+    if not target_path:
+        raise ValueError("External MonoScript outer file path is unavailable")
+
+    target_env = None
+    try:
+        target_env = load_unitypy(target_path)
+        matches = [
+            candidate
+            for candidate in target_env.objects
+            if candidate.type.name == "MonoScript"
+            and int(candidate.path_id) == script_path_id
+            and str(candidate.assets_file.name).lower()
+            == str(target_assets_name).lower()
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "External MonoScript object resolution was ambiguous or missing"
+            )
+        identity = _coerce_monoscript_identity(matches[0].read())
+        if identity_cache is not None:
+            identity_cache[cache_key] = identity
+        return identity
+    finally:
+        close_unitypy_env(target_env)
+        target_env = None
+        gc.collect()
+
+
+def _is_tmp_fontasset_script_identity(identity: tuple[str, str, str]) -> bool:
+    """Return whether a MonoScript is an official TMP or TextCore FontAsset."""
+    namespace, class_name, _assembly_name = identity
+    return (namespace, class_name) in {
+        ("TMPro", "TMP_FontAsset"),
+        ("UnityEngine.TextCore.Text", "FontAsset"),
+    }
+
+
 def _preflight_shared_atlas_owners(
     all_assets_files: list[str],
     replacement_lookup: dict[tuple[str, str, str, int], str],
@@ -2855,6 +2987,9 @@ def _preflight_shared_atlas_owners(
 
     records: list[JsonDict] = []
     parse_failures: list[str] = []
+    script_identity_cache: dict[
+        tuple[str, str, int], tuple[str, str, str]
+    ] = {}
     for outer_path in all_assets_files:
         outer_key = _normalize_asset_file_key(outer_path)
         if not outer_key:
@@ -2867,11 +3002,31 @@ def _preflight_shared_atlas_owners(
             for obj in env.objects:
                 if obj.type.name != "MonoBehaviour":
                     continue
+                object_label = (
+                    f"{outer_path}|{obj.assets_file.name}|{int(obj.path_id)}"
+                )
+                try:
+                    script_identity = _read_monobehaviour_script_identity(
+                        obj,
+                        current_outer_key=outer_key,
+                        source_bundle_signature=source_signature,
+                        asset_file_index=asset_file_index,
+                        identity_cache=script_identity_cache,
+                    )
+                except Exception as exc:
+                    parse_failures.append(
+                        f"{object_label} script identity "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+                    continue
+                if not _is_tmp_fontasset_script_identity(script_identity):
+                    continue
+
                 try:
                     data = _safe_parse_as_dict(obj)
                 except Exception as exc:
                     parse_failures.append(
-                        f"{outer_path}|{obj.assets_file.name}|{int(obj.path_id)} "
+                        f"{object_label} TMP payload "
                         f"({type(exc).__name__}: {exc})"
                     )
                     continue
@@ -2884,6 +3039,10 @@ def _preflight_shared_atlas_owners(
                     unity_version=unity_hint or None,
                 )
                 if not tmp_info.get("is_tmp"):
+                    parse_failures.append(
+                        f"{object_label} TMP payload "
+                        "(unrecognized TMP_FontAsset schema)"
+                    )
                     continue
                 if (
                     data.get("spriteSheet") is not None
@@ -2965,7 +3124,8 @@ def _preflight_shared_atlas_owners(
         preview = parse_failures[:5]
         suffix = "" if len(parse_failures) <= 5 else f" (+{len(parse_failures) - 5} more)"
         raise ValueError(
-            "Shared-atlas safety preflight could not parse every MonoBehaviour; "
+            "Shared-atlas safety preflight could not resolve every MonoBehaviour "
+            "script identity or parse every TMP FontAsset payload; "
             "replacement was refused because an unseen TMP owner cannot be excluded: "
             f"{preview}{suffix}"
         )

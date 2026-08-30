@@ -763,9 +763,9 @@ def _validate_layout_rectangles(
 def _compute_sdf_tile(alpha_tile: Any, spread: int) -> Any:
     """KR: 알파 타일에서 SDF(Signed Distance Field) 값을 계산한다.
     알고리즘:
-      1. 127 임계값으로 inside/outside 이진 마스크 생성
-      2. scipy EDT로 각 픽셀의 최근접 경계까지 유클리드 거리 계산
-      3. signed_distance = dist_inside - dist_outside
+      1. 127 임계값으로 source zero-contour의 inside/outside 부호 보존
+      2. 회색 coverage와 hard edge를 서브픽셀 경계 거리 seed로 변환
+      3. 안/밖 각각 가장 가까운 같은 부호 seed에서 scipy EDT 거리 전파
       4. spread 범위로 정규화: 0.5 + (sd / (2 * spread))
          -> edge ~ 0.5, inside > 0.5, outside < 0.5
     TMP SDF 셰이더가 이 0.5 경계를 기준으로 글리프 윤곽을 판단하고,
@@ -773,9 +773,9 @@ def _compute_sdf_tile(alpha_tile: Any, spread: int) -> Any:
 
     EN: Compute SDF (Signed Distance Field) values from an alpha tile.
     Algorithm:
-      1. Create inside/outside binary mask at threshold 127
-      2. Compute Euclidean distance to nearest boundary via scipy EDT
-      3. signed_distance = dist_inside - dist_outside
+      1. Preserve the source zero-contour sign with a threshold of 127
+      2. Convert greyscale coverage and hard edges into subpixel distance seeds
+      3. Propagate distance from the nearest same-sign seed via scipy EDT
       4. Normalize within spread range: 0.5 + (sd / (2 * spread))
          -> edge ~ 0.5, inside > 0.5, outside < 0.5
     The TMP SDF shader uses this 0.5 boundary to determine glyph outlines,
@@ -784,22 +784,65 @@ def _compute_sdf_tile(alpha_tile: Any, spread: int) -> Any:
     if np is None or scipy_ndimage is None:
         raise RuntimeError("numpy and scipy are required for SDF generation.")
 
-    inside = alpha_tile > 127
-    if not inside.any():
-        return np.zeros_like(alpha_tile, dtype=np.uint8)
-    if inside.all():
-        return np.full_like(alpha_tile, 255, dtype=np.uint8)
+    source = np.asarray(alpha_tile, dtype=np.uint8)
+    if source.ndim != 2:
+        raise ValueError("SDF alpha tile must be a two-dimensional array.")
 
-    outside = ~inside
-    dist_outside = scipy_ndimage.distance_transform_edt(outside)
-    dist_inside = scipy_ndimage.distance_transform_edt(inside)
+    inside = source > 127
+    if not inside.any():
+        if not source.any():
+            return np.zeros_like(source, dtype=np.uint8)
+        raise ValueError(
+            "Non-empty SDF glyph coverage never crosses the 127 threshold."
+        )
+    if inside.all():
+        return np.full_like(source, 255, dtype=np.uint8)
+
+    # A four-connected boundary matches the pixel-grid contour used by the
+    # hinted FreeType coverage mask.  Eight-connected erosion merges diagonal
+    # strokes and holes in small CJK glyphs and symbols.
+    cross = np.asarray(
+        ((False, True, False), (True, True, True), (False, True, False)),
+        dtype=bool,
+    )
+    antialiased = (source > 0) & (source < 255)
+    inside_boundary = inside & ~scipy_ndimage.binary_erosion(
+        inside,
+        structure=cross,
+        border_value=0,
+    )
+    outside_boundary = (~inside) & scipy_ndimage.binary_dilation(
+        inside,
+        structure=cross,
+        border_value=0,
+    )
+    boundary_seeds = antialiased | inside_boundary | outside_boundary
+
+    # Partial coverage is a subpixel signed-distance estimate in [-0.5, 0.5].
+    # Fully covered hard-edge pixels sit half a texel inside the contour, and
+    # uncovered hard-edge pixels sit half a texel outside it.
+    seed_offsets = source.astype(np.float64) / 255.0 - 0.5
+    seed_offsets[inside_boundary & ~antialiased] = 0.5
+    seed_offsets[outside_boundary & ~antialiased] = -0.5
+
+    signed_distance = np.empty(source.shape, dtype=np.float64)
+    for region, sign in ((inside, 1.0), (~inside, -1.0)):
+        region_seeds = boundary_seeds & region
+        if not region_seeds.any():
+            raise ValueError("SDF coverage contour has no boundary seed.")
+        distances, nearest = scipy_ndimage.distance_transform_edt(
+            ~region_seeds,
+            return_indices=True,
+        )
+        nearest_offsets = seed_offsets[tuple(nearest)]
+        propagated = distances + np.abs(nearest_offsets)
+        signed_distance[region] = sign * propagated[region]
+
     # KR: TMP / SDF 셰이더 규약: edge ~ 0.5, inside > 0.5, outside < 0.5.
     # EN: TMP / SDF shader convention: edge ~ 0.5, inside > 0.5, outside < 0.5.
-    signed_distance = dist_inside - dist_outside
-
     spread_value = float(max(1, spread))
     normalized = np.clip(0.5 + (signed_distance / (2.0 * spread_value)), 0.0, 1.0)
-    return (normalized * 255.0).astype(np.uint8)
+    return np.rint(normalized * 255.0).astype(np.uint8)
 
 
 # --------------------------------------------------------------------------- #
@@ -1182,7 +1225,7 @@ def generate_sdf_assets_from_ttf(
             # KR: SDF 모드: EDT 기반 거리장 변환 / 래스터 모드: 비트맵 그대로 사용
             # EN: SDF mode: EDT-based distance field transform / Raster mode: use bitmap as-is
             if normalized_render_mode == "sdf":
-                mode_tile = _compute_sdf_tile(tile, atlas_padding)
+                mode_tile = _compute_sdf_tile(tile, atlas_padding + 1)
             else:
                 mode_tile = tile
             # KR: max 합성으로 겹침 방지 (이론상 shelf 패킹에선 겹치지 않지만 안전장치)

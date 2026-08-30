@@ -203,6 +203,114 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
             [{"m_X": 0, "m_Y": 56, "m_Width": 10, "m_Height": 8}],
         )
 
+    def test_sdf_coverage_edt_preserves_zero_contour_and_edge_levels(
+        self,
+    ) -> None:
+        np = make_sdf.np
+        self.assertIsNotNone(np)
+        assert np is not None
+
+        alpha = np.zeros((12, 11), dtype=np.uint8)
+        alpha[:, 3:8] = np.asarray([0, 124, 255, 124, 0], dtype=np.uint8)
+        alpha[3:9, 8] = 160
+        alpha[4:8, 9] = 240
+        coverage_sdf = make_sdf._compute_sdf_tile(alpha, 21)
+
+        self.assertEqual(coverage_sdf.shape, alpha.shape)
+        self.assertTrue(np.array_equal(coverage_sdf >= 128, alpha > 127))
+        self.assertEqual(
+            int((coverage_sdf >= 128).sum()),
+            int((alpha > 127).sum()),
+        )
+        coverage_ramp = np.tile(
+            np.asarray(
+                [1, 32, 64, 96, 124, 128, 160, 192, 224, 254],
+                dtype=np.uint8,
+            ),
+            (3, 1),
+        )
+        for spread in (5, 7, 15, 20, 64):
+            with self.subTest(spread=spread):
+                ramp_sdf = make_sdf._compute_sdf_tile(coverage_ramp, spread)
+                self.assertTrue(
+                    np.array_equal(ramp_sdf >= 128, coverage_ramp > 127)
+                )
+                self.assertLess(int(ramp_sdf[1, 4]), 128)
+                self.assertGreaterEqual(int(ramp_sdf[1, 5]), 128)
+
+        ramp_sdf = make_sdf._compute_sdf_tile(coverage_ramp, 21)
+        edge_levels = {
+            int(value) for value in np.unique(ramp_sdf) if 124 <= value <= 131
+        }
+        self.assertEqual(edge_levels, set(range(124, 132)))
+
+        horizontal = np.zeros((11, 12), dtype=np.uint8)
+        horizontal[4:7, :] = 255
+        diagonal = np.zeros((11, 12), dtype=np.uint8)
+        diagonal[np.arange(10), np.arange(10)] = 255
+        thin_vertical = np.zeros((11, 12), dtype=np.uint8)
+        thin_vertical[:, 5] = 255
+        edge_columns = np.zeros((11, 12), dtype=np.uint8)
+        edge_columns[:, (0, -1)] = 255
+        for name, fixture in (
+            ("horizontal", horizontal),
+            ("diagonal", diagonal),
+            ("thin_vertical", thin_vertical),
+            ("edge_columns", edge_columns),
+        ):
+            with self.subTest(fixture=name):
+                fixture_sdf = make_sdf._compute_sdf_tile(fixture, 21)
+                self.assertTrue(
+                    np.array_equal(fixture_sdf >= 128, fixture > 127)
+                )
+        edge_sdf = make_sdf._compute_sdf_tile(edge_columns, 21)
+        self.assertGreater(int(edge_sdf[5, 0]), int(edge_sdf[5, 1]))
+        self.assertGreater(int(edge_sdf[5, -1]), int(edge_sdf[5, -2]))
+
+        hard_edge = np.zeros((9, 48), dtype=np.uint8)
+        hard_edge[:, :24] = 255
+        hard_sdf = make_sdf._compute_sdf_tile(hard_edge, 21)
+        middle_row = hard_sdf[4].astype(np.int16)
+        self.assertEqual(
+            [int(middle_row[index]) for index in (22, 23, 24, 25)],
+            [137, 131, 124, 118],
+        )
+        outside_steps = np.diff(middle_row[25:32])
+        self.assertTrue(np.all((outside_steps == -6) | (outside_steps == -7)))
+
+        with (
+            patch.object(
+                make_sdf.scipy_ndimage,
+                "binary_erosion",
+                side_effect=lambda values, **_kwargs: values.copy(),
+            ),
+            patch.object(
+                make_sdf.scipy_ndimage,
+                "binary_dilation",
+                side_effect=lambda values, **_kwargs: values.copy(),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "no boundary seed"):
+                make_sdf._compute_sdf_tile(hard_edge, 21)
+
+        empty = np.zeros((3, 5), dtype=np.uint8)
+        full = np.full((3, 5), 255, dtype=np.uint8)
+        self.assertTrue(
+            np.array_equal(
+                make_sdf._compute_sdf_tile(empty, 3),
+                empty,
+            )
+        )
+        self.assertTrue(
+            np.array_equal(
+                make_sdf._compute_sdf_tile(full, 3),
+                full,
+            )
+        )
+        subthreshold = np.asarray([[0, 64, 127, 64, 0]], dtype=np.uint8)
+        with self.assertRaisesRegex(ValueError, "never crosses"):
+            make_sdf._compute_sdf_tile(subthreshold, 3)
+
     def test_dynamic_tmp_population_is_rejected(self) -> None:
         self.assertFalse(
             core._prepare_static_tmp_population(
@@ -264,6 +372,20 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
         try:
             data = generated["sdf_data"]
             self.assertEqual(data["m_AtlasRenderMode"], 4169)
+            material_floats = dict(
+                generated["sdf_materials"]["m_SavedProperties"]["m_Floats"]
+            )
+            self.assertEqual(
+                material_floats["_GradientScale"],
+                float(data["m_AtlasPadding"] + 1),
+            )
+            np = make_sdf.np
+            self.assertIsNotNone(np)
+            assert np is not None
+            atlas_alpha = np.asarray(generated["sdf_atlas"].getchannel("A"))
+            atlas_levels = {int(value) for value in np.unique(atlas_alpha)}
+            self.assertGreater(len(atlas_levels), 32)
+            self.assertTrue(atlas_levels.intersection(range(122, 133)))
             self.assertEqual(
                 {glyph["m_Index"] for glyph in data["m_GlyphTable"]},
                 {glyph_a, glyph_v},
@@ -928,6 +1050,212 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
         base_records[1]["replacement_font"] = "Mulmaru"
         with self.assertRaisesRegex(ValueError, "different fonts"):
             core._validate_shared_atlas_owner_records(base_records)
+
+    def test_shared_atlas_preflight_only_parses_tmp_fontasset_payloads(
+        self,
+    ) -> None:
+        def make_object(namespace: str, class_name: str) -> SimpleNamespace:
+            script = SimpleNamespace(
+                m_Namespace=namespace,
+                m_ClassName=class_name,
+                m_AssemblyName="Unity.TextMeshPro",
+            )
+            script_ref = SimpleNamespace(m_PathID=7, read=lambda: script)
+            assets_file = SimpleNamespace(
+                name="CAB-test",
+                unity_version="2022.3.62f2",
+            )
+            return SimpleNamespace(
+                type=SimpleNamespace(name="MonoBehaviour"),
+                assets_file=assets_file,
+                path_id=11,
+                parse_monobehaviour_head=lambda: SimpleNamespace(
+                    m_Script=script_ref
+                ),
+            )
+
+        replacement_lookup = {
+            ("SDF", "game.assets", "CAB-test", 99): "NanumGothic"
+        }
+        unrelated = make_object("UnityEngine.Localization", "Locale")
+        unrelated_env = SimpleNamespace(objects=[unrelated])
+        with (
+            patch.object(core, "_read_bundle_signature", return_value=None),
+            patch.object(core, "load_unitypy", return_value=unrelated_env),
+            patch.object(core, "close_unitypy_env"),
+            patch.object(
+                core,
+                "_safe_parse_as_dict",
+                side_effect=AssertionError("unrelated payload was parsed"),
+            ) as parse_payload,
+        ):
+            core._preflight_shared_atlas_owners(
+                ["game.assets"],
+                replacement_lookup,
+                None,
+                {},
+            )
+        parse_payload.assert_not_called()
+
+        tmp_object = make_object("TMPro", "TMP_FontAsset")
+        tmp_env = SimpleNamespace(objects=[tmp_object])
+        with (
+            patch.object(core, "_read_bundle_signature", return_value=None),
+            patch.object(core, "load_unitypy", return_value=tmp_env),
+            patch.object(core, "close_unitypy_env"),
+            patch.object(
+                core,
+                "_safe_parse_as_dict",
+                side_effect=RuntimeError("payload unavailable"),
+            ) as parse_payload,
+        ):
+            with self.assertRaisesRegex(ValueError, "TMP payload"):
+                core._preflight_shared_atlas_owners(
+                    ["game.assets"],
+                    replacement_lookup,
+                    None,
+                    {},
+                )
+        parse_payload.assert_called_once_with(tmp_object)
+
+        self.assertTrue(
+            core._is_tmp_fontasset_script_identity(
+                (
+                    "UnityEngine.TextCore.Text",
+                    "FontAsset",
+                    "UnityEngine.TextCoreTextEngineModule",
+                )
+            )
+        )
+
+        null_script_object = make_object("TMPro", "TMP_FontAsset")
+        null_script_object.parse_monobehaviour_head = lambda: SimpleNamespace(
+            m_Script=SimpleNamespace(m_PathID=0)
+        )
+        with self.assertRaisesRegex(ValueError, "reference is null"):
+            core._read_monobehaviour_script_identity(null_script_object)
+
+    def test_monoscript_identity_resolves_an_external_addressables_cab(
+        self,
+    ) -> None:
+        script = SimpleNamespace(
+            m_Namespace="TMPro",
+            m_ClassName="TMP_FontAsset",
+            m_AssemblyName="Unity.TextMeshPro.dll",
+        )
+        external_script_object = SimpleNamespace(
+            type=SimpleNamespace(name="MonoScript"),
+            path_id=77,
+            assets_file=SimpleNamespace(name="CAB-font"),
+            read=lambda: script,
+        )
+        external_env = SimpleNamespace(objects=[external_script_object])
+        source_assets_file = SimpleNamespace(name="CAB-prefab")
+        direct_reads: list[bool] = []
+
+        def read_ambiguous_external() -> SimpleNamespace:
+            direct_reads.append(True)
+            return SimpleNamespace(
+                m_Namespace="Wrong.Namespace",
+                m_ClassName="WrongFontAsset",
+                m_AssemblyName="Wrong.Assembly",
+            )
+
+        script_ref = SimpleNamespace(
+            m_FileID=1,
+            m_PathID=77,
+            read=read_ambiguous_external,
+        )
+        font_object = SimpleNamespace(
+            assets_file=source_assets_file,
+            parse_monobehaviour_head=lambda: SimpleNamespace(
+                m_Script=script_ref
+            ),
+        )
+        target_key = core._normalize_asset_file_key("font.bundle")
+        assert target_key is not None
+        asset_index = {
+            "path_by_key": {target_key: "font.bundle"},
+        }
+        identity_cache: dict[
+            tuple[str, str, int], tuple[str, str, str]
+        ] = {}
+
+        with (
+            patch.object(
+                core,
+                "_resolve_target_assets_name",
+                return_value="CAB-font",
+            ),
+            patch.object(
+                core,
+                "_resolve_target_outer_file_key",
+                return_value=target_key,
+            ),
+            patch.object(
+                core,
+                "load_unitypy",
+                return_value=external_env,
+            ) as load_env,
+            patch.object(core, "close_unitypy_env") as close_env,
+        ):
+            identity = core._read_monobehaviour_script_identity(
+                font_object,
+                current_outer_key="prefab.bundle",
+                source_bundle_signature="UnityFS",
+                asset_file_index=asset_index,
+                identity_cache=identity_cache,
+            )
+            cached_identity = core._read_monobehaviour_script_identity(
+                font_object,
+                current_outer_key="prefab.bundle",
+                source_bundle_signature="UnityFS",
+                asset_file_index=asset_index,
+                identity_cache=identity_cache,
+            )
+
+        self.assertEqual(
+            identity,
+            ("TMPro", "TMP_FontAsset", "Unity.TextMeshPro.dll"),
+        )
+        self.assertEqual(cached_identity, identity)
+        self.assertEqual(len(identity_cache), 1)
+        self.assertEqual(direct_reads, [])
+        load_env.assert_called_once_with("font.bundle")
+        close_env.assert_called_once_with(external_env)
+
+        broken_script_object = SimpleNamespace(
+            type=SimpleNamespace(name="MonoScript"),
+            path_id=77,
+            assets_file=SimpleNamespace(name="CAB-font"),
+            read=lambda: (_ for _ in ()).throw(
+                ValueError("broken MonoScript")
+            ),
+        )
+        broken_env = SimpleNamespace(objects=[broken_script_object])
+        with (
+            patch.object(
+                core,
+                "_resolve_target_assets_name",
+                return_value="CAB-font",
+            ),
+            patch.object(
+                core,
+                "_resolve_target_outer_file_key",
+                return_value=target_key,
+            ),
+            patch.object(core, "load_unitypy", return_value=broken_env),
+            patch.object(core, "close_unitypy_env") as close_broken_env,
+        ):
+            with self.assertRaisesRegex(ValueError, "broken MonoScript"):
+                core._read_monobehaviour_script_identity(
+                    font_object,
+                    current_outer_key="prefab.bundle",
+                    source_bundle_signature="UnityFS",
+                    asset_file_index=asset_index,
+                    identity_cache={},
+                )
+        close_broken_env.assert_called_once_with(broken_env)
 
     def test_new_schema_fields_override_old_unity_hint(self) -> None:
         data = {"m_GlyphTable": [], "m_CharacterTable": [], "m_AtlasWidth": 64}
