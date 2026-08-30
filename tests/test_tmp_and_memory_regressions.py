@@ -386,6 +386,66 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
         finally:
             generated["sdf_atlas"].close()
 
+    def test_generated_raster_uses_bitmap_packing_without_sdf_guard(self) -> None:
+        generated = make_sdf.generate_sdf_assets_from_ttf(
+            ttf_data=(ROOT / "KR_ASSETS" / "NanumGothic.ttf").read_bytes(),
+            font_name="NanumGothic",
+            unicodes=[ord(char) for char in "가나다라"],
+            point_size=16,
+            atlas_padding=2,
+            atlas_width=64,
+            atlas_height=64,
+            render_mode="raster",
+        )
+        self.assertIsInstance(generated, dict)
+        assert generated is not None
+        try:
+            data = generated["sdf_data"]
+            self.assertEqual(
+                generated["sdf_atlas"].convert("RGB").getextrema(),
+                ((255, 255), (255, 255), (255, 255)),
+            )
+            padding = int(data["m_AtlasPadding"])
+            used_rects = data["m_UsedGlyphRects"]
+
+            for glyph in data["m_GlyphTable"]:
+                glyph_rect = glyph["m_GlyphRect"]
+                glyph_x = int(glyph_rect["m_X"])
+                glyph_y = int(glyph_rect["m_Y"])
+                glyph_width = int(glyph_rect["m_Width"])
+                glyph_height = int(glyph_rect["m_Height"])
+                containing = [
+                    used
+                    for used in used_rects
+                    if int(used["m_X"]) <= glyph_x
+                    and int(used["m_Y"]) <= glyph_y
+                    and glyph_x + glyph_width
+                    <= int(used["m_X"]) + int(used["m_Width"])
+                    and glyph_y + glyph_height
+                    <= int(used["m_Y"]) + int(used["m_Height"])
+                ]
+                self.assertEqual(len(containing), 1)
+                used = containing[0]
+                used_x = int(used["m_X"])
+                used_y = int(used["m_Y"])
+                used_width = int(used["m_Width"])
+                used_height = int(used["m_Height"])
+
+                self.assertEqual(used_width, glyph_width + padding * 2)
+                self.assertEqual(used_height, glyph_height + padding * 2)
+                self.assertEqual(glyph_x - used_x, padding)
+                self.assertEqual(glyph_y - used_y, padding)
+                self.assertEqual(
+                    used_x + used_width - glyph_x - glyph_width,
+                    padding,
+                )
+                self.assertEqual(
+                    used_y + used_height - glyph_y - glyph_height,
+                    padding,
+                )
+        finally:
+            generated["sdf_atlas"].close()
+
     def test_dynamic_tmp_population_is_rejected(self) -> None:
         self.assertFalse(
             core._prepare_static_tmp_population(
@@ -515,10 +575,415 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
             1,
         )
 
-    def test_raster_conversion_is_rejected_without_shader_retargeting(self) -> None:
-        with self.assertRaisesRegex(ValueError, r"Material\.m_Shader"):
-            core._reject_unsafe_raster_conversion(True)
-        core._reject_unsafe_raster_conversion(False)
+    def test_raster_shader_contracts_are_name_and_property_driven(self) -> None:
+        sprite_properties = {
+            "_MainTex",
+            "_Color",
+            "_ClipRect",
+            "_Stencil",
+            "_StencilComp",
+            "_ColorMask",
+        }
+        self.assertEqual(
+            core._classify_compatible_raster_shader(
+                "TextMeshPro/Sprite",
+                sprite_properties,
+            ),
+            "tmp_sprite",
+        )
+        self.assertIsNone(
+            core._classify_compatible_raster_shader(
+                "TextMeshPro/Sprite",
+                sprite_properties - {"_Stencil"},
+            )
+        )
+        self.assertIsNone(
+            core._classify_compatible_raster_shader(
+                "TextMeshPro/Distance Field",
+                sprite_properties,
+            )
+        )
+
+    def test_raster_shader_retarget_prefers_dedicated_bitmap(self) -> None:
+        def shader_reader(path_id: int, name: str, properties: set[str]):
+            parsed_form = SimpleNamespace(
+                m_Name=name,
+                m_PropInfo=SimpleNamespace(
+                    m_Props=[SimpleNamespace(m_Name=value) for value in properties]
+                ),
+            )
+            reader = SimpleNamespace(
+                type=SimpleNamespace(name="Shader"),
+                path_id=path_id,
+                parse_as_object=lambda: SimpleNamespace(
+                    m_Name="",
+                    m_ParsedForm=parsed_form,
+                ),
+            )
+            return reader
+
+        assets_file = SimpleNamespace(name="CAB-font", externals=[])
+        bitmap = shader_reader(
+            20,
+            "TextMeshPro/Bitmap",
+            {
+                "_MainTex",
+                "_FaceColor",
+                "_ClipRect",
+                "_Stencil",
+                "_StencilComp",
+                "_ColorMask",
+            },
+        )
+        sprite = shader_reader(
+            10,
+            "TextMeshPro/Sprite",
+            {
+                "_MainTex",
+                "_Color",
+                "_ClipRect",
+                "_Stencil",
+                "_StencilComp",
+                "_ColorMask",
+            },
+        )
+        for reader in (bitmap, sprite):
+            reader.assets_file = assets_file
+        assets_file.objects = {10: sprite, 20: bitmap}
+        material = SimpleNamespace(m_Shader=SimpleNamespace(m_FileID=0, m_PathID=1))
+
+        resolved = core._resolve_compatible_raster_shader(
+            assets_file,
+            material,
+            "font.bundle",
+            source_bundle_signature="UnityFS",
+            asset_file_index=None,
+        )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved["kind"], "tmp_bitmap")
+        self.assertEqual((resolved["file_id"], resolved["path_id"]), (0, 20))
+
+        gui_text = shader_reader(
+            30,
+            "GUI/Text Shader",
+            {"_MainTex", "_Color"},
+        )
+        gui_text.assets_file = assets_file
+        assets_file.objects = {30: gui_text}
+        self.assertIsNone(
+            core._resolve_compatible_raster_shader(
+                assets_file,
+                material,
+                "font.bundle",
+                source_bundle_signature="UnityFS",
+                asset_file_index=None,
+            )
+        )
+        unsafe_resolved = core._resolve_compatible_raster_shader(
+            assets_file,
+            material,
+            "font.bundle",
+            source_bundle_signature="UnityFS",
+            asset_file_index=None,
+            allow_unsafe_gui_text_fallback=True,
+        )
+        self.assertIsNotNone(unsafe_resolved)
+        assert unsafe_resolved is not None
+        self.assertEqual(unsafe_resolved["kind"], "gui_text")
+
+    def test_raster_shader_retarget_preserves_current_compatible_pptr(self) -> None:
+        def shader_reader(
+            assets_file: SimpleNamespace,
+            path_id: int,
+            name: str,
+            properties: set[str],
+        ) -> SimpleNamespace:
+            parsed_form = SimpleNamespace(
+                m_Name=name,
+                m_PropInfo=SimpleNamespace(
+                    m_Props=[SimpleNamespace(m_Name=value) for value in properties]
+                ),
+            )
+            return SimpleNamespace(
+                type=SimpleNamespace(name="Shader"),
+                path_id=path_id,
+                assets_file=assets_file,
+                parse_as_object=lambda: SimpleNamespace(
+                    m_Name="",
+                    m_ParsedForm=parsed_form,
+                ),
+            )
+
+        bitmap_properties = {
+            "_MainTex",
+            "_FaceColor",
+            "_ClipRect",
+            "_Stencil",
+            "_StencilComp",
+            "_ColorMask",
+        }
+        sprite_properties = {
+            "_MainTex",
+            "_Color",
+            "_ClipRect",
+            "_Stencil",
+            "_StencilComp",
+            "_ColorMask",
+        }
+        assets_file = SimpleNamespace(name="CAB-font", externals=[])
+        bitmap = shader_reader(
+            assets_file, 20, "TextMeshPro/Bitmap", bitmap_properties
+        )
+        sprite = shader_reader(
+            assets_file, 10, "TextMeshPro/Sprite", sprite_properties
+        )
+        assets_file.objects = {10: sprite, 20: bitmap}
+        shader_ref = SimpleNamespace(
+            m_FileID=0,
+            m_PathID=10,
+            deref=lambda: sprite,
+        )
+        material = SimpleNamespace(m_Shader=shader_ref)
+
+        safe = core._resolve_compatible_raster_shader(
+            assets_file,
+            material,
+            "font.bundle",
+            source_bundle_signature="UnityFS",
+            asset_file_index=None,
+        )
+        self.assertIsNotNone(safe)
+        assert safe is not None
+        self.assertEqual((safe["file_id"], safe["path_id"]), (0, 20))
+
+        explicit = core._resolve_compatible_raster_shader(
+            assets_file,
+            material,
+            "font.bundle",
+            source_bundle_signature="UnityFS",
+            asset_file_index=None,
+            allow_unsafe_full_color_shader_fallback=True,
+        )
+        self.assertIsNotNone(explicit)
+        assert explicit is not None
+        self.assertEqual((explicit["file_id"], explicit["path_id"]), (0, 20))
+
+        assets_file.objects = {10: sprite}
+        explicit_current_only = core._resolve_compatible_raster_shader(
+            assets_file,
+            material,
+            "font.bundle",
+            source_bundle_signature="UnityFS",
+            asset_file_index=None,
+            allow_unsafe_full_color_shader_fallback=True,
+        )
+        self.assertIsNotNone(explicit_current_only)
+        assert explicit_current_only is not None
+        self.assertEqual(
+            (explicit_current_only["file_id"], explicit_current_only["path_id"]),
+            (0, 10),
+        )
+
+        external_assets = SimpleNamespace(name="CAB-shaders")
+        external_bitmap = shader_reader(
+            external_assets, 77, "TextMeshPro/Bitmap", bitmap_properties
+        )
+        external_material = SimpleNamespace(
+            m_Shader=SimpleNamespace(
+                m_FileID=2,
+                m_PathID=77,
+                deref=lambda: external_bitmap,
+            )
+        )
+        assets_file.objects = {}
+        external = core._resolve_compatible_raster_shader(
+            assets_file,
+            external_material,
+            "font.bundle",
+            source_bundle_signature="UnityFS",
+            asset_file_index=None,
+        )
+        self.assertIsNotNone(external)
+        assert external is not None
+        self.assertEqual((external["file_id"], external["path_id"]), (2, 77))
+
+    def test_raster_material_is_rebuilt_for_selected_shader_contract(self) -> None:
+        main_texture = {"m_FileID": 2, "m_PathID": 99}
+        material = SimpleNamespace(
+            m_SavedProperties=SimpleNamespace(
+                m_TexEnvs=[
+                    (
+                        "_MainTex",
+                        SimpleNamespace(
+                            m_Texture=SimpleNamespace(**main_texture),
+                            m_Scale=SimpleNamespace(x=1.0, y=1.0),
+                            m_Offset=SimpleNamespace(x=0.0, y=0.0),
+                        ),
+                    )
+                ],
+                m_Ints=[("unused", 1)],
+                m_Floats=[("_Stencil", 3.0), ("_GradientScale", 8.0)],
+                m_Colors=[
+                    ("_FaceColor", {"r": 0.2, "g": 0.3, "b": 0.4, "a": 1.0}),
+                    (
+                        "_ClipRect",
+                        {"r": -10.0, "g": -20.0, "b": 30.0, "a": 40.0},
+                    ),
+                ],
+            )
+        )
+        properties = {
+            "_MainTex",
+            "_Color",
+            "_ClipRect",
+            "_Stencil",
+            "_StencilComp",
+            "_ColorMask",
+        }
+
+        changed = core._prune_material_saved_properties_for_raster(
+            material,
+            {},
+            shader_kind="tmp_sprite",
+            shader_properties=properties,
+        )
+
+        self.assertTrue(changed)
+        saved = material.m_SavedProperties
+        self.assertEqual([entry[0] for entry in saved.m_TexEnvs], ["_MainTex"])
+        self.assertEqual(
+            saved.m_TexEnvs[0][1]["m_Texture"],
+            main_texture,
+        )
+        self.assertEqual(saved.m_Ints, [])
+        self.assertNotIn("_GradientScale", dict(saved.m_Floats))
+        self.assertEqual(dict(saved.m_Floats)["_Stencil"], 3.0)
+        self.assertEqual(
+            dict(saved.m_Colors)["_Color"],
+            {"r": 0.2, "g": 0.3, "b": 0.4, "a": 1.0},
+        )
+
+    def test_raster_render_modes_follow_legacy_or_textcore_shape(self) -> None:
+        self.assertEqual(
+            core._select_tmp_raster_render_modes(
+                {
+                    "m_AtlasRenderMode": 7,
+                    "fontCreationSettings": {"fontRenderMode": 7},
+                },
+                4121,
+            ),
+            (0, 0),
+        )
+        self.assertEqual(
+            core._select_tmp_raster_render_modes(
+                {
+                    "m_AtlasRenderMode": 4169,
+                    "m_CreationSettings": {"renderMode": 4169},
+                },
+                4121,
+            ),
+            (4121, 4121),
+        )
+
+    def test_custom_atlas_raster_material_resets_shader_padding(self) -> None:
+        material = SimpleNamespace(
+            m_SavedProperties=SimpleNamespace(
+                m_TexEnvs=[
+                    (
+                        "_MainTex",
+                        SimpleNamespace(
+                            m_Texture=SimpleNamespace(m_FileID=0, m_PathID=9),
+                        ),
+                    )
+                ],
+                m_Floats=[("_Padding", 12.0)],
+                m_Colors=[("_FaceColor", {"r": 1, "g": 1, "b": 1, "a": 1})],
+            )
+        )
+        properties = {
+            "_MainTex",
+            "_FaceColor",
+            "_Padding",
+            "_ClipRect",
+            "_Stencil",
+            "_StencilComp",
+            "_ColorMask",
+        }
+
+        self.assertTrue(
+            core._prune_material_saved_properties_for_raster(
+                material,
+                {},
+                shader_kind="tmp_bitmap_custom_atlas",
+                shader_properties=properties,
+            )
+        )
+        self.assertEqual(dict(material.m_SavedProperties.m_Floats)["_Padding"], 0.0)
+
+    def test_raster_material_rebuilds_alpha_clip_keyword(self) -> None:
+        material = SimpleNamespace(
+            m_ShaderKeywords="UNDERLAY_ON UNITY_UI_ALPHACLIP",
+            m_ValidKeywords=["UNDERLAY_ON"],
+            m_InvalidKeywords=["GLOW_ON"],
+            m_SavedProperties=SimpleNamespace(
+                m_TexEnvs=[],
+                m_Ints=[],
+                m_Floats=[("_UseUIAlphaClip", 1.0)],
+                m_Colors=[],
+            ),
+        )
+        properties = {
+            "_MainTex",
+            "_Color",
+            "_ClipRect",
+            "_Stencil",
+            "_StencilComp",
+            "_ColorMask",
+            "_UseUIAlphaClip",
+        }
+
+        self.assertTrue(
+            core._prune_material_saved_properties_for_raster(
+                material,
+                {},
+                shader_kind="tmp_sprite",
+                shader_properties=properties,
+            )
+        )
+        self.assertTrue(core._reset_raster_material_keywords(material, properties))
+        self.assertEqual(material.m_ShaderKeywords, "UNITY_UI_ALPHACLIP")
+        self.assertEqual(material.m_ValidKeywords, ["UNITY_UI_ALPHACLIP"])
+        self.assertEqual(material.m_InvalidKeywords, [])
+
+    def test_raster_texture_sampling_contract_is_bilinear_without_mips(self) -> None:
+        texture = SimpleNamespace(
+            m_TextureSettings=SimpleNamespace(m_FilterMode=0),
+            m_MipMap=True,
+            m_MipCount=4,
+            m_StreamingMipmaps=True,
+            m_StreamingMipmapsPriority=3,
+        )
+
+        self.assertTrue(core._apply_raster_texture_sampling_contract(texture))
+        self.assertEqual(texture.m_TextureSettings.m_FilterMode, 1)
+        self.assertFalse(texture.m_MipMap)
+        self.assertEqual(texture.m_MipCount, 1)
+        self.assertFalse(texture.m_StreamingMipmaps)
+        self.assertEqual(texture.m_StreamingMipmapsPriority, 0)
+        self.assertFalse(core._apply_raster_texture_sampling_contract(texture))
+
+        with self.assertRaises(RuntimeError):
+            core._apply_raster_texture_sampling_contract(
+                SimpleNamespace(m_MipMap=False)
+            )
+        with self.assertRaises(RuntimeError):
+            core._apply_raster_texture_sampling_contract(
+                SimpleNamespace(
+                    m_TextureSettings=SimpleNamespace(m_FilterMode=1)
+                )
+            )
 
     def test_replacement_sdf_json_and_png_are_validated_as_one_unit(self) -> None:
         valid = {
@@ -1949,6 +2414,15 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
         self.assertEqual(
             core.select_replacement_asset_padding("NanumGothic", 20, None),
             20,
+        )
+        self.assertEqual(
+            core.select_replacement_asset_padding(
+                "NanumGothic",
+                20,
+                None,
+                prefer_raster=True,
+            ),
+            5,
         )
 
     def test_missing_padding_variant_regenerates_instead_of_using_root_sdf(

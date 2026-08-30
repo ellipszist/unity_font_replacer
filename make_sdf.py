@@ -1034,12 +1034,14 @@ def generate_sdf_assets_from_ttf(
             glyph_w, glyph_h, metrics = _measure_glyph_metrics(
                 font, int(code), int(ascent)
             )
-            # TextCore reserves one additional texel between padded glyph tiles.
-            # TMP can expand UVs beyond atlas padding for bilinear sampling and
-            # material effects, so omitting this guard leaks adjacent SDF fields.
+            # TextCore reserves one additional texel only for distance-field
+            # packing. Bitmap modes use the padded glyph tile itself without
+            # the SDF sampling guard (TMP_FontAssetCreatorWindow's
+            # RASTER_MODE_BITMAP packing modifier follows the same split).
+            sampling_guard = 1 if normalized_render_mode == "sdf" else 0
             if glyph_w > 0 and glyph_h > 0:
-                rect_w = glyph_w + atlas_padding * 2 + 1
-                rect_h = glyph_h + atlas_padding * 2 + 1
+                rect_w = glyph_w + atlas_padding * 2 + sampling_guard
+                rect_h = glyph_h + atlas_padding * 2 + sampling_guard
             else:
                 rect_w = 1
                 rect_h = 1
@@ -1211,9 +1213,10 @@ def generate_sdf_assets_from_ttf(
 
             tile_w = glyph_w + atlas_padding * 2
             tile_h = glyph_h + atlas_padding * 2
-            if pw != tile_w + 1 or ph != tile_h + 1:
+            sampling_guard = 1 if normalized_render_mode == "sdf" else 0
+            if pw != tile_w + sampling_guard or ph != tile_h + sampling_guard:
                 _emit(
-                    f"[layout] invalid TextCore guard for glyph={glyph_index}: "
+                    f"[layout] invalid TextCore allocation for glyph={glyph_index}: "
                     f"allocation=({pw}, {ph}), tile=({tile_w}, {tile_h})"
                 )
                 return None
@@ -1231,10 +1234,11 @@ def generate_sdf_assets_from_ttf(
                 mode_tile = _compute_sdf_tile(tile, atlas_padding + 1)
             else:
                 mode_tile = tile
-            # Native TextCore places the extra guard on the left and bottom in
-            # atlas coordinates. PIL is top-origin, so the rendered tile starts
+            # Native TextCore places the SDF-only guard on the left and bottom
+            # in atlas coordinates. PIL is top-origin, so the SDF tile starts
             # one texel to the right and leaves the allocation's last row clear.
-            tile_x = px + 1
+            # Raster tiles begin directly at the allocation origin.
+            tile_x = px + sampling_guard
             tile_y = py
             atlas_alpha[tile_y : tile_y + tile_h, tile_x : tile_x + tile_w] = (
                 np.maximum(
@@ -1427,6 +1431,12 @@ def generate_sdf_assets_from_ttf(
     # ------------------------------------------------------------------ #
 
     atlas_rgba = np.zeros((selected_atlas_h, selected_atlas_w, 4), dtype=np.uint8)
+    # Alpha8 targets keep only the alpha plane, while RGBA targets and TMP's
+    # Sprite / Bitmap Custom Atlas fallbacks multiply the full sampled color.
+    # White RGB therefore preserves the intended tint for raster atlases;
+    # black RGB would make those shader paths render black or invisible.
+    if normalized_render_mode == "raster":
+        atlas_rgba[:, :, :3] = 255
     atlas_rgba[:, :, 3] = atlas_alpha
     atlas_image = Image.fromarray(atlas_rgba, mode="RGBA")
 

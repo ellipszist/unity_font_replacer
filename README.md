@@ -78,16 +78,18 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 | `--ttfonly` | TTF 폰트만 교체 |
 | `--target-file <파일명>` | 지정한 파일명만 교체 대상에 포함 (여러 번/콤마로 지정 가능) |
 
-#### SDF 교체 옵션
+#### TMP FontAsset 교체 옵션
 
 | 옵션 | 설명 |
 |------|------|
 | `--use-game-material` | 이전 CLI 호환용. 게임 Material 스타일 보존은 기본이며 필수 atlas/shader 값은 항상 동기화 |
-| `--force-raster` | 이전 CLI 호환용. 호환 Bitmap shader를 안전하게 연결할 수 없어 현재는 지정 시 오류로 중단 |
+| `--force-raster` | Alpha8 Raster atlas를 생성하고, 각 Material을 현재 파일에서 실제로 도달 가능한 TMP Bitmap shader로 재연결 |
+| `--allow-unsafe-full-color-shader-fallback` | 테스트 전용. Alpha8에서 RGB가 보장되지 않는 `TextMeshPro/Sprite`/`Bitmap Custom Atlas` fallback을 명시적으로 허용 |
+| `--allow-unsafe-gui-text-fallback` | 테스트 전용. TMP UI mask/depth를 지원하지 않는 `GUI/Text Shader` fallback을 명시적으로 허용 |
 | `--freeze-dynamic` | Dynamic/DynamicOS TMP FontAsset을 명시적으로 baked Static으로 고정하고 runtime source Font PPtr 해제 |
 | `--use-game-line-metrics` | 게임 원본 줄 간격 메트릭 사용 (pointSize는 교체값 유지) |
 | `--outline-ratio <float>` | 현재 선택된 Material 기준 `_OutlineWidth`, `_OutlineSoftness`에 배율 적용 (기본 `1.0`) |
-| `--charset <파일/문자열>` | TTF/OTF에서 SDF 자동 생성 시 사용할 글자셋 지정 (기본 `CharList_3911.txt`) |
+| `--charset <파일/문자열>` | TTF/OTF에서 SDF/Raster atlas 자동 생성 시 사용할 글자셋 지정 (기본 `CharList_3911.txt`) |
 
 #### 저장
 
@@ -228,10 +230,11 @@ JSON 예시 (`--ps5-swizzle` 미사용):
 
 | 필드 | 설명 |
 |------|------|
-| `force_raster` | 이전 JSON 호환용 (`"True"` / `"False"`, 기본 `"False"`) |
+| `force_raster` | 해당 FontAsset을 Alpha8 Raster atlas로 변환 (`"True"` / `"False"`, 기본 `"False"`) |
 
 - SDF와 Bitmap Material은 shader 계약이 달라 `m_AtlasRenderMode`만 바꾸는 변환은 안전하지 않습니다.
-- `force_raster: "True"` 또는 `--force-raster`를 지정하면 파일을 수정하기 전에 명시적 오류로 중단합니다.
+- `force_raster: "True"` 또는 `--force-raster`를 지정하면 FontAsset/atlas뿐 아니라 연결된 Material의 `m_Shader`와 SavedProperties도 함께 변환합니다.
+- 기존 PPtr로 도달 가능한 compiled Shader의 이름과 실제 property 계약을 모두 확인하며, 호환 shader가 없으면 파일을 저장하지 않고 중단합니다.
 
 ### PS5 swizzle 필드
 
@@ -437,7 +440,7 @@ python export_fonts_ko.py "D:\MyGame"
 - 추가 제외 확장자가 필요하면 `--exclude-ext "resS,.resource,.split0"`처럼 지정하세요.
 - 파일 단위로 제한하려면 `--target-file`을 사용하세요.
 
-### SDF 교체
+### TMP FontAsset (SDF / Raster) 교체
 
 - 기본 줄 간격 메트릭 모드는 게임 원본 비율을 기준으로 교체 폰트 pointSize에 맞게 보정 적용합니다.
 - 게임 원본 줄 간격 메트릭을 그대로 쓰려면 `--use-game-line-metrics`를 사용하세요. (pointSize는 항상 교체 폰트 값)
@@ -452,11 +455,16 @@ python export_fonts_ko.py "D:\MyGame"
 - 글리프가 0개인 TMP fallback FontAsset도 atlas 참조가 있으면 SDF 교체 대상에 포함합니다. 일부 게임의 `* SDF - Fallback` 빈 에셋이 남아 누락 글자가 빈칸으로 떨어지는 문제를 줄이기 위한 처리입니다.
 - 하나의 atlas를 여러 FontAsset이 공유하면 모든 소유자를 같은 폰트로 선택한 경우에만 교체합니다. 일부만 선택하거나 서로 다른 폰트로 지정하면 중단합니다.
 - 교체 결과는 static single-atlas로 정규화됩니다. 원래 Dynamic/DynamicOS인 FontAsset은 기본적으로 중단하며, 동적 글리프 추가를 포기할 의도가 명확할 때만 `--freeze-dynamic`으로 Static 고정 및 runtime source Font PPtr 해제를 허용합니다. 이때 필요한 모든 문자를 `--charset`에 포함해야 합니다.
-- Bitmap TMP FontAsset 및 SDF↔Raster 변환은 호환 shader PPtr를 증명할 수 없어 현재 지원하지 않습니다.
+- 원래 Bitmap인 TMP FontAsset은 자동으로 Raster atlas를 생성합니다. SDF FontAsset은 `force_raster: "True"` 또는 `--force-raster`로 Raster 변환할 수 있습니다.
+- Raster 변환은 기존 PPtr 경로로 도달 가능한 shader만 사용하고, 현재 연결된 호환 PPtr을 우선 보존합니다. Alpha8에서 공식적으로 안전한 자동 후보는 `TextMeshPro/Bitmap`과 `TextMeshPro/Mobile/Bitmap`이며, compiled Shader의 실제 property 계약까지 검증합니다. 안전한 후보가 없으면 저장 전에 중단합니다.
+- `TextMeshPro/Sprite`와 `TextMeshPro/Bitmap Custom Atlas`는 RGB 전체를 읽지만 Alpha8 저장은 생성된 흰색 RGB 채널을 보존하지 않습니다. `--allow-unsafe-full-color-shader-fallback`은 UGUI 실기 진단을 위한 명시적 예외이며, 3D `TextMeshPro`/MeshRenderer까지의 출력을 보장하지 않습니다.
+- `--allow-unsafe-gui-text-fallback`은 수동 진단용 마지막 수단입니다. `GUI/Text Shader`는 기본 glyph mesh를 그릴 수 있지만 stencil/`RectMask2D`가 없고 depth test가 항상 통과하므로, 마스크 밖으로 글자가 새거나 3D 물체를 뚫고 보일 수 있습니다.
+- Raster shader에는 SDF의 outline/underlay/glow/gradient 계약이 없으므로 해당 속성과 keyword를 제거합니다. face color와 shader가 지원하는 clip/stencil 값 및 `UNITY_UI_ALPHACLIP` toggle은 보존합니다.
+- TTF/OTF에서 생성하는 Raster atlas는 SDF effect padding을 상속하지 않고 5 texel의 투명 여백을 사용합니다. 이는 TMP bitmap의 기본 1 texel과 `Extra Padding`의 추가 4 texel UV 확장을 모두 보호하면서 atlas 해상도 낭비를 줄입니다.
 - `--outline-ratio`는 현재 선택된 Material 기준값을 1.0으로 보고 `_OutlineWidth`, `_OutlineSoftness`에 추가 배율을 곱합니다.
 - `--outline-ratio 1.25`는 외곽선을 25% 두껍게, `--outline-ratio 0.6`은 더 얇게 만듭니다.
 - `--outline-ratio`는 `--use-game-material` 사용 여부와 관계없이 현재 게임 Material의 outline 값을 기준으로 적용됩니다.
-- `force_raster: "True"`와 `--force-raster`는 이전 설정 파일/CLI 호환을 위해 파싱하지만 현재는 안전 오류로 중단합니다.
+- Raster 변환은 현대 TextCore의 `RASTER_MODE_BITMAP`과 구형 TMP의 bitmap enum을 직렬화 형태에 맞게 선택하며, 생성 설정과 runtime render mode를 함께 동기화합니다.
 - 공식 TMP 0.1.x~4.0 pre 소스에서 확인된 구형·hybrid·신형 형태를 실제 TypeTree 필드 기준으로 판별합니다. 실제 binary의 TypeTree를 읽고 저장 후 재검증할 수 있을 때만 진행하며, 알 수 없거나 모순된 render/schema는 버전 숫자로 추측하지 않고 중단합니다.
 
 ### Preview Export

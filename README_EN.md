@@ -78,16 +78,18 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 | `--ttfonly` | Replace TTF fonts only |
 | `--target-file <name>` | Limit replacement to specific file name(s) (repeatable/comma-separated) |
 
-#### SDF Options
+#### TMP FontAsset Options
 
 | Option | Description |
 |------|------|
 | `--use-game-material` | Legacy CLI compatibility. Game Material style is preserved by default; required atlas/shader values are always synchronized |
-| `--force-raster` | Legacy CLI compatibility only. Currently fails safely because a compatible Bitmap shader cannot be retargeted |
+| `--force-raster` | Generate an Alpha8 raster atlas and retarget each Material to a reachable TMP Bitmap shader |
+| `--allow-unsafe-full-color-shader-fallback` | Testing only. Explicitly allow `TextMeshPro/Sprite`/`Bitmap Custom Atlas` fallbacks whose RGB is not guaranteed by Alpha8 storage |
+| `--allow-unsafe-gui-text-fallback` | Testing only. Explicitly allow the `GUI/Text Shader` fallback without TMP UI masking or depth support |
 | `--freeze-dynamic` | Explicitly freeze Dynamic/DynamicOS TMP FontAssets to baked Static and clear the runtime source Font PPtr |
 | `--use-game-line-metrics` | Keep in-game line metrics (pointSize still follows replacement font) |
 | `--outline-ratio <float>` | Apply a multiplier to `_OutlineWidth` and `_OutlineSoftness` on the currently selected Material baseline (default `1.0`) |
-| `--charset <file/text>` | Charset for TTF/OTF-to-SDF auto-generation (default `CharList_3911.txt`) |
+| `--charset <file/text>` | Charset for TTF/OTF-to-SDF/raster atlas generation (default `CharList_3911.txt`) |
 
 #### Save / Output
 
@@ -228,10 +230,11 @@ In `--parse` JSON, `force_raster` is included **only for SDF entries**, with def
 
 | Field | Description |
 |------|------|
-| `force_raster` | Legacy JSON compatibility field (`"True"` / `"False"`, default `"False"`) |
+| `force_raster` | Convert that FontAsset to an Alpha8 raster atlas (`"True"` / `"False"`, default `"False"`) |
 
 - SDF and Bitmap Materials have different shader contracts, so changing only `m_AtlasRenderMode` is unsafe.
-- `force_raster: "True"` or `--force-raster` stops with an explicit error before any file is modified.
+- `force_raster: "True"` or `--force-raster` converts the linked Material `m_Shader` and SavedProperties together with the FontAsset and atlas.
+- The tool verifies both the compiled Shader name and its concrete property contract through an existing PPtr route. It saves nothing when no compatible shader is reachable.
 
 ### PS5 swizzle fields
 
@@ -436,7 +439,7 @@ python export_fonts_en.py "D:\MyGame"
 - Add extra exclusion extensions with `--exclude-ext "resS,.resource,.split0"` when needed.
 - Use `--target-file` to restrict replacements to specific files.
 
-### SDF Replacement
+### TMP FontAsset (SDF / Raster) Replacement
 
 - Default line metrics mode scales original proportions to the replacement font's pointSize.
 - Use `--use-game-line-metrics` to keep original in-game line metrics. (pointSize still follows replacement font.)
@@ -451,11 +454,16 @@ python export_fonts_en.py "D:\MyGame"
 - Empty TMP fallback FontAssets are included as SDF replacement targets when they still have an atlas reference. This prevents unresolved characters from falling back into an unchanged `* SDF - Fallback` asset with no glyphs.
 - When FontAssets share an atlas, every owner must be selected for the same replacement. Partial selection or conflicting replacement fonts are refused.
 - Results are normalized to a static single atlas. Dynamic/DynamicOS targets are refused by default; use `--freeze-dynamic` only when disabling runtime glyph addition is intentional. It freezes the asset to Static and clears the runtime source Font PPtr, so every required character must be included with `--charset`.
-- Bitmap TMP FontAssets and SDF-to-Raster conversion are currently unsupported because a compatible shader PPtr cannot be proven.
+- Existing Bitmap TMP FontAssets automatically receive a raster atlas. Use `force_raster: "True"` or `--force-raster` to convert an SDF FontAsset to raster.
+- Raster conversion uses only shaders reachable through existing PPtr routes and preserves the currently linked compatible PPtr first. The officially safe automatic Alpha8 candidates are `TextMeshPro/Bitmap` and `TextMeshPro/Mobile/Bitmap`; the concrete compiled property contract is verified before selection. The tool fails before saving when no safe candidate is reachable.
+- `TextMeshPro/Sprite` and `TextMeshPro/Bitmap Custom Atlas` consume full RGB samples, while Alpha8 storage discards the generated white RGB channels. `--allow-unsafe-full-color-shader-fallback` is an explicit UGUI diagnostics exception and does not guarantee output through 3D `TextMeshPro`/MeshRenderer paths.
+- `--allow-unsafe-gui-text-fallback` is a last-resort manual-diagnostics option. `GUI/Text Shader` can draw the basic glyph mesh, but it has no stencil/`RectMask2D` contract and always passes the depth test, so text can escape masks or show through 3D geometry.
+- Raster shaders do not implement SDF outline, underlay, glow, or gradient properties. Conversion removes those properties and stale keywords while preserving face color, supported clip/stencil values, and the `UNITY_UI_ALPHACLIP` toggle.
+- TTF/OTF-generated raster atlases do not inherit SDF effect padding. They use a five-texel transparent margin, covering TMP bitmap's one-texel baseline plus the optional four-texel `Extra Padding` UV expansion while avoiding wasted atlas resolution.
 - `--outline-ratio` treats the current Material baseline as `1.0` and multiplies `_OutlineWidth` / `_OutlineSoftness` after the baseline is chosen.
 - `--outline-ratio 1.25` makes outlines 25% thicker, while `--outline-ratio 0.6` makes them thinner.
 - `--outline-ratio` uses the current in-game Material outline values regardless of whether `--use-game-material` is present.
-- `force_raster: "True"` and `--force-raster` are still parsed for legacy configuration/CLI compatibility, but now fail safely.
+- Raster conversion synchronizes the creation setting and runtime render mode, selecting modern TextCore `RASTER_MODE_BITMAP` or the legacy TMP bitmap enum from the serialized shape.
 - Old, hybrid, and modern shapes identified in the official TMP 0.1.x through 4.0 preview sources are selected from actual TypeTree fields. Processing continues only when the real binary TypeTree can be read and the saved result can be reopened; unknown or contradictory render/schema data is refused instead of guessed from a version number.
 
 ### Preview Export
