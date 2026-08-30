@@ -311,6 +311,81 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "never crosses"):
             make_sdf._compute_sdf_tile(subthreshold, 3)
 
+    def test_generated_sdf_preserves_textcore_sampling_guard(self) -> None:
+        generated = make_sdf.generate_sdf_assets_from_ttf(
+            ttf_data=(ROOT / "KR_ASSETS" / "NanumGothic.ttf").read_bytes(),
+            font_name="NanumGothic",
+            unicodes=[ord(char) for char in "가나다라"],
+            point_size=16,
+            atlas_padding=2,
+            atlas_width=64,
+            atlas_height=64,
+        )
+        self.assertIsInstance(generated, dict)
+        assert generated is not None
+        try:
+            data = generated["sdf_data"]
+            atlas_alpha = make_sdf.np.asarray(
+                generated["sdf_atlas"].getchannel("A")
+            )
+            atlas_height = int(data["m_AtlasHeight"])
+            padding = int(data["m_AtlasPadding"])
+            used_rects = data["m_UsedGlyphRects"]
+
+            for glyph in data["m_GlyphTable"]:
+                glyph_rect = glyph["m_GlyphRect"]
+                glyph_x = int(glyph_rect["m_X"])
+                glyph_y = int(glyph_rect["m_Y"])
+                glyph_width = int(glyph_rect["m_Width"])
+                glyph_height = int(glyph_rect["m_Height"])
+                containing = [
+                    used
+                    for used in used_rects
+                    if int(used["m_X"]) <= glyph_x
+                    and int(used["m_Y"]) <= glyph_y
+                    and glyph_x + glyph_width
+                    <= int(used["m_X"]) + int(used["m_Width"])
+                    and glyph_y + glyph_height
+                    <= int(used["m_Y"]) + int(used["m_Height"])
+                ]
+                self.assertEqual(len(containing), 1)
+                used = containing[0]
+                used_x = int(used["m_X"])
+                used_y = int(used["m_Y"])
+                used_width = int(used["m_Width"])
+                used_height = int(used["m_Height"])
+
+                self.assertEqual(used_width, glyph_width + padding * 2 + 1)
+                self.assertEqual(used_height, glyph_height + padding * 2 + 1)
+                self.assertEqual(glyph_x - used_x, padding + 1)
+                self.assertEqual(glyph_y - used_y, padding + 1)
+                self.assertEqual(
+                    used_x + used_width - glyph_x - glyph_width,
+                    padding,
+                )
+                self.assertEqual(
+                    used_y + used_height - glyph_y - glyph_height,
+                    padding,
+                )
+
+                used_top = atlas_height - used_y - used_height
+                self.assertTrue(
+                    make_sdf.np.all(
+                        atlas_alpha[used_top : used_top + used_height, used_x] == 0
+                    )
+                )
+                self.assertTrue(
+                    make_sdf.np.all(
+                        atlas_alpha[
+                            used_top + used_height - 1,
+                            used_x : used_x + used_width,
+                        ]
+                        == 0
+                    )
+                )
+        finally:
+            generated["sdf_atlas"].close()
+
     def test_dynamic_tmp_population_is_rejected(self) -> None:
         self.assertFalse(
             core._prepare_static_tmp_population(

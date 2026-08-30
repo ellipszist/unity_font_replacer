@@ -1034,13 +1034,12 @@ def generate_sdf_assets_from_ttf(
             glyph_w, glyph_h, metrics = _measure_glyph_metrics(
                 font, int(code), int(ascent)
             )
-            # KR: 유효한 글리프는 양쪽에 padding을 더한 타일 크기로 패킹.
-            #     빈 글리프(공백 등)는 1x1 최소 슬롯 할당.
-            # EN: Valid glyphs are packed with padding added on both sides.
-            #     Empty glyphs (spaces, etc.) get a minimum 1x1 slot.
+            # TextCore reserves one additional texel between padded glyph tiles.
+            # TMP can expand UVs beyond atlas padding for bilinear sampling and
+            # material effects, so omitting this guard leaks adjacent SDF fields.
             if glyph_w > 0 and glyph_h > 0:
-                rect_w = glyph_w + atlas_padding * 2
-                rect_h = glyph_h + atlas_padding * 2
+                rect_w = glyph_w + atlas_padding * 2 + 1
+                rect_h = glyph_h + atlas_padding * 2 + 1
             else:
                 rect_w = 1
                 rect_h = 1
@@ -1210,13 +1209,17 @@ def generate_sdf_assets_from_ttf(
             copy_w = min(glyph_w, bitmap_w)
             copy_h = min(glyph_h, bitmap_h)
 
-            # KR: 패딩을 포함한 타일 생성 후 비트맵 삽입.
-            #     패딩 영역은 0으로 유지되어 SDF 계산 시 outside로 처리됨.
-            # EN: Create tile with padding then insert bitmap.
-            #     Padding area stays 0, treated as outside during SDF computation.
-            tile = np.zeros((ph, pw), dtype=np.uint8)
-            offset_x = min(atlas_padding, max(0, pw - glyph_w))
-            offset_y = min(atlas_padding, max(0, ph - glyph_h))
+            tile_w = glyph_w + atlas_padding * 2
+            tile_h = glyph_h + atlas_padding * 2
+            if pw != tile_w + 1 or ph != tile_h + 1:
+                _emit(
+                    f"[layout] invalid TextCore guard for glyph={glyph_index}: "
+                    f"allocation=({pw}, {ph}), tile=({tile_w}, {tile_h})"
+                )
+                return None
+            tile = np.zeros((tile_h, tile_w), dtype=np.uint8)
+            offset_x = atlas_padding
+            offset_y = atlas_padding
             if copy_w > 0 and copy_h > 0:
                 tile[offset_y : offset_y + copy_h, offset_x : offset_x + copy_w] = (
                     bitmap[:copy_h, :copy_w]
@@ -1228,16 +1231,23 @@ def generate_sdf_assets_from_ttf(
                 mode_tile = _compute_sdf_tile(tile, atlas_padding + 1)
             else:
                 mode_tile = tile
-            # KR: max 합성으로 겹침 방지 (이론상 shelf 패킹에선 겹치지 않지만 안전장치)
-            # EN: Max-composite to prevent overlap (shelf packing shouldn't overlap, but safeguard)
-            atlas_alpha[py : py + ph, px : px + pw] = np.maximum(
-                atlas_alpha[py : py + ph, px : px + pw], mode_tile
+            # Native TextCore places the extra guard on the left and bottom in
+            # atlas coordinates. PIL is top-origin, so the rendered tile starts
+            # one texel to the right and leaves the allocation's last row clear.
+            tile_x = px + 1
+            tile_y = py
+            atlas_alpha[tile_y : tile_y + tile_h, tile_x : tile_x + tile_w] = (
+                np.maximum(
+                    atlas_alpha[
+                        tile_y : tile_y + tile_h,
+                        tile_x : tile_x + tile_w,
+                    ],
+                    mode_tile,
+                )
             )
 
-            # KR: 글리프 실제 위치 (패딩 오프셋 적용)
-            # EN: Actual glyph position (with padding offset applied)
-            glyph_x = px + offset_x
-            glyph_y_top = py + offset_y
+            glyph_x = tile_x + offset_x
+            glyph_y_top = tile_y + offset_y
             glyph_rect_w = glyph_w
             glyph_rect_h = glyph_h
         else:
