@@ -55,7 +55,7 @@
         "referencedTextAssetGUID": "ca32bb3a091e7b54495460f24d433db5",
         "fontStyle": 0,
         "fontStyleModifier": 0.0,
-        "renderMode": 4118,
+        "renderMode": 4169,
         "includeFontFeatures": 0
     },
     "m_SourceFontFile": {
@@ -85757,7 +85757,7 @@
     "m_AtlasWidth": 4096,
     "m_AtlasHeight": 4096,
     "m_AtlasPadding": 7,
-    "m_AtlasRenderMode": 4118,
+    "m_AtlasRenderMode": 4169,
     "m_UsedGlyphRects": [
         {
             "m_X": 0,

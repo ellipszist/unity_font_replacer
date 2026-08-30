@@ -229,6 +229,33 @@ class SaveRegressionTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertFalse(captured[0].exists())
 
+    def test_replace_default_temp_root_never_uses_the_game_directory(self) -> None:
+        captured: list[tuple[Path, Path]] = []
+
+        @core._cleanup_replace_call_resources
+        def succeed_without_spill(
+            game_path: str,
+            temp_root_dir: str | None = None,
+            _deferred_payload_dir: str | None = None,
+        ) -> bool:
+            captured.append(
+                (Path(str(temp_root_dir)), Path(str(_deferred_payload_dir)))
+            )
+            return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            game_path = Path(temp_dir) / "ExampleGame"
+            game_data_path = game_path / "ExampleGame_Data"
+            game_data_path.mkdir(parents=True)
+
+            self.assertTrue(succeed_without_spill(str(game_path)))
+
+            temp_root, spill_dir = captured[0]
+            self.assertFalse(temp_root.is_relative_to(game_path))
+            self.assertFalse(spill_dir.is_relative_to(game_path))
+            self.assertFalse((game_data_path / "temp").exists())
+            self.assertFalse(temp_root.exists())
+
     def test_consuming_one_payload_preserves_unmatched_payload_and_spill(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -583,6 +610,7 @@ class SaveRegressionTests(unittest.TestCase):
             type = FakeType()
             assets_file = FakeAssetsFile()
             path_id = 7
+            data = None
 
             def peek_name(self) -> str:
                 return "mat"
@@ -628,7 +656,10 @@ class SaveRegressionTests(unittest.TestCase):
                 patch.object(
                     core,
                     "_safe_save",
-                    side_effect=lambda obj, parsed: obj.assets_file.mark_changed(),
+                    side_effect=lambda obj, parsed: (
+                        setattr(obj, "data", b"patched-material"),
+                        obj.assets_file.mark_changed(),
+                    ),
                 ),
                 patch.object(core, "close_unitypy_env", side_effect=close_calls.append),
                 patch.object(core, "_ensure_custom_unitypy_streaming_save"),
@@ -668,6 +699,7 @@ class SaveRegressionTests(unittest.TestCase):
             type = FakeType()
             assets_file = FakeAssetsFile()
             path_id = 7
+            data = None
 
         class FakeFile:
             dataflags = None
@@ -708,7 +740,13 @@ class SaveRegressionTests(unittest.TestCase):
                     "_apply_material_replacement_to_object",
                     return_value=True,
                 ),
-                patch.object(core, "_safe_save"),
+                patch.object(
+                    core,
+                    "_safe_save",
+                    side_effect=lambda obj, parsed: setattr(
+                        obj, "data", b"patched-material"
+                    ),
+                ),
                 patch.object(core, "_ensure_custom_unitypy_streaming_save"),
             ):
                 result = core.replace_fonts_in_file(
@@ -748,6 +786,7 @@ class SaveRegressionTests(unittest.TestCase):
             type = FakeType()
             assets_file = FakeAssetsFile()
             path_id = 7
+            data = None
 
         class FakeFile:
             dataflags = None
@@ -781,7 +820,13 @@ class SaveRegressionTests(unittest.TestCase):
                     "_apply_material_replacement_to_object",
                     return_value=True,
                 ),
-                patch.object(core, "_safe_save"),
+                patch.object(
+                    core,
+                    "_safe_save",
+                    side_effect=lambda obj, parsed: setattr(
+                        obj, "data", b"patched-font"
+                    ),
+                ),
                 patch.object(core, "_ensure_custom_unitypy_streaming_save"),
                 patch.object(
                     core.subprocess,
@@ -811,6 +856,123 @@ class SaveRegressionTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"original")
             self.assertIs(deferred_material_plans[file_key][object_key], payload)
 
+    def test_failed_material_save_is_reapplied_by_fresh_retry(self) -> None:
+        class FakeType:
+            name = "Material"
+
+        class FakeAssetsFile:
+            name = "CAB-test"
+
+        class FakeObject:
+            type = FakeType()
+            path_id = 7
+
+            def __init__(self) -> None:
+                self.assets_file = FakeAssetsFile()
+                self.data = None
+
+        class FakeFile:
+            dataflags = None
+
+            def save_to(self, path: str, packer=None) -> int:
+                Path(path).write_bytes(b"SAVED")
+                return 5
+
+        class FakeEnv:
+            def __init__(self) -> None:
+                self.file = FakeFile()
+                self.objects = [FakeObject()]
+                self.files = {"bundle": self.file}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            game_path = root / "Game"
+            data_path = game_path / "Game_Data"
+            data_path.mkdir(parents=True)
+            target = data_path / "bundle"
+            target.write_bytes(b"original")
+            file_key = core._normalize_asset_file_key(str(target))
+            object_key = core._make_assets_object_key("CAB-test", 7)
+            payload = {"replacement_font": "TestFont"}
+            deferred_material_plans = {file_key: {object_key: payload}}
+            patched_material_identities: set[str] = set()
+            validation_ok = False
+            material_patch_calls = 0
+
+            def fake_apply_material(*args, **kwargs) -> bool:
+                nonlocal material_patch_calls
+                material_patch_calls += 1
+                return True
+
+            def fake_validate(*args, **kwargs):
+                return SimpleNamespace(
+                    returncode=0 if validation_ok else 9,
+                    stdout="" if validation_ok else "invalid bundle",
+                    stderr="",
+                )
+
+            with (
+                patch.object(
+                    core,
+                    "load_unitypy",
+                    side_effect=lambda *a, **k: FakeEnv(),
+                ),
+                patch.object(core, "_safe_parse_as_object", return_value=object()),
+                patch.object(
+                    core,
+                    "_apply_material_replacement_to_object",
+                    side_effect=fake_apply_material,
+                ),
+                patch.object(
+                    core,
+                    "_safe_save",
+                    side_effect=lambda obj, parsed: setattr(
+                        obj, "data", b"patched-material"
+                    ),
+                ),
+                patch.object(core, "_ensure_custom_unitypy_streaming_save"),
+                patch.object(core.subprocess, "run", side_effect=fake_validate),
+            ):
+                first_result = core.replace_fonts_in_file(
+                    "2021.3.0f1",
+                    str(game_path),
+                    str(target),
+                    {},
+                    replace_ttf=False,
+                    replace_sdf=False,
+                    temp_root_dir=str(root / "scratch"),
+                    generator=object(),
+                    replacement_lookup={},
+                    deferred_material_plans=deferred_material_plans,
+                    patched_material_identities=patched_material_identities,
+                    lang="en",
+                )
+
+                self.assertFalse(first_result)
+                self.assertEqual(patched_material_identities, set())
+                self.assertEqual(target.read_bytes(), b"original")
+
+                validation_ok = True
+                second_result = core.replace_fonts_in_file(
+                    "2021.3.0f1",
+                    str(game_path),
+                    str(target),
+                    {},
+                    replace_ttf=False,
+                    replace_sdf=False,
+                    temp_root_dir=str(root / "scratch"),
+                    generator=object(),
+                    replacement_lookup={},
+                    deferred_material_plans=deferred_material_plans,
+                    patched_material_identities=patched_material_identities,
+                    lang="en",
+                )
+
+            self.assertTrue(second_result)
+            self.assertEqual(material_patch_calls, 2)
+            self.assertEqual(len(patched_material_identities), 1)
+            self.assertEqual(target.read_bytes(), b"SAVED")
+
     def test_requested_ttf_save_failure_is_not_reported_as_already_satisfied(self) -> None:
         class FakeType:
             name = "Font"
@@ -822,6 +984,7 @@ class SaveRegressionTests(unittest.TestCase):
             type = FakeType()
             assets_file = FakeAssetsFile()
             path_id = 7
+            data = None
 
         class FakeFont:
             m_FontData = b"old-font"
@@ -871,7 +1034,13 @@ class SaveRegressionTests(unittest.TestCase):
                         "line_spacing": 2.0,
                     },
                 ),
-                patch.object(core, "_safe_save"),
+                patch.object(
+                    core,
+                    "_safe_save",
+                    side_effect=lambda obj, parsed: setattr(
+                        obj, "data", b"patched-font"
+                    ),
+                ),
                 patch.object(core, "_ensure_custom_unitypy_streaming_save"),
                 patch.object(
                     core.subprocess,

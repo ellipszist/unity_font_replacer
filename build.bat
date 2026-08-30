@@ -36,12 +36,12 @@ if exist "%LOCAL_UNITYPY%\pyproject.toml" (
   "%VENV_PY%" -m pip install --upgrade --force-reinstall "%LOCAL_UNITYPY%"
 ) else (
   echo [build] Local custom UnityPy not found. Falling back to remote repository.
-  "%VENV_PY%" -m pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@4018e7600357e185f9986af536d6f105729f0950
+  "%VENV_PY%" -m pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@bccc488474556a5aab30121d7a6c7500c54a80c7
 )
 if errorlevel 1 exit /b 1
-"%VENV_PY%" -c "import UnityPy,sys; from UnityPy.files.BundleFile import BundleFile; from UnityPy.files.ObjectReader import ObjectReader; from UnityPy.files.SerializedFile import SerializedFile; from UnityPy.helpers import CompressionHelper; v=tuple(int(x) for x in UnityPy.__version__.split('.')[:3]); probe=type('Probe',(),{'data':b'modified'})(); print(sys.version); print(UnityPy.__version__); print(UnityPy.__file__); assert v >= (1,25,2) and ObjectReader.get_raw_data(probe)==b'modified' and callable(getattr(BundleFile,'save_to',None)) and callable(getattr(BundleFile,'_write_decompressed_block',None)) and callable(getattr(SerializedFile,'save_to',None)) and callable(getattr(SerializedFile,'get_spill_store',None)) and callable(getattr(CompressionHelper,'chunk_based_compress_iter_to_file',None)) and callable(getattr(CompressionHelper,'create_lzma_decompressor',None)), 'Required custom UnityPy low-memory APIs are missing'"
+"%VENV_PY%" -c "import UnityPy,sys; from UnityPy.files.BundleFile import BundleFile; from UnityPy.files.ObjectReader import ObjectReader; from UnityPy.files.SerializedFile import SerializedFile; from UnityPy.helpers import CompressionHelper; v=tuple(int(x) for x in UnityPy.__version__.split('.')[:3]); probe=type('Probe',(),{'data':b'modified'})(); print(sys.version); print(UnityPy.__version__); print(UnityPy.__file__); assert v >= (1,25,3) and ObjectReader.get_raw_data(probe)==b'modified' and callable(getattr(BundleFile,'save_to',None)) and callable(getattr(BundleFile,'_write_decompressed_block',None)) and callable(getattr(SerializedFile,'save_to',None)) and callable(getattr(SerializedFile,'get_spill_store',None)) and callable(getattr(CompressionHelper,'chunk_based_compress_iter_to_file',None)) and callable(getattr(CompressionHelper,'create_lzma_decompressor',None)), 'Required custom UnityPy low-memory APIs are missing'"
 if errorlevel 1 (
-  echo [build] ERROR: Installed UnityPy is not the required low-memory 1.25.2+ build
+  echo [build] ERROR: Installed UnityPy is not the required low-memory 1.25.3+ build
   exit /b 1
 )
 

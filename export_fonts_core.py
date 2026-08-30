@@ -50,9 +50,11 @@ import sys
 from functools import lru_cache
 from typing import Any, Literal, NoReturn, cast
 
+from tmp_font_schema import inspect_tmp_font_schema as _inspect_tmp_font_schema
 from unitypy_runtime import (
     cleanup_unitypy_environments,
     close_unitypy_env as _close_env,
+    create_type_tree_generator,
     load_unitypy,
 )
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
@@ -73,6 +75,7 @@ JsonDict = dict[str, Any]
 _TMP_OLD_ONLY_LAST = (2018, 3, 14)
 _TMP_NEW_SCHEMA_FIRST = (2018, 4, 2)
 _TMP_CREATION_SETTINGS_KEYS = (
+    "fontCreationSettings",
     "m_CreationSettings",
     "m_FontAssetCreationSettings",
     "m_fontAssetCreationEditorSettings",
@@ -254,6 +257,10 @@ def find_assets_files(data_path: str) -> list[str]:
         ".mp4",
         ".avi",
         ".mov",
+        ".bak",
+        ".ress",
+        ".resource",
+        ".resources",
         ".rollback",
         ".tmp",
     }
@@ -281,9 +288,16 @@ def find_assets_files(data_path: str) -> list[str]:
 
 
 def get_compile_method(data_path: str) -> str:
-    """KR: Managed 폴더 존재 여부로 빌드 방식(Mono/Il2cpp)을 판별한다.
-    EN: Determine build method (Mono/Il2cpp) by checking for the Managed folder."""
-    return "Mono" if os.path.exists(os.path.join(data_path, "Managed")) else "Il2cpp"
+    """KR: 런타임 메타데이터로 빌드 방식(Mono/Il2cpp)을 판별한다.
+    EN: Determine build method (Mono/Il2cpp) from runtime metadata."""
+    metadata_path = os.path.join(
+        data_path, "il2cpp_data", "Metadata", "global-metadata.dat"
+    )
+    if os.path.isfile(metadata_path):
+        return "Il2cpp"
+    if os.path.isdir(os.path.join(data_path, "Managed")):
+        return "Mono"
+    return "Il2cpp"
 
 
 def create_generator(
@@ -295,59 +309,31 @@ def create_generator(
 ) -> TypeTreeGenerator:
     """KR: TypeTreeGenerator를 초기화하고 어셈블리 메타데이터를 로드한다.
     Mono 빌드: Managed/*.dll을 순회하며 load_dll().
-    Il2cpp 빌드: GameAssembly.dll + global-metadata.dat -> load_il2cpp().
+    Il2cpp 빌드: GameAssembly.dll + global-metadata.dat -> 외부 캐시 DummyDll.
     TypeTree는 UnityPy가 MonoBehaviour를 딕셔너리로 역직렬화할 때 필요.
 
     EN: Initialize TypeTreeGenerator and load assembly metadata.
     Mono builds: iterate Managed/*.dll and call load_dll().
-    Il2cpp builds: GameAssembly.dll + global-metadata.dat -> load_il2cpp().
+    Il2cpp builds: GameAssembly.dll + global-metadata.dat -> external cached DummyDll.
     TypeTree is required for UnityPy to deserialize MonoBehaviours into dicts."""
     try:
-        generator = TypeTreeGenerator(unity_version)
-    except ImportError:
+        return create_type_tree_generator(
+            unity_version,
+            game_path,
+            data_path,
+            compile_method,
+            log=_log_console,
+        )
+    except ImportError as exc:
         if lang == "ko":
             raise RuntimeError(
                 "TypeTreeGeneratorAPI가 설치되지 않아 TMP 폰트 타입트리를 생성할 수 없습니다.\n"
                 "`pip install TypeTreeGeneratorAPI`를 실행해 주세요."
-            )
+            ) from exc
         raise RuntimeError(
             "TypeTreeGeneratorAPI is required to generate TMP typetrees.\n"
             "Install it with: `pip install TypeTreeGeneratorAPI`."
-        )
-
-    if compile_method == "Mono":
-        managed_dir = os.path.join(data_path, "Managed")
-        for fn in os.listdir(managed_dir):
-            if not fn.endswith(".dll"):
-                continue
-            try:
-                with open(os.path.join(managed_dir, fn), "rb") as f:
-                    generator.load_dll(f.read())
-            except Exception as e:  # pragma: no cover
-                if lang == "ko":
-                    _log_console(f"경고: DLL 로드 실패 '{fn}': {e}")
-                else:
-                    _log_console(f"Warning: failed to load DLL '{fn}': {e}")
-    else:
-        il2cpp_path = os.path.join(game_path, "GameAssembly.dll")
-        metadata_path = os.path.join(
-            data_path, "il2cpp_data", "Metadata", "global-metadata.dat"
-        )
-        if not os.path.exists(il2cpp_path) or not os.path.exists(metadata_path):
-            if lang == "ko":
-                raise RuntimeError(
-                    "Il2cpp 감지됨. 'GameAssembly.dll'과 'global-metadata.dat'가 필요합니다."
-                )
-            raise RuntimeError(
-                "Detected Il2cpp. 'GameAssembly.dll' and 'global-metadata.dat' are required."
-            )
-        with open(il2cpp_path, "rb") as f:
-            il2cpp = f.read()
-        with open(metadata_path, "rb") as f:
-            metadata = f.read()
-        generator.load_il2cpp(il2cpp, metadata)
-
-    return generator
+        ) from exc
 
 
 @lru_cache(maxsize=256)
@@ -502,7 +488,55 @@ def _build_asset_file_index(
         "basename_to_keys": basename_to_keys,
         "relpath_by_key": relpath_by_key,
         "basename_by_key": basename_by_key,
+        "internal_name_to_keys": {},
+        "internal_name_index_complete": False,
     }
+
+
+def _ensure_internal_asset_name_index(asset_file_index: dict[str, Any]) -> None:
+    """Index inner SerializedFile names for hash/semantic-named outer bundles."""
+    if bool(asset_file_index.get("internal_name_index_complete")):
+        return
+    path_by_key = cast(dict[str, str], asset_file_index.get("path_by_key", {}))
+    internal_name_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.setdefault("internal_name_to_keys", {}),
+    )
+    for outer_key, outer_path in path_by_key.items():
+        env = None
+        try:
+            env = load_unitypy(outer_path)
+            roots = getattr(env, "files", None)
+            stack = list(roots.values()) if isinstance(roots, dict) else []
+            primary = getattr(env, "file", None)
+            if primary is not None:
+                stack.append(primary)
+            seen: set[int] = set()
+            names: set[str] = set()
+            while stack:
+                item = stack.pop()
+                if item is None or id(item) in seen:
+                    continue
+                seen.add(id(item))
+                item_name = _normalize_assets_key(getattr(item, "name", None))
+                if item_name:
+                    names.add(item_name)
+                children = getattr(item, "files", None)
+                if isinstance(children, dict):
+                    for child_name, child in children.items():
+                        child_key = _normalize_assets_key(child_name)
+                        if child_key:
+                            names.add(child_key)
+                        stack.append(child)
+            for name in names:
+                keys = internal_name_to_keys.setdefault(name, [])
+                if outer_key not in keys:
+                    keys.append(outer_key)
+        except Exception:
+            continue
+        finally:
+            _close_env(env)
+    asset_file_index["internal_name_index_complete"] = True
 
 
 def _extract_external_assets_name(external_ref: Any) -> str | None:
@@ -694,6 +728,15 @@ def _collect_asset_file_index_matches(
     for match_key in basename_to_keys.get(basename, []):
         _append_match(match_key)
 
+    if not matches:
+        _ensure_internal_asset_name_index(asset_file_index)
+        internal_name_to_keys = cast(
+            dict[str, list[str]],
+            asset_file_index.get("internal_name_to_keys", {}),
+        )
+        for match_key in internal_name_to_keys.get(basename, []):
+            _append_match(match_key)
+
     return matches
 
 
@@ -704,10 +747,10 @@ def _choose_asset_file_match(
     current_file_key: str | None,
     reference_desc: str,
 ) -> str | None:
-    """KR: 여러 매칭 후보 중 최적 1개를 선택한다.
-    단독 매칭 -> 같은 디렉토리 형제 우선 -> 사전순 첫 번째 폴백.
+    """KR: 여러 매칭 후보 중 안전하게 유일한 1개를 선택한다.
+    단독 매칭 -> 같은 디렉토리의 유일한 형제 -> 모호하면 거부.
     EN: Choose the best single match from multiple candidates.
-    Single match -> prefer sibling in same directory -> fallback to first alphabetically."""
+    Single match -> unique sibling in the same directory -> reject ambiguity."""
     if not matches:
         return None
     if len(matches) == 1:
@@ -724,11 +767,11 @@ def _choose_asset_file_match(
             ]
             if len(sibling_matches) == 1:
                 return sibling_matches[0]
-    chosen = sorted(matches)[0]
     _log_console(
-        f"Warning: ambiguous asset reference '{reference_desc}' matched {len(matches)} files; using first: {chosen}"
+        f"Warning: ambiguous asset reference '{reference_desc}' matched "
+        f"{len(matches)} files; refusing to guess."
     )
-    return chosen
+    return None
 
 
 def _resolve_target_outer_key(
@@ -788,15 +831,15 @@ def _make_assets_object_key(assets_name: str, path_id: int) -> str:
 
 
 def _has_real_atlas_path(ref: Any) -> bool:
-    """KR: PathID > 0이면 실제 텍스처를 가리키는 유효한 참조.
-    EN: A valid reference pointing to an actual texture if PathID > 0."""
+    """KR: 0이 아닌 signed PathID면 실제 텍스처를 가리키는 유효한 참조.
+    EN: Any nonzero signed PathID is a valid reference to an actual texture."""
     _, path_id = _atlas_ref_ids(ref)
-    return path_id > 0
+    return path_id != 0
 
 
 def _first_valid_atlas_ref(value: Any) -> JsonDict | None:
-    """KR: 리스트에서 PathID > 0인 첫 번째 유효 아틀라스 참조를 반환한다.
-    EN: Return the first valid atlas reference with PathID > 0 from a list."""
+    """KR: 리스트에서 PathID가 0이 아닌 첫 번째 유효 아틀라스 참조를 반환한다.
+    EN: Return the first valid atlas reference with a nonzero PathID from a list."""
     if not isinstance(value, list):
         return None
     for item in value:
@@ -811,11 +854,11 @@ def _best_atlas_ref(
     prefer_new: bool,
 ) -> JsonDict | None:
     """KR: 신형(m_AtlasTextures)/구형(atlas) 중 최선의 아틀라스 참조를 반환한다.
-    우선순위: PathID>0인 유효 참조 -> PathID=0이라도 존재하는 참조.
+    우선순위: PathID가 0이 아닌 유효 참조 -> PathID=0이라도 존재하는 참조.
     prefer_new=True이면 신형을 먼저 시도.
 
     EN: Return the best atlas reference from new (m_AtlasTextures) or old (atlas) schema.
-    Priority: valid ref with PathID>0 -> any existing ref even with PathID=0.
+    Priority: valid ref with nonzero PathID -> any existing ref even with PathID=0.
     If prefer_new=True, try new schema first."""
     new_any = _first_atlas_ref(data.get("m_AtlasTextures"))
     new_valid = _first_valid_atlas_ref(data.get("m_AtlasTextures"))
@@ -925,48 +968,7 @@ def inspect_tmp_font_schema(
       glyph_count  : number of glyphs
       atlas_file_id, atlas_path_id : atlas Texture2D reference
     """
-    target_version = detect_tmp_version(data, unity_version=unity_version)
-    new_glyph_count = _safe_list_len(data.get("m_GlyphTable"))
-    old_glyph_count = _safe_list_len(data.get("m_glyphInfoList"))
-    has_new_face = isinstance(data.get("m_FaceInfo"), dict)
-    has_old_face = isinstance(data.get("m_fontInfo"), dict)
-    new_atlas_ref = _first_atlas_ref(data.get("m_AtlasTextures"))
-    singular_atlas_ref = (
-        cast(JsonDict | None, data.get("m_AtlasTexture"))
-        if isinstance(data.get("m_AtlasTexture"), dict)
-        else None
-    )
-    old_atlas_ref = (
-        cast(JsonDict | None, data.get("atlas"))
-        if isinstance(data.get("atlas"), dict)
-        else None
-    )
-
-    if target_version == "new":
-        glyph_count = new_glyph_count if new_glyph_count > 0 else old_glyph_count
-        atlas_ref = _best_atlas_ref(data, prefer_new=True)
-    else:
-        glyph_count = old_glyph_count if old_glyph_count > 0 else new_glyph_count
-        atlas_ref = _best_atlas_ref(data, prefer_new=False)
-
-    atlas_file_id, atlas_path_id = _atlas_ref_ids(atlas_ref)
-
-    is_tmp = bool(
-        new_glyph_count > 0
-        or old_glyph_count > 0
-        or has_new_face
-        or has_old_face
-        or new_atlas_ref is not None
-        or singular_atlas_ref is not None
-        or old_atlas_ref is not None
-    )
-    return {
-        "version": target_version,
-        "is_tmp": is_tmp,
-        "glyph_count": int(glyph_count),
-        "atlas_file_id": int(atlas_file_id),
-        "atlas_path_id": int(atlas_path_id),
-    }
+    return _inspect_tmp_font_schema(data, unity_version=unity_version)
 
 
 def is_tmp_font_asset(obj: Any) -> bool:
@@ -1032,7 +1034,7 @@ def extract_tmp_refs(parse_dict: JsonDict) -> dict[str, int] | None:
     version = str(info.get("version", "new"))
     atlas_ref = _best_atlas_ref(parse_dict, prefer_new=(version == "new"))
     file_id, path_id = _atlas_ref_ids(atlas_ref)
-    if path_id <= 0:
+    if path_id == 0:
         fallback_atlas_ref = _best_atlas_ref(parse_dict, prefer_new=(version != "new"))
         file_id, path_id = _atlas_ref_ids(fallback_atlas_ref)
 
@@ -1137,13 +1139,13 @@ def export_fonts(
             if lang == "ko":
                 _log_console(
                     f"경고: 동일 basename 에셋이 여러 개 있습니다: '{duplicate_name}'. "
-                    f"가능하면 외부 참조 path를 이용해 해석하지만, 모호하면 첫 경로를 사용합니다. "
+                    f"외부 참조 path와 내부 CAB 이름으로 유일하게 해석할 수 없으면 건너뜁니다. "
                     f"경로 목록: {duplicate_paths}"
                 )
             else:
                 _log_console(
                     f"Warning: duplicate asset basename '{duplicate_name}' detected; "
-                    f"the exporter will try external ref paths first, but falls back to the first match when ambiguous. "
+                    f"ambiguous references are skipped unless external paths or inner CAB names resolve uniquely. "
                     f"Paths: {duplicate_paths}"
                 )
 
@@ -1248,7 +1250,7 @@ def export_fonts(
                     ] = objname.replace(" SDF", " SDF Atlas")
 
                 if (
-                    refs["material_path_id"] > 0
+                    refs["material_path_id"] != 0
                     and material_target_assets_name
                     and material_target_outer_key
                 ):

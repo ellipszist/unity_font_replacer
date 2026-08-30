@@ -88,6 +88,7 @@ def find_assets_files(
         ".browser",
         ".aspx",
         ".map",
+        ".ress",
         ".resource",
         ".resources",
         ".rollback",
@@ -251,9 +252,9 @@ def scan_fonts_from_env(
                     glyph_count = int(tmp_info.get("glyph_count", 0) or 0)
                     atlas_file_id = int(tmp_info.get("atlas_file_id", 0) or 0)
                     atlas_path_id = int(tmp_info.get("atlas_path_id", 0) or 0)
-                    # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 교체 대상이 아닙니다.
-                    # EN: External reference stubs (FileID!=0, PathID=0) are not actual replacement targets.
-                    if atlas_file_id != 0 and atlas_path_id == 0:
+                    # This replacer updates an existing Texture2D; it cannot
+                    # create an atlas for a null PPtr.
+                    if atlas_path_id == 0:
                         continue
                     if glyph_count == 0:
                         is_sprite_asset = (
@@ -265,8 +266,6 @@ def scan_fonts_from_env(
                             or isinstance(parse_dict.get("spriteInfoList"), list)
                         )
                         if is_sprite_asset:
-                            continue
-                        if atlas_file_id == 0 and atlas_path_id == 0:
                             continue
                 except Exception:
                     if lang == "ko":

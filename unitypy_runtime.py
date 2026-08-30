@@ -7,9 +7,15 @@ load/save features required by this project.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
@@ -30,6 +36,7 @@ def _prefer_sibling_unitypy() -> None:
 _prefer_sibling_unitypy()
 
 import UnityPy as UnityPy  # noqa: E402
+from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator  # noqa: E402
 
 
 _P = ParamSpec("_P")
@@ -37,6 +44,260 @@ _R = TypeVar("_R")
 _ACTIVE_ENVIRONMENTS: ContextVar[list[Any] | None] = ContextVar(
     "unitypy_active_environments", default=None
 )
+
+_IL2CPP_CACHE_FORMAT = 1
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while True:
+            chunk = source.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _il2cpp_cache_root(explicit_root: str | None = None) -> str:
+    configured = explicit_root or os.environ.get("UFR_IL2CPP_CACHE_ROOT", "")
+    base = (
+        os.path.abspath(configured)
+        if configured
+        else os.path.join(tempfile.gettempdir(), "UnityFontReplacer")
+    )
+    root = os.path.abspath(os.path.join(base, "il2cpp_cache"))
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _il2cpp_dumper_path(explicit_path: str | None = None) -> str:
+    configured = explicit_path or os.environ.get("UFR_IL2CPP_DUMPER", "")
+    if configured:
+        candidate = os.path.abspath(configured)
+    else:
+        base = (
+            os.path.dirname(sys.executable)
+            if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__))
+        )
+        candidate = os.path.join(base, "Il2CppDumper", "Il2CppDumper.exe")
+    if not os.path.isfile(candidate):
+        raise FileNotFoundError(
+            "Il2CppDumper.exe was not found. Expected it at " f"{candidate}"
+        )
+    return candidate
+
+
+def _safe_remove_cache_tree(path: str, cache_root: str) -> None:
+    resolved_path = os.path.abspath(path)
+    resolved_root = os.path.abspath(cache_root)
+    if resolved_path == resolved_root or os.path.commonpath(
+        (resolved_path, resolved_root)
+    ) != resolved_root:
+        raise RuntimeError(f"Refusing to remove unsafe cache path: {resolved_path}")
+    if os.path.isdir(resolved_path):
+        shutil.rmtree(resolved_path)
+
+
+def _dummy_cache_is_complete(cache_dir: str, expected_manifest: dict[str, Any]) -> bool:
+    manifest_path = os.path.join(cache_dir, "manifest.json")
+    dummy_dir = os.path.join(cache_dir, "DummyDll")
+    if not os.path.isfile(manifest_path) or not os.path.isdir(dummy_dir):
+        return False
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+    except Exception:
+        return False
+    if manifest != expected_manifest:
+        return False
+    return any(name.lower().endswith(".dll") for name in os.listdir(dummy_dir))
+
+
+def _ensure_il2cpp_dummy_dlls(
+    unity_version: str,
+    game_path: str,
+    data_path: str,
+    *,
+    cache_root: str | None = None,
+    dumper_path: str | None = None,
+    log: Callable[[str], None] | None = None,
+) -> str:
+    binary_path = os.path.join(game_path, "GameAssembly.dll")
+    metadata_path = os.path.join(
+        data_path, "il2cpp_data", "Metadata", "global-metadata.dat"
+    )
+    if not os.path.isfile(binary_path) or not os.path.isfile(metadata_path):
+        raise FileNotFoundError(
+            "IL2CPP requires GameAssembly.dll and global-metadata.dat."
+        )
+    resolved_dumper = _il2cpp_dumper_path(dumper_path)
+    resolved_cache_root = _il2cpp_cache_root(cache_root)
+    manifest = {
+        "format": _IL2CPP_CACHE_FORMAT,
+        "unity_version": str(unity_version),
+        "game_assembly_sha256": _sha256_file(binary_path),
+        "global_metadata_sha256": _sha256_file(metadata_path),
+        "dumper_sha256": _sha256_file(resolved_dumper),
+    }
+    cache_key = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    cache_dir = os.path.join(resolved_cache_root, cache_key)
+    if _dummy_cache_is_complete(cache_dir, manifest):
+        if log:
+            log(f"[generator] Reusing external IL2CPP cache: {cache_dir}")
+        return os.path.join(cache_dir, "DummyDll")
+
+    lock_path = os.path.join(resolved_cache_root, f"{cache_key}.lock")
+    lock_fd: int | None = None
+    deadline = time.monotonic() + 900.0
+    while lock_fd is None:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if _dummy_cache_is_complete(cache_dir, manifest):
+                return os.path.join(cache_dir, "DummyDll")
+            try:
+                lock_age = time.time() - os.path.getmtime(lock_path)
+            except OSError:
+                continue
+            if lock_age > 1800:
+                try:
+                    os.unlink(lock_path)
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for IL2CPP cache lock: {lock_path}"
+                )
+            time.sleep(0.25)
+
+    work_dir: str | None = None
+    try:
+        os.write(lock_fd, str(os.getpid()).encode("ascii"))
+        if _dummy_cache_is_complete(cache_dir, manifest):
+            return os.path.join(cache_dir, "DummyDll")
+        work_dir = tempfile.mkdtemp(
+            prefix=f"{cache_key}.building.",
+            dir=resolved_cache_root,
+        )
+        command = [
+            resolved_dumper,
+            os.path.abspath(binary_path),
+            os.path.abspath(metadata_path),
+            os.path.abspath(work_dir),
+        ]
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+        if log:
+            log(f"[generator] Building external IL2CPP cache: {work_dir}")
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            startupinfo=startupinfo,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if process.returncode != 0:
+            details = (process.stderr or process.stdout or "").strip()
+            raise RuntimeError(
+                f"Il2CppDumper failed with exit code {process.returncode}: "
+                f"{details[-4000:]}"
+            )
+        dummy_dir = os.path.join(work_dir, "DummyDll")
+        dll_names = (
+            sorted(name for name in os.listdir(dummy_dir) if name.lower().endswith(".dll"))
+            if os.path.isdir(dummy_dir)
+            else []
+        )
+        if not dll_names:
+            raise RuntimeError("Il2CppDumper completed without producing DummyDll files.")
+        with open(os.path.join(work_dir, "manifest.json"), "w", encoding="utf-8") as manifest_file:
+            json.dump(manifest, manifest_file, indent=2, sort_keys=True)
+        if os.path.isdir(cache_dir):
+            _safe_remove_cache_tree(cache_dir, resolved_cache_root)
+        os.replace(work_dir, cache_dir)
+        work_dir = None
+        return os.path.join(cache_dir, "DummyDll")
+    finally:
+        if work_dir and os.path.isdir(work_dir):
+            _safe_remove_cache_tree(work_dir, resolved_cache_root)
+        if lock_fd is not None:
+            os.close(lock_fd)
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+
+
+def _load_generator_dll_directory(
+    generator: TypeTreeGenerator,
+    dll_dir: str,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> int:
+    loaded = 0
+    failures: list[str] = []
+    for name in sorted(os.listdir(dll_dir)):
+        if not name.lower().endswith(".dll"):
+            continue
+        path = os.path.join(dll_dir, name)
+        try:
+            with open(path, "rb") as dll_file:
+                generator.load_dll(dll_file.read())
+            loaded += 1
+        except Exception as exc:
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+    if loaded == 0:
+        raise RuntimeError(
+            f"No type-tree DLL could be loaded from {dll_dir}: {failures[:5]}"
+        )
+    if failures and log:
+        log(
+            f"[generator] Loaded {loaded} DLL(s); "
+            f"{len(failures)} failed: {failures[:5]}"
+        )
+    return loaded
+
+
+def create_type_tree_generator(
+    unity_version: str,
+    game_path: str,
+    data_path: str,
+    compile_method: str,
+    *,
+    cache_root: str | None = None,
+    dumper_path: str | None = None,
+    log: Callable[[str], None] | None = None,
+) -> TypeTreeGenerator:
+    """Create a generator without ever placing DummyDll files in the game."""
+    generator = TypeTreeGenerator(unity_version)
+    if compile_method == "Mono":
+        managed_dir = os.path.join(data_path, "Managed")
+        if not os.path.isdir(managed_dir):
+            raise FileNotFoundError(f"Managed directory not found: {managed_dir}")
+        _load_generator_dll_directory(generator, managed_dir, log=log)
+        return generator
+
+    dummy_dir = _ensure_il2cpp_dummy_dlls(
+        unity_version,
+        game_path,
+        data_path,
+        cache_root=cache_root,
+        dumper_path=dumper_path,
+        log=log,
+    )
+    loaded = _load_generator_dll_directory(generator, dummy_dir, log=log)
+    if log:
+        log(f"[generator] Loaded {loaded} external IL2CPP DummyDll file(s).")
+    return generator
 
 
 def _version_tuple(value: Any) -> tuple[int, int, int]:
@@ -259,6 +520,7 @@ __all__ = [
     "UnityPy",
     "cleanup_unitypy_environments",
     "close_unitypy_env",
+    "create_type_tree_generator",
     "load_unitypy",
     "missing_low_memory_features",
     "require_low_memory_unitypy",

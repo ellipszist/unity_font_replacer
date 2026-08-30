@@ -39,6 +39,7 @@ import inspect
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -56,6 +57,11 @@ from functools import lru_cache, wraps
 from typing import Any, Callable, Iterable, Literal, NoReturn, cast
 
 from PIL import Image, ImageOps
+from addressables_catalog import (
+    find_addressables_catalogs,
+    patch_addressables_catalog_bytes,
+    validate_local_addressables_bundle_load,
+)
 from asset_validation import (
     _collect_validation_inner_names,
     _structural_validate_unityfs_bundle,
@@ -97,6 +103,7 @@ from scan_worker_pool import (
 )
 from tmp_font_schema import (
     _TMP_CREATION_SETTINGS_KEYS as _TMP_CREATION_SETTINGS_KEYS,
+    _all_valid_atlas_refs,
     _atlas_ref_ids,
     _best_atlas_ref,
     _get_tmp_material_reference,
@@ -119,11 +126,13 @@ from unitypy_runtime import (
     UnityPy,
     cleanup_unitypy_environments,
     close_unitypy_env,
+    create_type_tree_generator,
     load_unitypy,
     missing_low_memory_features,
 )
 from UnityPy.files.replacers import Replacer
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
+from UnityPy.streams import EndianBinaryWriter
 
 try:
     from fontTools.ttLib import TTFont
@@ -256,60 +265,6 @@ _NEW_LINE_METRIC_SCALE_KEYS = (
     "m_StrikethroughOffset",
     "m_StrikethroughThickness",
     "m_TabWidth",
-)
-# KR: 머티리얼 패딩 스케일 키: 아틀라스 크기 변경 시 비례 보정이 필요한 셰이더 프로퍼티
-# EN: Material padding scale keys: shader properties needing proportional correction on atlas size change
-_MATERIAL_PADDING_SCALE_KEYS = (
-    "_GradientScale",
-    "_FaceDilate",
-    "_OutlineWidth",
-    "_OutlineSoftness",
-    "_UnderlayDilate",
-    "_UnderlaySoftness",
-    "_UnderlayOffsetX",
-    "_UnderlayOffsetY",
-    "_GlowOffset",
-    "_GlowInner",
-    "_GlowOuter",
-)
-# KR: 머티리얼 스타일 float 키: 원본 머티리얼의 시각적 스타일을 보존해야 하는 프로퍼티
-# EN: Material style float keys: properties that must preserve the original material visual style
-_MATERIAL_STYLE_FLOAT_KEYS = (
-    "_FaceDilate",
-    "_OutlineWidth",
-    "_OutlineSoftness",
-    "_UnderlayDilate",
-    "_UnderlaySoftness",
-    "_UnderlayOffsetX",
-    "_UnderlayOffsetY",
-    "_GlowOffset",
-    "_GlowInner",
-    "_GlowOuter",
-    "_ScaleRatioA",
-    "_ScaleRatioB",
-    "_ScaleRatioC",
-)
-# KR: 머티리얼 스타일에서 패딩 스케일 보정이 필요한 키
-# EN: Material style keys needing padding scale correction
-_MATERIAL_STYLE_PADDING_SCALE_KEYS = (
-    "_FaceDilate",
-    "_OutlineWidth",
-    "_OutlineSoftness",
-    "_UnderlayDilate",
-    "_UnderlaySoftness",
-    "_UnderlayOffsetX",
-    "_UnderlayOffsetY",
-    "_GlowOffset",
-    "_GlowInner",
-    "_GlowOuter",
-)
-# KR: 머티리얼 스타일 색상 키: 원본에서 보존해야 하는 색상 프로퍼티
-# EN: Material style color keys: color properties to preserve from original
-_MATERIAL_STYLE_COLOR_KEYS = (
-    "_FaceColor",
-    "_OutlineColor",
-    "_UnderlayColor",
-    "_GlowColor",
 )
 # KR: 외곽선 비율 보정 대상 키
 # EN: Outline ratio correction target keys
@@ -784,6 +739,113 @@ def prepare_output_only_dependencies(
             _log_console(
                 f"Prepared output-only dependencies: {len(copied)} ({', '.join(copied)})"
             )
+
+
+def _update_addressables_catalogs_for_modified_bundles(
+    *,
+    data_path: str,
+    output_only_root: str | None,
+    modified_asset_keys: set[str],
+    asset_path_by_key: dict[str, str],
+    transaction: _DeferredPatchTransaction | None,
+) -> list[str]:
+    """Patch local catalog CRC/size records for modified Addressables bundles."""
+    bundle_sizes: dict[str, int] = {}
+    for asset_key in modified_asset_keys:
+        source_path = asset_path_by_key.get(asset_key)
+        if not source_path:
+            continue
+        try:
+            relative_path = os.path.relpath(source_path, data_path).replace("\\", "/")
+        except ValueError:
+            continue
+        if not relative_path.casefold().startswith("streamingassets/aa/"):
+            continue
+        if _read_bundle_signature(source_path, BUNDLE_SIGNATURES) not in BUNDLE_SIGNATURES:
+            continue
+        saved_path = (
+            resolve_output_only_path(source_path, data_path, output_only_root)
+            if output_only_root
+            else source_path
+        )
+        if not os.path.isfile(saved_path):
+            raise FileNotFoundError(
+                f"modified Addressables bundle is missing: {saved_path}"
+            )
+        bundle_name = os.path.basename(source_path).casefold()
+        bundle_size = os.path.getsize(saved_path)
+        previous_size = bundle_sizes.get(bundle_name)
+        if previous_size is not None and previous_size != bundle_size:
+            raise ValueError(
+                f"duplicate Addressables bundle name has conflicting sizes: {bundle_name}"
+            )
+        bundle_sizes[bundle_name] = bundle_size
+
+    if not bundle_sizes:
+        return []
+
+    matched_names: set[str] = set()
+    changed_catalogs: list[str] = []
+    for source_catalog in find_addressables_catalogs(data_path):
+        with open(source_catalog, "rb") as stream:
+            original_catalog = stream.read()
+        patched_catalog, patched_names = patch_addressables_catalog_bytes(
+            original_catalog,
+            bundle_sizes,
+        )
+        if patched_names:
+            validate_local_addressables_bundle_load(
+                source_catalog,
+                original_catalog,
+                patched_names,
+            )
+        matched_names.update(name.casefold() for name in patched_names)
+        if patched_catalog == original_catalog:
+            continue
+
+        destination_catalog = (
+            resolve_output_only_path(source_catalog, data_path, output_only_root)
+            if output_only_root
+            else source_catalog
+        )
+        destination_parent = os.path.dirname(destination_catalog)
+        if destination_parent:
+            os.makedirs(destination_parent, exist_ok=True)
+        if transaction is not None:
+            transaction.backup(
+                destination_catalog,
+                allow_missing=bool(output_only_root),
+                replace_only=not bool(output_only_root),
+            )
+        fd, staged_catalog = tempfile.mkstemp(
+            prefix=f".{os.path.basename(destination_catalog)}.",
+            suffix=".patched.tmp",
+            dir=destination_parent or None,
+        )
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                fd = -1
+                stream.write(patched_catalog)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _atomic_replace_validated_file(staged_catalog, destination_catalog)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.remove(staged_catalog)
+            except OSError:
+                pass
+            raise
+        changed_catalogs.append(source_catalog)
+
+    unmatched_names = sorted(bundle_sizes.keys() - matched_names)
+    if unmatched_names:
+        raise RuntimeError(
+            "Addressables catalog record not found for modified bundle(s): "
+            + ", ".join(unmatched_names)
+        )
+    return changed_catalogs
 
 
 def register_temp_dir_for_cleanup(path: str) -> str:
@@ -2115,7 +2177,79 @@ def _build_asset_file_index(
         "basename_to_keys": basename_to_keys,
         "relpath_by_key": relpath_by_key,
         "basename_by_key": basename_by_key,
+        # Populated lazily only when an external CAB name cannot be resolved
+        # from outer filenames. Addressables commonly name the outer bundle by
+        # a content hash while PPtr externals refer to its inner CAB name.
+        "internal_name_to_keys": {},
+        "internal_name_index_complete": False,
     }
+
+
+def _ensure_internal_asset_name_index(asset_file_index: dict[str, Any]) -> None:
+    """Index inner SerializedFile names for hash-named AssetBundles once."""
+    if bool(asset_file_index.get("internal_name_index_complete")):
+        return
+
+    path_by_key = cast(dict[str, str], asset_file_index.get("path_by_key", {}))
+    internal_name_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.setdefault("internal_name_to_keys", {}),
+    )
+
+    for outer_key, outer_path in path_by_key.items():
+        if _read_bundle_signature(outer_path, BUNDLE_SIGNATURES) not in BUNDLE_SIGNATURES:
+            continue
+        env = None
+        try:
+            env = load_unitypy(outer_path)
+            roots = getattr(env, "files", None)
+            stack = list(roots.values()) if isinstance(roots, dict) else []
+            primary = getattr(env, "file", None)
+            if primary is not None:
+                stack.append(primary)
+            seen_items: set[int] = set()
+            seen_names: set[str] = set()
+            while stack:
+                item = stack.pop()
+                if item is None or id(item) in seen_items:
+                    continue
+                seen_items.add(id(item))
+                item_name = _normalize_assets_basename(getattr(item, "name", None))
+                if item_name:
+                    normalized_name = item_name.lower()
+                    if normalized_name not in seen_names:
+                        seen_names.add(normalized_name)
+                        keys = internal_name_to_keys.setdefault(normalized_name, [])
+                        if outer_key not in keys:
+                            keys.append(outer_key)
+                children = getattr(item, "files", None)
+                if isinstance(children, dict):
+                    for child_name, child in children.items():
+                        normalized_child = _normalize_assets_basename(child_name)
+                        if normalized_child:
+                            lowered_child = normalized_child.lower()
+                            if lowered_child not in seen_names:
+                                seen_names.add(lowered_child)
+                                keys = internal_name_to_keys.setdefault(
+                                    lowered_child,
+                                    [],
+                                )
+                                if outer_key not in keys:
+                                    keys.append(outer_key)
+                        stack.append(child)
+        except Exception as exc:
+            _log_debug(
+                f"[asset_index] inner-name scan failed: path={outer_path} "
+                f"error={type(exc).__name__}: {exc}"
+            )
+        finally:
+            close_unitypy_env(env)
+            env = None
+            gc.collect()
+
+    for keys in internal_name_to_keys.values():
+        keys.sort()
+    asset_file_index["internal_name_index_complete"] = True
 
 
 def _extract_external_assets_name(external_ref: Any) -> str | None:
@@ -2269,12 +2403,8 @@ def _resolve_target_assets_name(
     return _resolve_assets_name_from_file_id(source_assets_file, resolved_file_id)
 
 
-def _resolve_material_main_texture_key(
-    source_assets_file: Any,
-    current_assets_name: str,
-    material: Any,
-) -> str | None:
-    """Resolve a Material's _MainTex reference across asset files."""
+def _material_main_texture_ref(material: Any) -> tuple[int, int] | None:
+    """Read a Material's serialized _MainTex PPtr without dereferencing it."""
     saved_props = getattr(material, "m_SavedProperties", None)
     tex_envs = getattr(saved_props, "m_TexEnvs", None)
     if not isinstance(tex_envs, list):
@@ -2298,17 +2428,178 @@ def _resolve_material_main_texture_key(
         else:
             file_id = int(getattr(tex_ref, "m_FileID", 0) or 0)
             path_id = int(getattr(tex_ref, "m_PathID", 0) or 0)
-        if path_id <= 0:
-            return None
-        target_assets_name = _resolve_target_assets_name(
+        return file_id, path_id
+    return None
+
+
+def _set_material_main_texture_ref(
+    material: Any,
+    file_id: int,
+    path_id: int,
+) -> bool:
+    """Retarget a serialized _MainTex PPtr while preserving its container shape."""
+    saved_props = getattr(material, "m_SavedProperties", None)
+    tex_envs = getattr(saved_props, "m_TexEnvs", None)
+    if not isinstance(tex_envs, list):
+        return False
+    for entry in tex_envs:
+        if not (
+            isinstance(entry, (list, tuple))
+            and len(entry) >= 2
+            and str(entry[0]) == "_MainTex"
+        ):
+            continue
+        tex_env = entry[1]
+        tex_ref = (
+            tex_env.get("m_Texture")
+            if isinstance(tex_env, dict)
+            else getattr(tex_env, "m_Texture", None)
+        )
+        if isinstance(tex_ref, dict):
+            old_ref = (
+                int(tex_ref.get("m_FileID", 0) or 0),
+                int(tex_ref.get("m_PathID", 0) or 0),
+            )
+            tex_ref["m_FileID"] = int(file_id)
+            tex_ref["m_PathID"] = int(path_id)
+            return old_ref != (int(file_id), int(path_id))
+        if tex_ref is not None:
+            old_ref = (
+                int(getattr(tex_ref, "m_FileID", 0) or 0),
+                int(getattr(tex_ref, "m_PathID", 0) or 0),
+            )
+            setattr(tex_ref, "m_FileID", int(file_id))
+            setattr(tex_ref, "m_PathID", int(path_id))
+            return old_ref != (int(file_id), int(path_id))
+        return False
+    return False
+
+
+def _find_pptr_file_id_for_target(
+    source_assets_file: Any,
+    current_file_key: str,
+    target_outer_file_key: str,
+    target_assets_name: str,
+    *,
+    source_bundle_signature: str | None,
+    asset_file_index: dict[str, Any] | None,
+) -> int | None:
+    """Find an existing FileID that addresses an exact outer/inner file pair."""
+    normalized_target_outer = (
+        _normalize_asset_file_key(target_outer_file_key) or target_outer_file_key
+    )
+    current_assets_name = _normalize_assets_basename(
+        getattr(source_assets_file, "name", "")
+    )
+    if (
+        (_normalize_asset_file_key(current_file_key) or current_file_key)
+        == normalized_target_outer
+        and current_assets_name
+        and current_assets_name.lower()
+        == str(target_assets_name).lower()
+    ):
+        return 0
+
+    externals = getattr(source_assets_file, "externals", None)
+    if externals is None:
+        externals = getattr(source_assets_file, "m_Externals", None)
+    if not isinstance(externals, (list, tuple)):
+        return None
+    for file_id in range(1, len(externals) + 1):
+        candidate_assets_name = _resolve_assets_name_from_file_id(
             source_assets_file,
-            current_assets_name,
             file_id,
         )
-        if not target_assets_name:
-            return None
-        return _make_assets_object_key(target_assets_name, path_id)
+        if not candidate_assets_name or (
+            candidate_assets_name.lower() != str(target_assets_name).lower()
+        ):
+            continue
+        candidate_outer = _resolve_target_outer_file_key(
+            current_file_key,
+            source_assets_file,
+            file_id,
+            candidate_assets_name,
+            source_bundle_signature=source_bundle_signature,
+            asset_file_index=asset_file_index,
+        )
+        if (
+            candidate_outer
+            and (_normalize_asset_file_key(candidate_outer) or candidate_outer)
+            == normalized_target_outer
+        ):
+            return file_id
     return None
+
+
+def _resolve_material_main_texture_key(
+    source_assets_file: Any,
+    current_assets_name: str,
+    material: Any,
+) -> str | None:
+    """Resolve a Material's _MainTex reference across asset files."""
+    ref = _material_main_texture_ref(material)
+    if ref is None:
+        return None
+    file_id, path_id = ref
+    if path_id == 0:
+        return None
+    target_assets_name = _resolve_target_assets_name(
+        source_assets_file,
+        current_assets_name,
+        file_id,
+    )
+    if not target_assets_name:
+        return None
+    return _make_assets_object_key(target_assets_name, path_id)
+
+
+def _make_outer_assets_object_key(
+    outer_file_key: str,
+    assets_name: str,
+    path_id: int,
+) -> str:
+    normalized_outer = _normalize_asset_file_key(outer_file_key) or str(outer_file_key)
+    return f"{normalized_outer}|{_make_assets_object_key(assets_name, path_id)}"
+
+
+def _resolve_material_main_texture_identity(
+    source_assets_file: Any,
+    current_assets_name: str,
+    current_file_key: str,
+    material: Any,
+    *,
+    source_bundle_signature: str | None,
+    asset_file_index: dict[str, Any] | None,
+) -> str | None:
+    """Resolve _MainTex as (outer file, SerializedFile, signed PathID)."""
+    ref = _material_main_texture_ref(material)
+    if ref is None:
+        return None
+    file_id, path_id = ref
+    if path_id == 0:
+        return None
+    target_assets_name = _resolve_target_assets_name(
+        source_assets_file,
+        current_assets_name,
+        file_id,
+    )
+    if not target_assets_name:
+        return None
+    target_outer_key = _resolve_target_outer_file_key(
+        current_file_key,
+        source_assets_file,
+        file_id,
+        target_assets_name,
+        source_bundle_signature=source_bundle_signature,
+        asset_file_index=asset_file_index,
+    )
+    if not target_outer_key:
+        return None
+    return _make_outer_assets_object_key(
+        target_outer_key,
+        target_assets_name,
+        path_id,
+    )
 
 
 def _collect_asset_file_index_matches(
@@ -2360,6 +2651,15 @@ def _collect_asset_file_index_matches(
     for match_key in basename_to_keys.get(basename, []):
         _append_match(match_key)
 
+    if not matches:
+        _ensure_internal_asset_name_index(asset_file_index)
+        internal_name_to_keys = cast(
+            dict[str, list[str]],
+            asset_file_index.get("internal_name_to_keys", {}),
+        )
+        for match_key in internal_name_to_keys.get(basename, []):
+            _append_match(match_key)
+
     return matches
 
 
@@ -2370,8 +2670,8 @@ def _choose_asset_file_match(
     current_file_key: str | None,
     reference_desc: str,
 ) -> str | None:
-    """KR: 여러 일치 항목 중 하나를 선택합니다. 같은 디렉토리의 형제 파일을 우선하고, 모호하면 정렬 후 첫 번째를 사용합니다.
-    EN: Selects one match from multiple candidates. Prefers sibling files in the same directory; if ambiguous, sorts and uses the first.
+    """KR: 여러 일치 항목 중 하나를 선택합니다. 같은 디렉토리의 유일한 형제 파일만 허용하며, 모호한 경우 안전하게 거부합니다.
+    EN: Selects one match from multiple candidates. Only a unique sibling is accepted; ambiguous matches are rejected safely.
     """
     if not matches:
         return None
@@ -2389,12 +2689,11 @@ def _choose_asset_file_match(
             ]
             if len(sibling_matches) == 1:
                 return sibling_matches[0]
-    chosen = sorted(matches)[0]
     _log_warning(
         f"[asset_path_ambiguous] reference={reference_desc} match_count={len(matches)} "
-        f"using_first={chosen}"
+        "skipped=True"
     )
-    return chosen
+    return None
 
 
 def _resolve_target_outer_file_key(
@@ -2462,6 +2761,216 @@ def _resolve_target_outer_file_key(
         if chosen:
             return chosen
     return None
+
+
+def _validate_shared_atlas_owner_records(records: list[JsonDict]) -> None:
+    """Reject partial or conflicting replacement of FontAssets sharing an atlas."""
+    selected_lookup_matches: dict[tuple[str, str, str, int], set[str]] = {}
+    owners_by_atlas: dict[str, list[JsonDict]] = {}
+
+    for record in records:
+        atlas_identity = str(record.get("atlas_identity", ""))
+        owner_identity = str(record.get("owner_identity", ""))
+        if not atlas_identity or not owner_identity:
+            continue
+        owners_by_atlas.setdefault(atlas_identity, []).append(record)
+
+        replacement_font = str(record.get("replacement_font", "")).strip()
+        lookup_key = record.get("lookup_key")
+        if replacement_font and isinstance(lookup_key, tuple) and len(lookup_key) == 4:
+            selected_lookup_matches.setdefault(lookup_key, set()).add(owner_identity)
+
+    ambiguous_targets = [
+        (lookup_key, owner_ids)
+        for lookup_key, owner_ids in selected_lookup_matches.items()
+        if len(owner_ids) > 1
+    ]
+    if ambiguous_targets:
+        lookup_key, owner_ids = ambiguous_targets[0]
+        raise ValueError(
+            "An SDF replacement target matches multiple outer asset files: "
+            f"{lookup_key!r} -> {sorted(owner_ids)}. Use an unambiguous asset file."
+        )
+
+    for atlas_identity, atlas_records in owners_by_atlas.items():
+        selected = [
+            record
+            for record in atlas_records
+            if str(record.get("replacement_font", "")).strip()
+        ]
+        if not selected:
+            continue
+
+        unselected = [
+            record
+            for record in atlas_records
+            if not str(record.get("replacement_font", "")).strip()
+        ]
+        if unselected:
+            selected_labels = sorted(
+                {str(record.get("owner_label", "")) for record in selected}
+            )
+            unselected_labels = sorted(
+                {str(record.get("owner_label", "")) for record in unselected}
+            )
+            raise ValueError(
+                "Unsafe partial replacement: the atlas is shared by selected and "
+                f"unselected TMP FontAssets ({atlas_identity}). Selected: "
+                f"{selected_labels}; unselected: {unselected_labels}. Select every "
+                "owner of the shared atlas or leave all of them unchanged."
+            )
+
+        replacement_names = {
+            str(record.get("replacement_font", "")).strip().casefold()
+            for record in selected
+        }
+        if len(replacement_names) > 1:
+            owner_targets = sorted(
+                {
+                    f"{record.get('owner_label', '')} -> "
+                    f"{str(record.get('replacement_font', '')).strip()}"
+                    for record in selected
+                }
+            )
+            raise ValueError(
+                "TMP FontAssets sharing one atlas cannot be replaced with different "
+                f"fonts ({atlas_identity}): {owner_targets}"
+            )
+
+
+def _preflight_shared_atlas_owners(
+    all_assets_files: list[str],
+    replacement_lookup: dict[tuple[str, str, str, int], str],
+    generator: TypeTreeGenerator | None,
+    asset_file_index: dict[str, Any],
+) -> None:
+    """Read every TMP FontAsset and validate exact outer/CAB/PathID atlas ownership."""
+    sdf_replacements = {
+        key: value
+        for key, value in replacement_lookup.items()
+        if len(key) == 4 and key[0] == "SDF" and str(value).strip()
+    }
+    if not sdf_replacements:
+        return
+
+    records: list[JsonDict] = []
+    parse_failures: list[str] = []
+    for outer_path in all_assets_files:
+        outer_key = _normalize_asset_file_key(outer_path)
+        if not outer_key:
+            raise ValueError(f"Could not normalize asset path: {outer_path}")
+        source_signature = _read_bundle_signature(outer_path, BUNDLE_SIGNATURES)
+        env = None
+        try:
+            env = load_unitypy(outer_path)
+            env.typetree_generator = generator
+            for obj in env.objects:
+                if obj.type.name != "MonoBehaviour":
+                    continue
+                try:
+                    data = _safe_parse_as_dict(obj)
+                except Exception as exc:
+                    parse_failures.append(
+                        f"{outer_path}|{obj.assets_file.name}|{int(obj.path_id)} "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+                    continue
+
+                unity_hint = str(
+                    getattr(obj.assets_file, "unity_version", None) or ""
+                )
+                tmp_info = inspect_tmp_font_schema(
+                    data,
+                    unity_version=unity_hint or None,
+                )
+                if not tmp_info.get("is_tmp"):
+                    continue
+                if (
+                    data.get("spriteSheet") is not None
+                    or isinstance(data.get("m_SpriteCharacterTable"), list)
+                    or isinstance(data.get("m_SpriteGlyphTable"), list)
+                    or isinstance(data.get("spriteInfoList"), list)
+                ):
+                    continue
+
+                atlas_refs = _all_valid_atlas_refs(data)
+                if not atlas_refs:
+                    continue
+                assets_name = str(obj.assets_file.name)
+                path_id = int(obj.path_id)
+                lookup_key = (
+                    "SDF",
+                    os.path.basename(outer_path),
+                    assets_name,
+                    path_id,
+                )
+                replacement_font = sdf_replacements.get(lookup_key, "")
+                owner_identity = _make_outer_assets_object_key(
+                    outer_key,
+                    assets_name,
+                    path_id,
+                )
+                owner_label = (
+                    f"{os.path.basename(outer_path)}|{assets_name}|"
+                    f"{path_id}|{obj.peek_name()}"
+                )
+
+                for atlas_ref in atlas_refs:
+                    atlas_file_id, atlas_path_id = _atlas_ref_ids(atlas_ref)
+                    target_assets_name = _resolve_target_assets_name(
+                        obj.assets_file,
+                        assets_name,
+                        atlas_file_id,
+                    )
+                    target_outer_key = _resolve_target_outer_file_key(
+                        outer_key,
+                        obj.assets_file,
+                        atlas_file_id,
+                        target_assets_name,
+                        source_bundle_signature=source_signature,
+                        asset_file_index=asset_file_index,
+                    )
+                    if not target_assets_name or not target_outer_key:
+                        raise ValueError(
+                            "Could not resolve a TMP atlas reference during shared-owner "
+                            f"preflight: {owner_label} -> "
+                            f"{atlas_file_id}:{atlas_path_id}"
+                        )
+                    records.append(
+                        {
+                            "atlas_identity": _make_outer_assets_object_key(
+                                target_outer_key,
+                                target_assets_name,
+                                atlas_path_id,
+                            ),
+                            "owner_identity": owner_identity,
+                            "owner_label": owner_label,
+                            "lookup_key": lookup_key,
+                            "replacement_font": replacement_font,
+                        }
+                    )
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(
+                f"Could not scan TMP atlas owners in {outer_path}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        finally:
+            close_unitypy_env(env)
+            env = None
+            gc.collect()
+
+    if parse_failures:
+        preview = parse_failures[:5]
+        suffix = "" if len(parse_failures) <= 5 else f" (+{len(parse_failures) - 5} more)"
+        raise ValueError(
+            "Shared-atlas safety preflight could not parse every MonoBehaviour; "
+            "replacement was refused because an unseen TMP owner cannot be excluded: "
+            f"{preview}{suffix}"
+        )
+
+    _validate_shared_atlas_owner_records(records)
 
 
 def _make_assets_object_key(assets_name: str, path_id: int) -> str:
@@ -3031,6 +3540,472 @@ def _prune_material_saved_properties_for_raster(
     return True
 
 
+def _material_shader_keywords(material: Any) -> set[str]:
+    """Return the enabled shader keywords represented by serialized Material data."""
+    keywords: set[str] = set()
+    raw_keywords = getattr(material, "m_ShaderKeywords", None)
+    if isinstance(raw_keywords, str):
+        keywords.update(token for token in re.split(r"[\s,]+", raw_keywords) if token)
+    elif isinstance(raw_keywords, (list, tuple, set)):
+        keywords.update(str(token) for token in raw_keywords if str(token))
+
+    valid_keywords = getattr(material, "m_ValidKeywords", None)
+    if isinstance(valid_keywords, (list, tuple, set)):
+        keywords.update(str(token) for token in valid_keywords if str(token))
+    return keywords
+
+
+def _recompute_tmp_shader_scale_ratios(
+    material: Any,
+    float_props: list[Any],
+) -> bool:
+    """Mirror TMP_ShaderUtilities.UpdateShaderRatios for serialized values."""
+    float_values: dict[str, float] = {}
+    for entry in float_props:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        try:
+            value = float(entry[1])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            float_values[str(entry[0])] = value
+
+    # UpdateShaderRatios returns early unless the SDF shader exposes both.
+    if "_GradientScale" not in float_values or "_FaceDilate" not in float_values:
+        return False
+    scale = float_values["_GradientScale"]
+    if scale <= 0:
+        return False
+
+    ratios_enabled = "RATIOS_OFF" not in _material_shader_keywords(material)
+    face_dilate = float_values["_FaceDilate"]
+    outline_width = float_values.get("_OutlineWidth", 0.0)
+    outline_softness = float_values.get("_OutlineSoftness", 0.0)
+    weight = max(
+        float_values.get("_WeightNormal", 0.0),
+        float_values.get("_WeightBold", 0.0),
+    ) / 4.0
+    ratio_a_denominator = scale * max(
+        1.0,
+        weight + face_dilate + outline_width + outline_softness,
+    )
+    ratio_values = {
+        "_ScaleRatioA": (
+            (scale - 1.0) / ratio_a_denominator if ratios_enabled else 1.0
+        )
+    }
+
+    effect_range = (weight + face_dilate) * (scale - 1.0)
+    available_range = max(0.0, scale - 1.0 - effect_range)
+    if "_ScaleRatioB" in float_values:
+        glow_span = max(
+            1.0,
+            float_values.get("_GlowOffset", 0.0)
+            + float_values.get("_GlowOuter", 0.0),
+        )
+        ratio_values["_ScaleRatioB"] = (
+            available_range / (scale * glow_span) if ratios_enabled else 1.0
+        )
+    if "_ScaleRatioC" in float_values:
+        underlay_span = max(
+            1.0,
+            max(
+                abs(float_values.get("_UnderlayOffsetX", 0.0)),
+                abs(float_values.get("_UnderlayOffsetY", 0.0)),
+            )
+            + float_values.get("_UnderlayDilate", 0.0)
+            + float_values.get("_UnderlaySoftness", 0.0),
+        )
+        ratio_values["_ScaleRatioC"] = (
+            available_range / (scale * underlay_span) if ratios_enabled else 1.0
+        )
+
+    changed = False
+    for index, entry in enumerate(float_props):
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        property_name = str(entry[0])
+        if property_name not in ratio_values:
+            continue
+        new_value = float(ratio_values[property_name])
+        try:
+            old_value = float(entry[1])
+        except (TypeError, ValueError):
+            old_value = float("nan")
+        if not math.isfinite(old_value) or old_value != new_value:
+            float_props[index] = (property_name, new_value)
+            changed = True
+    return changed
+
+
+def _build_sdf_material_payload(
+    *,
+    atlas_width: int,
+    atlas_height: int,
+    material_data: Any,
+    replacement_is_sdf: bool,
+    force_raster: bool,
+    use_game_material: bool,
+    outline_ratio: float,
+    replacement_padding: float,
+    replacement_font: str,
+    source_entry: str,
+) -> JsonDict:
+    """Build one compatibility payload for a font's direct and preset Materials."""
+    preserve_game_style = bool(replacement_is_sdf and not force_raster)
+    apply_replacement_material = not use_game_material
+    float_overrides: dict[str, float] = {}
+    color_overrides: dict[str, JsonDict] = {}
+    replacement_gradient_scale: float | None = None
+
+    saved_properties = (
+        material_data.get("m_SavedProperties", {})
+        if isinstance(material_data, dict)
+        else {}
+    )
+    replacement_floats = (
+        saved_properties.get("m_Floats", [])
+        if isinstance(saved_properties, dict)
+        else []
+    )
+    replacement_colors = (
+        saved_properties.get("m_Colors", [])
+        if isinstance(saved_properties, dict)
+        else []
+    )
+
+    for prop in replacement_floats:
+        if not isinstance(prop, (list, tuple)) or len(prop) < 2:
+            continue
+        key = str(prop[0])
+        try:
+            value = float(prop[1])
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        if key == "_GradientScale":
+            replacement_gradient_scale = value
+            continue
+        if key in {"_TextureWidth", "_TextureHeight"}:
+            continue
+        if apply_replacement_material and not preserve_game_style:
+            float_overrides[key] = value
+
+    if apply_replacement_material and not preserve_game_style:
+        for prop in replacement_colors:
+            if not isinstance(prop, (list, tuple)) or len(prop) < 2:
+                continue
+            color_overrides[str(prop[0])] = _color_value_to_dict(
+                prop[1],
+                {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
+            )
+
+    gradient_scale: float | None = None
+    if replacement_is_sdf and not force_raster:
+        if replacement_gradient_scale is not None and replacement_gradient_scale > 0:
+            gradient_scale = replacement_gradient_scale
+        elif replacement_padding >= 0:
+            gradient_scale = float(replacement_padding + 1.0)
+
+    prune_raster_material = bool(force_raster and apply_replacement_material)
+    if prune_raster_material:
+        gradient_scale = 1.0
+
+    return {
+        "w": int(atlas_width),
+        "h": int(atlas_height),
+        "gs": gradient_scale,
+        "float_overrides": float_overrides,
+        "color_overrides": color_overrides,
+        "outline_ratio": float(outline_ratio),
+        "reset_keywords": prune_raster_material,
+        "prune_raster_material": prune_raster_material,
+        "preserve_game_style": preserve_game_style,
+        "recompute_shader_ratios": bool(replacement_is_sdf and not force_raster),
+        "replacement_padding": float(replacement_padding),
+        "replacement_font": replacement_font,
+        "source_entry": source_entry,
+    }
+
+
+def _reject_unsafe_raster_conversion(requested: bool) -> None:
+    """Refuse bitmap conversion until a compatible Material shader can be resolved."""
+    if not requested:
+        return
+    raise ValueError(
+        "Raster TMP replacement is unsafe without retargeting Material.m_Shader "
+        "to a compatible Bitmap shader. Use an SDF replacement instead."
+    )
+
+
+def _prepare_static_tmp_population(
+    data: dict[str, Any],
+    *,
+    allow_freeze: bool = False,
+) -> bool:
+    """Validate a static target or explicitly freeze a dynamic target."""
+    population_mode = 0
+    if "m_AtlasPopulationMode" in data:
+        raw_mode = data.get("m_AtlasPopulationMode")
+        try:
+            population_mode = int(raw_mode)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "TMP FontAsset has an unreadable atlas population mode; refusing "
+                "an unsafe replacement."
+            ) from exc
+    dynamic_os = parse_bool_flag(data.get("InternalDynamicOS"))
+    is_dynamic = population_mode != 0 or dynamic_os
+    if not is_dynamic:
+        return False
+    if not allow_freeze:
+        raise ValueError(
+            "Dynamic TMP FontAsset replacement requires explicit --freeze-dynamic "
+            "because the replacement is a baked static atlas."
+        )
+
+    if "m_AtlasPopulationMode" in data:
+        data["m_AtlasPopulationMode"] = 0
+    if "InternalDynamicOS" in data:
+        data["InternalDynamicOS"] = False
+    source_font = data.get("m_SourceFontFile")
+    if isinstance(source_font, dict):
+        source_font["m_FileID"] = 0
+        source_font["m_PathID"] = 0
+    return True
+
+
+def _validate_replacement_sdf_assets(
+    sdf_data: JsonDict,
+    atlas: Image.Image,
+) -> None:
+    """Validate replacement metadata and atlas as one fail-closed unit."""
+
+    def exact_int(value: Any, label: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{label} must be an integer")
+        try:
+            result = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{label} must be an integer") from exc
+        if isinstance(value, float) and (
+            not math.isfinite(value) or not value.is_integer()
+        ):
+            raise ValueError(f"{label} must be an exact integer")
+        return result
+
+    def validate_rect(record: Any, label: str, width: int, height: int) -> None:
+        if not isinstance(record, dict):
+            raise ValueError(f"{label} must be an object")
+        try:
+            x = exact_int(record["m_X"], f"{label}.m_X")
+            y = exact_int(record["m_Y"], f"{label}.m_Y")
+            rect_width = exact_int(record["m_Width"], f"{label}.m_Width")
+            rect_height = exact_int(record["m_Height"], f"{label}.m_Height")
+        except KeyError as exc:
+            raise ValueError(f"{label} is missing {exc.args[0]}") from exc
+        if (
+            x < 0
+            or y < 0
+            or rect_width < 0
+            or rect_height < 0
+            or x + rect_width > width
+            or y + rect_height > height
+        ):
+            raise ValueError(
+                f"{label} lies outside the {width}x{height} replacement atlas"
+            )
+
+    if not isinstance(sdf_data, dict) or not isinstance(atlas, Image.Image):
+        raise ValueError("Replacement SDF metadata and atlas image are required")
+    atlas_width = exact_int(sdf_data.get("m_AtlasWidth"), "m_AtlasWidth")
+    atlas_height = exact_int(sdf_data.get("m_AtlasHeight"), "m_AtlasHeight")
+    atlas_padding = exact_int(sdf_data.get("m_AtlasPadding"), "m_AtlasPadding")
+    if atlas_width <= 0 or atlas_height <= 0:
+        raise ValueError("Replacement SDF atlas dimensions must be positive")
+    if (atlas_width, atlas_height) != tuple(map(int, atlas.size)):
+        raise ValueError(
+            "Replacement SDF JSON dimensions do not match its PNG atlas: "
+            f"JSON={atlas_width}x{atlas_height}, PNG={atlas.width}x{atlas.height}"
+        )
+    if atlas_padding <= 0 or atlas_padding >= min(atlas_width, atlas_height):
+        raise ValueError("Replacement SDF atlas padding is invalid")
+    if not isinstance(sdf_data.get("m_FaceInfo"), dict):
+        raise ValueError("Replacement SDF metadata is missing m_FaceInfo")
+
+    glyph_table = sdf_data.get("m_GlyphTable")
+    character_table = sdf_data.get("m_CharacterTable")
+    if not isinstance(glyph_table, list) or not glyph_table:
+        raise ValueError("Replacement SDF metadata has no glyph table")
+    if not isinstance(character_table, list) or not character_table:
+        raise ValueError("Replacement SDF metadata has no character table")
+
+    glyph_indexes: set[int] = set()
+    for index, glyph in enumerate(glyph_table):
+        label = f"m_GlyphTable[{index}]"
+        if not isinstance(glyph, dict):
+            raise ValueError(f"{label} must be an object")
+        try:
+            glyph_index = exact_int(glyph["m_Index"], f"{label}.m_Index")
+        except KeyError as exc:
+            raise ValueError(f"{label} is missing m_Index") from exc
+        if glyph_index < 0 or glyph_index in glyph_indexes:
+            raise ValueError(f"{label} has an invalid or duplicate glyph index")
+        glyph_indexes.add(glyph_index)
+        atlas_index = exact_int(
+            glyph.get("m_AtlasIndex", 0),
+            f"{label}.m_AtlasIndex",
+        )
+        if atlas_index != 0:
+            raise ValueError(
+                "Multi-atlas replacement data is not supported; "
+                f"{label}.m_AtlasIndex={atlas_index}"
+            )
+        validate_rect(
+            glyph.get("m_GlyphRect"),
+            f"{label}.m_GlyphRect",
+            atlas_width,
+            atlas_height,
+        )
+
+    for index, character in enumerate(character_table):
+        label = f"m_CharacterTable[{index}]"
+        if not isinstance(character, dict):
+            raise ValueError(f"{label} must be an object")
+        try:
+            unicode_value = exact_int(character["m_Unicode"], f"{label}.m_Unicode")
+            glyph_index = exact_int(
+                character["m_GlyphIndex"],
+                f"{label}.m_GlyphIndex",
+            )
+        except KeyError as exc:
+            raise ValueError(f"{label} is missing {exc.args[0]}") from exc
+        if not (0 <= unicode_value <= 0x10FFFF):
+            raise ValueError(f"{label}.m_Unicode is outside the Unicode range")
+        if glyph_index not in glyph_indexes:
+            raise ValueError(
+                f"{label} references missing glyph index {glyph_index}"
+            )
+
+    for table_name in ("m_UsedGlyphRects", "m_FreeGlyphRects"):
+        rects = sdf_data.get(table_name)
+        if rects is None:
+            continue
+        if not isinstance(rects, list):
+            raise ValueError(f"{table_name} must be a list")
+        for index, rect in enumerate(rects):
+            validate_rect(
+                rect,
+                f"{table_name}[{index}]",
+                atlas_width,
+                atlas_height,
+            )
+
+
+def _detect_tmp_font_render_family(data: JsonDict) -> str | None:
+    """Classify serialized TMP render metadata without relying on package version."""
+    # TMP 1.4 can keep the legacy creation-settings enum (6/7) after its
+    # runtime atlas mode has migrated to the newer bit-mask enum. The runtime
+    # field is authoritative whenever it exists.
+    if "m_AtlasRenderMode" in data:
+        try:
+            atlas_render_mode = int(data.get("m_AtlasRenderMode", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if atlas_render_mode < 0:
+            return None
+
+        # Some pre-TextCore or incompletely migrated TMP assets serialize the
+        # old small RenderMode enum in this field instead of FontEngine flags.
+        if atlas_render_mode in (0, 1, 2, 3):
+            return "bitmap"
+        if atlas_render_mode in (6, 7):
+            return "sdf"
+
+        # GlyphRenderMode is assembled from FontEngine raster-mode flags.
+        # 0x1000 is the 1x sampling flag shared by both bitmap and SDF modes,
+        # so it cannot identify the render family. Unity versions use 0x10
+        # for bitmap and 0x20/0x40 (plus newer MSDF variants) for distance
+        # fields. For example, RASTER=0x1016, legacy SDF16=0x4026,
+        # current SDF16=0x402A, and SDFAA_HINTED=0x1049.
+        bitmap_signal = bool(atlas_render_mode & 0x0010)
+        sdf_signal = bool(atlas_render_mode & 0x0360)
+        if bitmap_signal and sdf_signal:
+            return "conflict"
+        if sdf_signal:
+            return "sdf"
+        if bitmap_signal:
+            return "bitmap"
+        return None
+
+    legacy_signals: set[str] = set()
+    for key, value in data.items():
+        if key.replace("_", "").lower() != "fontassettype":
+            continue
+        try:
+            font_asset_type = int(value)
+        except (TypeError, ValueError):
+            continue
+        if font_asset_type == 1:
+            legacy_signals.add("sdf")
+        elif font_asset_type == 2:
+            legacy_signals.add("bitmap")
+
+    if legacy_signals:
+        if len(legacy_signals) > 1:
+            return "conflict"
+        return next(iter(legacy_signals))
+
+    creation_key = _resolve_creation_settings_key(data)
+    creation_settings = data.get(creation_key) if creation_key else None
+    if isinstance(creation_settings, dict):
+        for key, value in creation_settings.items():
+            if not key.replace("_", "").lower().endswith("rendermode"):
+                continue
+            try:
+                creation_render_mode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if creation_render_mode in (6, 7):
+                legacy_signals.add("sdf")
+            elif creation_render_mode in (0, 1, 2, 3):
+                legacy_signals.add("bitmap")
+
+    if len(legacy_signals) > 1:
+        return "conflict"
+    return next(iter(legacy_signals), None)
+
+
+def _has_tmp_sdf_shader_signature(saved_props: Any) -> bool:
+    """Match the shader properties TMP itself uses to identify SDF Materials."""
+    float_props = getattr(saved_props, "m_Floats", None)
+    if not isinstance(float_props, list):
+        return False
+    names = {
+        str(entry[0])
+        for entry in float_props
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2
+    }
+    return "_GradientScale" in names and "_WeightNormal" in names
+
+
+def _has_tmp_material_signature(saved_props: Any) -> bool:
+    float_props = getattr(saved_props, "m_Floats", None)
+    if not isinstance(float_props, list):
+        return False
+    names = {
+        str(entry[0])
+        for entry in float_props
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2
+    }
+    return bool(
+        {"_GradientScale", "_TextureWidth", "_TextureHeight"}.issubset(names)
+        and names & {"_WeightNormal", "_FaceDilate", "_ScaleRatioA"}
+    )
+
+
 def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -> bool:
     """KR: 머티리얼 교체 정보를 파싱된 객체에 적용합니다. float/color 오버라이드, 외곽선 비율, 스타일 보존 등을 처리합니다.
     EN: Applies material replacement info to the parsed object. Handles float/color overrides, outline ratio, style preservation, etc.
@@ -3052,14 +4027,8 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
         outline_ratio = 1.0
     outline_fallback_used = False
     preserve_game_style = bool(mat_info.get("preserve_game_style", False))
-    try:
-        style_padding_scale_ratio = float(mat_info.get("style_padding_scale_ratio", 1.0))
-    except Exception:
-        style_padding_scale_ratio = 1.0
-    if style_padding_scale_ratio <= 0:
-        style_padding_scale_ratio = 1.0
     prune_raster_material = bool(mat_info.get("prune_raster_material", False))
-    replacement_padding = float(mat_info.get("replacement_padding", 0) or 0)
+    recompute_shader_ratios = bool(mat_info.get("recompute_shader_ratios", False))
     gradient_scale = mat_info.get("gs")
     texture_h_raw = mat_info.get("h")
     texture_w_raw = mat_info.get("w")
@@ -3074,6 +4043,10 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
 
     saved_props = getattr(parse_dict, "m_SavedProperties", None)
     if saved_props is None:
+        return False
+    if bool(mat_info.get("require_tmp_signature", False)) and not _has_tmp_material_signature(
+        saved_props
+    ):
         return False
 
     if prune_raster_material:
@@ -3101,14 +4074,14 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                 prop_name = str(entry[0])
                 if prop_name == "_GradientScale":
                     candidate: float | None = None
-                    if prop_name in float_overrides:
-                        try:
-                            candidate = float(float_overrides[prop_name])
-                        except Exception:
-                            candidate = None
-                    elif gradient_scale is not None:
+                    if gradient_scale is not None:
                         try:
                             candidate = float(gradient_scale)
+                        except Exception:
+                            candidate = None
+                    elif prop_name in float_overrides:
+                        try:
+                            candidate = float(float_overrides[prop_name])
                         except Exception:
                             candidate = None
                     if candidate is not None:
@@ -3119,16 +4092,24 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                         float_props[i] = ("_GradientScale", candidate)
                         has_gradient_scale = True
                         changed = True
-                elif preserve_game_style and prop_name in _MATERIAL_STYLE_FLOAT_KEYS:
+                elif prop_name == "_TextureHeight" and texture_h is not None:
+                    # KR: _TextureHeight는 실제 아틀라스 크기가 float_overrides보다 우선합니다.
+                    # EN: For _TextureHeight, the actual atlas size takes priority over float_overrides.
+                    float_props[i] = ("_TextureHeight", texture_h)
+                    has_texture_height = True
+                    changed = True
+                elif prop_name == "_TextureWidth" and texture_w is not None:
+                    float_props[i] = ("_TextureWidth", texture_w)
+                    has_texture_width = True
+                    changed = True
+                elif preserve_game_style:
                     candidate = existing_float_map.get(prop_name)
                     if candidate is None:
                         continue
-                    if prop_name in _MATERIAL_STYLE_PADDING_SCALE_KEYS:
-                        candidate = float(candidate * style_padding_scale_ratio)
                     if prop_name in _MATERIAL_OUTLINE_RATIO_KEYS:
                         candidate = float(candidate * outline_ratio)
-                    float_props[i] = (prop_name, float(candidate))
-                    changed = True
+                        float_props[i] = (prop_name, float(candidate))
+                        changed = True
                 elif prop_name in _MATERIAL_OUTLINE_RATIO_KEYS:
                     candidate: float | None = None
                     existing_value: float | None = None
@@ -3200,16 +4181,6 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                     if candidate is not None:
                         float_props[i] = (prop_name, float(candidate * outline_ratio))
                         changed = True
-                elif prop_name == "_TextureHeight" and texture_h is not None:
-                    # KR: _TextureHeight는 실제 아틀라스 크기가 float_overrides보다 우선합니다.
-                    # EN: For _TextureHeight, the actual atlas size takes priority over float_overrides.
-                    float_props[i] = ("_TextureHeight", texture_h)
-                    has_texture_height = True
-                    changed = True
-                elif prop_name == "_TextureWidth" and texture_w is not None:
-                    float_props[i] = ("_TextureWidth", texture_w)
-                    has_texture_width = True
-                    changed = True
                 elif prop_name in float_overrides:
                     float_props[i] = (prop_name, float(float_overrides[prop_name]))
                     changed = True
@@ -3229,26 +4200,11 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                 float_props.append(("_GradientScale", float(gradient_scale)))
                 changed = True
 
-            # KR: _ScaleRatioA를 교체 아틀라스의 padding/GradientScale로 재계산합니다.
-            # TMP에서 ScaleRatioA = padding / GradientScale이며, 이 값이 불일치하면 외곽선/그림자 크기가 틀어집니다.
-            # EN: Recalculates _ScaleRatioA using the replacement atlas padding/GradientScale.
-            # In TMP, ScaleRatioA = padding / GradientScale; mismatch causes incorrect outline/shadow sizes.
-            if replacement_padding > 0:
-                final_gs = None
-                for _fp in float_props:
-                    if isinstance(_fp, (list, tuple)) and len(_fp) >= 2 and _fp[0] == "_GradientScale":
-                        try:
-                            final_gs = float(_fp[1])
-                        except Exception:
-                            pass
-                        break
-                if final_gs and final_gs > 0:
-                    new_scale_ratio_a = replacement_padding / final_gs
-                    for k, fp in enumerate(float_props):
-                        if isinstance(fp, (list, tuple)) and len(fp) >= 2 and fp[0] == "_ScaleRatioA":
-                            float_props[k] = ("_ScaleRatioA", float(new_scale_ratio_a))
-                            changed = True
-                            break
+            if recompute_shader_ratios and _recompute_tmp_shader_scale_ratios(
+                parse_dict,
+                float_props,
+            ):
+                changed = True
 
             if outline_fallback_used:
                 logger.debug(
@@ -3260,7 +4216,7 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
         if isinstance(color_props, list) and color_overrides:
             for i in range(len(color_props)):
                 color_name = color_props[i][0]
-                if preserve_game_style and str(color_name) in _MATERIAL_STYLE_COLOR_KEYS:
+                if preserve_game_style:
                     continue
                 override = color_overrides.get(color_name)
                 if not isinstance(override, dict):
@@ -3362,10 +4318,17 @@ def get_compile_method(datapath: str) -> str:
     """KR: 데이터 폴더의 컴파일 방식을 Mono/Il2cpp로 판별합니다.
     EN: Determines the compile method (Mono/Il2cpp) of the data folder.
     """
-    if "Managed" in os.listdir(datapath):
-        return "Mono"
-    else:
+    metadata_path = os.path.join(
+        datapath, "il2cpp_data", "Metadata", "global-metadata.dat"
+    )
+    # global-metadata.dat is authoritative. Older releases of this tool put
+    # Il2CppDumper's DummyDll directory at <Game>_Data/Managed, so checking
+    # Managed first can permanently misclassify a real IL2CPP player as Mono.
+    if os.path.isfile(metadata_path):
         return "Il2cpp"
+    if os.path.isdir(os.path.join(datapath, "Managed")):
+        return "Mono"
+    return "Il2cpp"
 
 
 def _create_generator(
@@ -3374,35 +4337,29 @@ def _create_generator(
     data_path: str,
     compile_method: str,
     lang: Language = "ko",
+    cache_root: str | None = None,
 ) -> TypeTreeGenerator:
-    """KR: 타입트리 생성기를 구성하고 Mono/Il2cpp 메타데이터를 로드합니다.
-    EN: Configures the TypeTree generator and loads Mono/Il2cpp metadata.
+    """KR: Mono DLL 또는 외부 캐시 IL2CPP DummyDll로 타입트리를 구성합니다.
+    EN: Configure TypeTrees from Mono DLLs or externally cached IL2CPP DummyDlls.
     """
-    generator = TypeTreeGenerator(unity_version)
-    if compile_method == "Mono":
-        managed_dir = os.path.join(data_path, "Managed")
-        for fn in os.listdir(managed_dir):
-            if not fn.endswith(".dll"):
-                continue
-            try:
-                with open(os.path.join(managed_dir, fn), "rb") as f:
-                    generator.load_dll(f.read())
-            except Exception as e:
-                if lang == "ko":
-                    _log_console(f"[generator] DLL 로드 실패: {fn} ({e})")
-                else:
-                    _log_console(f"[generator] Failed to load DLL: {fn} ({e})")
-    else:
-        il2cpp_path = os.path.join(game_path, "GameAssembly.dll")
-        with open(il2cpp_path, "rb") as f:
-            il2cpp = f.read()
-        metadata_path = os.path.join(
-            data_path, "il2cpp_data", "Metadata", "global-metadata.dat"
+    try:
+        return create_type_tree_generator(
+            unity_version,
+            game_path,
+            data_path,
+            compile_method,
+            cache_root=cache_root,
+            log=_log_console,
         )
-        with open(metadata_path, "rb") as f:
-            metadata = f.read()
-        generator.load_il2cpp(il2cpp, metadata)
-    return generator
+    except ImportError as exc:
+        if lang == "ko":
+            raise RuntimeError(
+                "TypeTreeGeneratorAPI가 설치되지 않아 TMP 폰트 타입트리를 "
+                "생성할 수 없습니다."
+            ) from exc
+        raise RuntimeError(
+            "TypeTreeGeneratorAPI is required to generate TMP typetrees."
+        ) from exc
 
 
 def _build_scan_worker_server_command(
@@ -3784,11 +4741,17 @@ def _build_font_asset_name_candidates(
     base_name = _strip_render_suffix(raw_name)
     if prefer_raster:
         name_candidates = _dedupe_preserve_order_str(
-            [raw_name, f"{base_name} Raster", f"{base_name} SDF"]
+            [
+                raw_name if raw_name.endswith(" Raster") else "",
+                f"{base_name} Raster",
+            ]
         )
     else:
         name_candidates = _dedupe_preserve_order_str(
-            [raw_name, f"{base_name} SDF", f"{base_name} Raster"]
+            [
+                raw_name if not raw_name.endswith(" Raster") else "",
+                f"{base_name} SDF",
+            ]
         )
 
     font_name_candidates = _dedupe_preserve_order_str(
@@ -3813,10 +4776,13 @@ def _select_builtin_bulk_padding_variant(
         numeric_padding = 0.0
     if numeric_padding <= 0:
         return None
-    return min(
-        _BULK_SDF_PADDING_VARIANTS,
-        key=lambda value: (abs(float(value) - numeric_padding), -int(value)),
-    )
+    # Never choose a smaller baked margin when a sufficient preset exists;
+    # preserved outline / glow / underlay styles could otherwise be clipped.
+    for value in sorted(_BULK_SDF_PADDING_VARIANTS):
+        if float(value) >= numeric_padding:
+            return int(value)
+    # Let the TTF-backed dynamic generator bake the exact required margin.
+    return None
 
 
 def select_replacement_asset_padding(
@@ -3829,7 +4795,7 @@ def select_replacement_asset_padding(
     if _resolve_ttf_source_path(str(replacement_font)) is None:
         return None
     try:
-        numeric_padding = int(round(float(source_padding_hint or 0)))
+        numeric_padding = int(math.ceil(float(source_padding_hint or 0)))
     except Exception:
         numeric_padding = 0
     return numeric_padding if numeric_padding > 0 else 7
@@ -4248,6 +5214,15 @@ def _load_font_assets_cached(
     """
     kr_assets = os.path.join(script_dir, "KR_ASSETS")
     asset_roots = _iter_kr_asset_roots(kr_assets, padding_variant=padding_variant)
+    # TTF/OTF sources may fall back to KR_ASSETS, but baked SDF metadata,
+    # atlas, and Material must come from the exact requested padding folder.
+    # Falling back to the root padding-7 assets for a padding-20 request would
+    # silently produce clipped Materials and prevent dynamic regeneration.
+    sdf_asset_roots = (
+        [os.path.join(kr_assets, f"Padding_{int(padding_variant)}")]
+        if padding_variant is not None
+        else [kr_assets]
+    )
     font_name_candidates, name_candidates = _build_font_asset_name_candidates(
         normalized,
         bool(prefer_raster),
@@ -4272,23 +5247,64 @@ def _load_font_assets_cached(
     sdf_swizzle = False
     sdf_process_swizzle = False
     for name_candidate in name_candidates:
-        for asset_root in asset_roots:
+        for asset_root in sdf_asset_roots:
             sdf_json_path = os.path.join(asset_root, f"{name_candidate}.json")
             if not os.path.exists(sdf_json_path):
                 continue
             with open(sdf_json_path, "r", encoding="utf-8") as f:
-                sdf_data = json.load(f)
-            if isinstance(sdf_data, dict):
-                sdf_data_normalized = normalize_sdf_data(sdf_data, deep_copy=True)
-                sdf_swizzle = parse_bool_flag(sdf_data.get("swizzle"))
-                sdf_process_swizzle = parse_bool_flag(sdf_data.get("process_swizzle"))
+                candidate_sdf_data = json.load(f)
+            if not isinstance(candidate_sdf_data, dict):
+                continue
+            if padding_variant is not None:
+                actual_padding = extract_tmp_atlas_padding(candidate_sdf_data)
+                if not math.isclose(
+                    float(actual_padding),
+                    float(padding_variant),
+                    rel_tol=0.0,
+                    abs_tol=0.01,
+                ):
+                    _log_warning(
+                        f"[font_assets] rejected mismatched cached SDF padding: "
+                        f"requested={padding_variant} actual={actual_padding} "
+                        f"path={sdf_json_path}"
+                    )
+                    continue
+            sdf_data = candidate_sdf_data
+            sdf_data_normalized = normalize_sdf_data(sdf_data, deep_copy=True)
+            if ttf_data:
+                import make_sdf as make_sdf_module
+
+                make_sdf_module.apply_tmp_gdef_classes(
+                    ttf_data,
+                    sdf_data_normalized,
+                )
+            feature_containers = (
+                sdf_data_normalized.get("m_FontFeatureTable"),
+                sdf_data_normalized.get("m_KerningTable"),
+                sdf_data_normalized.get("m_kerningInfo"),
+            )
+            has_serialized_features = any(
+                isinstance(value, list) and bool(value)
+                for container in feature_containers
+                if isinstance(container, dict)
+                for value in container.values()
+            )
+            if ttf_data and not has_serialized_features:
+                sdf_data_normalized.update(
+                    make_sdf_module.build_tmp_font_feature_payload(
+                        ttf_data,
+                        sdf_data_normalized,
+                    )
+                )
+            sdf_swizzle = parse_bool_flag(sdf_data.get("swizzle"))
+            sdf_process_swizzle = parse_bool_flag(sdf_data.get("process_swizzle"))
             break
         if sdf_data is not None:
             break
 
     sdf_atlas_path = None
     for name_candidate in name_candidates:
-        for asset_root in asset_roots:
+        for asset_root in sdf_asset_roots:
             candidate_atlas_path = os.path.join(
                 asset_root, f"{name_candidate} Atlas.png"
             )
@@ -4301,7 +5317,7 @@ def _load_font_assets_cached(
 
     sdf_material_data = None
     for name_candidate in name_candidates:
-        for asset_root in asset_roots:
+        for asset_root in sdf_asset_roots:
             sdf_material_path = os.path.join(
                 asset_root, f"{name_candidate} Material.json"
             )
@@ -4312,6 +5328,10 @@ def _load_font_assets_cached(
             break
         if sdf_material_data is not None:
             break
+
+    if sdf_data is None:
+        sdf_atlas_path = None
+        sdf_material_data = None
 
     return {
         "ttf_data": ttf_data,
@@ -4529,6 +5549,86 @@ class _SegmentedBytesReplacer:
         self.segments.clear()
 
 
+def _hash_object_raw_data(obj: Any) -> tuple[int, str]:
+    """Hash one serialized object's exact bytes without joining streamed replacers."""
+    digest = hashlib.sha256()
+    replacement = getattr(obj, "data", None)
+    iter_chunks = getattr(replacement, "iter_chunks", None)
+    if callable(iter_chunks):
+        size = 0
+        for chunk in iter_chunks(1024 * 1024):
+            view = bytes(chunk)
+            digest.update(view)
+            size += len(view)
+        return size, digest.hexdigest()
+    if replacement is not None:
+        raw = replacement if isinstance(replacement, bytes) else bytes(replacement)
+        digest.update(raw)
+        return len(raw), digest.hexdigest()
+
+    reader = obj.reader
+    original_position = reader.Position
+    remaining = int(obj.byte_size)
+    size = remaining
+    try:
+        obj.reset()
+        while remaining > 0:
+            chunk = reader.read_bytes(min(remaining, 1024 * 1024))
+            if not chunk:
+                raise EOFError(
+                    f"Serialized object ended with {remaining} byte(s) remaining."
+                )
+            digest.update(chunk)
+            remaining -= len(chunk)
+    finally:
+        reader.Position = original_position
+    return size, digest.hexdigest()
+
+
+def _collect_changed_object_manifest(env: Any) -> list[JsonDict]:
+    """Collect exact identities and hashes for every ObjectReader changed in memory."""
+    manifest: list[JsonDict] = []
+    for obj in env.objects:
+        if getattr(obj, "data", None) is None:
+            continue
+        size, sha256 = _hash_object_raw_data(obj)
+        manifest.append(
+            {
+                "assets_name": str(obj.assets_file.name),
+                "path_id": int(obj.path_id),
+                "size": int(size),
+                "sha256": sha256,
+            }
+        )
+    manifest.sort(key=lambda item: (item["assets_name"], item["path_id"]))
+    return manifest
+
+
+def _validate_object_manifest(env: Any, manifest: list[JsonDict]) -> None:
+    """Verify saved raw object bytes by exact SerializedFile name and signed PathID."""
+    objects_by_key: dict[tuple[str, int], list[Any]] = {}
+    for obj in env.objects:
+        key = (str(obj.assets_file.name), int(obj.path_id))
+        objects_by_key.setdefault(key, []).append(obj)
+
+    for expected in manifest:
+        key = (str(expected.get("assets_name", "")), int(expected.get("path_id", 0)))
+        matches = objects_by_key.get(key, [])
+        if len(matches) != 1:
+            raise ValueError(
+                f"saved object identity {key!r} matched {len(matches)} object(s)"
+            )
+        actual_size, actual_sha256 = _hash_object_raw_data(matches[0])
+        expected_size = int(expected.get("size", -1))
+        expected_sha256 = str(expected.get("sha256", ""))
+        if actual_size != expected_size or actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"saved object bytes differ for {key!r}: "
+                f"expected {expected_size}/{expected_sha256}, "
+                f"got {actual_size}/{actual_sha256}"
+            )
+
+
 def _append_trailing_bytes(obj: Any, trailing: bytes) -> None:
     """Append trailing bytes without materializing a file-backed Replacer."""
     if not trailing:
@@ -4557,6 +5657,31 @@ def _capture_trailing_bytes(obj: Any) -> bytes:
     return b""
 
 
+def _verify_typetree_prefix_roundtrip(
+    obj: Any,
+    parsed_value: Any,
+    consumed_size: int,
+) -> None:
+    """Prove that a partial TypeTree parse reproduces the original prefix."""
+    if consumed_size < 0 or consumed_size > int(obj.byte_size):
+        raise ValueError(
+            f"Invalid partial TypeTree size {consumed_size} for {obj.byte_size} bytes."
+        )
+    writer = EndianBinaryWriter(b"", endian=obj.reader.endian)
+    try:
+        obj.save_typetree(parsed_value, writer=writer)
+        serialized_prefix = writer.bytes
+    finally:
+        writer.dispose()
+    original = obj.get_raw_data()
+    expected_prefix = original[:consumed_size]
+    if serialized_prefix != expected_prefix:
+        raise ValueError(
+            "Partial TypeTree parse is not byte-stable; refusing to preserve "
+            "unclassified trailing data during an edit."
+        )
+
+
 def _safe_parse_as_object(obj: Any, **kwargs: Any) -> Any:
     """KR: parse_as_object()를 check_read=True로 먼저 시도하고,
     바이트 크기 불일치(중국판 Unity 등)로 실패하면 check_read=False로 재시도하고
@@ -4574,6 +5699,11 @@ def _safe_parse_as_object(obj: Any, **kwargs: Any) -> Any:
         if "Expected to read" in str(e) and "bytes" in str(e):
             result = obj.parse_as_object(check_read=False, **kwargs)
             trailing = _capture_trailing_bytes(obj)
+            _verify_typetree_prefix_roundtrip(
+                obj,
+                result,
+                int(obj.byte_size) - len(trailing),
+            )
             _store_trailing_bytes(obj, trailing)
             return result
         raise
@@ -4596,6 +5726,11 @@ def _safe_parse_as_dict(obj: Any, **kwargs: Any) -> dict[str, Any]:
         if "Expected to read" in str(e) and "bytes" in str(e):
             result = obj.parse_as_dict(check_read=False, **kwargs)
             trailing = _capture_trailing_bytes(obj)
+            _verify_typetree_prefix_roundtrip(
+                obj,
+                result,
+                int(obj.byte_size) - len(trailing),
+            )
             _store_trailing_bytes(obj, trailing)
             return result
         raise
@@ -4707,55 +5842,22 @@ def _binary_patch_texture2d(
     import struct as _struct
 
     original_raw = obj.get_raw_data()
-    if len(original_raw) < 48:
+    endian = ">" if getattr(obj.reader, "endian", "<") == ">" else "<"
+    if (
+        len(original_raw) < 48
+        or not (0 < int(width) <= 0x7FFFFFFF)
+        or not (0 < int(height) <= 0x7FFFFFFF)
+        or not (0 < len(image_data) <= 0x7FFFFFFF)
+    ):
         return False
-
-    # KR: 원본 raw에서 스트림 경로 문자열을 찾아 필드 위치를 역추적합니다.
-    # 스트리밍 경로 문자열 검색 (.resS 또는 .resource)
-    # EN: Finds stream path strings in the original raw data to trace back field positions.
-    # Searches for streaming path strings (.resS or .resource)
-    stream_path_marker = None
-    for marker in [b".resS", b".resource"]:
-        idx = original_raw.find(marker)
-        if idx >= 0:
-            # KR: 문자열 시작 위치를 찾기 위해 앞쪽으로 탐색
-            # EN: Scan backwards to find the start position of the string
-            str_start = idx
-            while str_start > 0 and original_raw[str_start - 1:str_start] not in (b"\x00",):
-                str_start -= 1
-                if idx - str_start > 200:
-                    break
-            # KR: string length prefix는 str_start - 4 위치
-            # EN: The string length prefix is at position str_start - 4
-            path_len_pos = str_start - 4
-            if path_len_pos < 0:
-                continue
-            try:
-                path_len = _struct.unpack_from("<i", original_raw, path_len_pos)[0]
-                if 0 < path_len < 256 and path_len_pos + 4 + path_len <= len(original_raw):
-                    stream_path_marker = (path_len_pos, path_len, str_start)
-                    break
-            except Exception:
-                continue
-
-    if stream_path_marker is not None:
-        # KR: 스트리밍 모드 — 경로 문자열 기준으로 필드 위치를 역추적합니다.
-        # EN: Streaming mode -- traces back field positions based on the path string.
-        path_len_pos, path_len, path_str_start = stream_path_marker
-        stream_size_pos = path_len_pos - 4
-        stream_offset_pos = stream_size_pos - 8
-        image_data_size_pos = stream_offset_pos - 4
-        orig_stream_end = path_str_start + path_len
-        orig_stream_end += (4 - orig_stream_end % 4) % 4
-    else:
-        image_data_size_pos = -1
-        orig_stream_end = len(original_raw)
 
     # KR: TypeTree 파싱으로 정확한 필드 오프셋을 구하고, 원본 raw를 직접 패치합니다.
     # EN: Obtains exact field offsets via TypeTree parsing and directly patches the original raw data.
     from UnityPy.helpers.TypeTreeHelper import TypeTreeConfig as _TTC, read_value as _rv
     from UnityPy.streams import EndianBinaryReader as _EBR
     field_offsets: dict[str, int] = {}
+    field_sizes: dict[str, int] = {}
+    field_values: dict[str, Any] = {}
     typetree_end: int | None = None
     _tmp_reader = None
     _root_node = None
@@ -4765,6 +5867,8 @@ def _binary_patch_texture2d(
         _root_node = obj._get_typetree_node()
         for _child in _root_node.m_Children:
             _pos_before = _tmp_reader.Position
+            if _child.m_Name in field_offsets:
+                raise ValueError(f"duplicate Texture2D field: {_child.m_Name}")
             field_offsets[_child.m_Name] = _pos_before
             if _child.m_Name == "image data" and _child.m_Type == "TypelessData":
                 _image_length = int(_tmp_reader.read_int())
@@ -4774,8 +5878,16 @@ def _binary_patch_texture2d(
                     raise ValueError("invalid Texture2D image data length")
                 _tmp_reader.Position += _image_length
                 _tmp_reader.align_stream()
+                field_values[_child.m_Name] = _image_length
             else:
-                _rv(_child, _tmp_reader, _tmp_config)
+                field_values[_child.m_Name] = _rv(
+                    _child,
+                    _tmp_reader,
+                    _tmp_config,
+                )
+            field_sizes[_child.m_Name] = int(_tmp_reader.Position) - int(
+                _pos_before
+            )
         typetree_end = int(_tmp_reader.Position)
     except Exception:
         pass
@@ -4786,50 +5898,65 @@ def _binary_patch_texture2d(
             except Exception:
                 pass
 
-    # KR: image data 필드의 시작 오프셋 = image_data_size_pos (TypeTree 기준)
-    # EN: Start offset of the image data field = image_data_size_pos (TypeTree basis)
-    if "image data" in field_offsets:
-        image_data_size_pos = field_offsets["image data"]
-
+    required_fields = {
+        "m_Width",
+        "m_Height",
+        "m_CompleteImageSize",
+        "image data",
+    }
     if (
-        stream_path_marker is None
-        and (image_data_size_pos < 0 or typetree_end is None)
+        typetree_end is None
+        or _root_node is None
+        or not required_fields.issubset(field_offsets)
+        or any(field_sizes.get(name) != 4 for name in required_fields - {"image data"})
     ):
-        # Rare fallback for TypeTrees whose child traversal failed. This path
-        # may materialize the old image once, but the normal binary fallback
-        # stays segmented and streaming.
-        try:
-            d_temp = obj.read_typetree(check_read=False)
-            orig_img_data = d_temp.get("image data", b"")
-            orig_img_len = (
-                len(orig_img_data)
-                if isinstance(orig_img_data, (bytes, bytearray, memoryview))
-                else 0
-            )
-            obj.reset()
-            pos0 = obj.reader.Position
-            obj.read_typetree(check_read=False)
-            typetree_bytes = obj.reader.Position - pos0
-            trailing_size = len(original_raw) - typetree_bytes
-            img_block_size = 4 + orig_img_len
-            img_block_padded = img_block_size + (4 - img_block_size % 4) % 4
-            if image_data_size_pos < 0:
-                image_data_size_pos = (
-                    len(original_raw) - trailing_size - 16 - img_block_padded
-                )
-            orig_stream_end = len(original_raw) - trailing_size
-            del orig_img_data, d_temp
-        except Exception:
-            return False
-
-    if image_data_size_pos < 0 or image_data_size_pos >= len(original_raw):
         return False
 
-    part4_start = (
-        typetree_end
-        if "image data" in field_offsets and typetree_end is not None
-        else orig_stream_end
+    image_data_size_pos = field_offsets["image data"]
+    original_image_size = field_values.get("image data")
+    try:
+        original_width = int(field_values["m_Width"])
+        original_height = int(field_values["m_Height"])
+        original_complete_size = int(field_values["m_CompleteImageSize"])
+        original_image_size = int(original_image_size)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    if (
+        not (0 < original_width <= 0x7FFFFFFF)
+        or not (0 < original_height <= 0x7FFFFFFF)
+        or not (0 <= original_complete_size <= 0xFFFFFFFF)
+        or not (0 <= original_image_size <= 0x7FFFFFFF)
+        or image_data_size_pos < 0
+        or image_data_size_pos + 4 + original_image_size > typetree_end
+        or typetree_end > len(original_raw)
+    ):
+        return False
+
+    root_children = list(getattr(_root_node, "m_Children", []))
+    image_nodes = [
+        index
+        for index, child in enumerate(root_children)
+        if child.m_Name == "image data"
+    ]
+    stream_nodes = [
+        index
+        for index, child in enumerate(root_children)
+        if child.m_Name == "m_StreamData"
+    ]
+    if len(image_nodes) != 1 or len(stream_nodes) > 1:
+        return False
+    image_node_index = image_nodes[0]
+    expected_suffix = (
+        ["m_StreamData"] if stream_nodes else []
     )
+    actual_suffix = [child.m_Name for child in root_children[image_node_index + 1 :]]
+    if actual_suffix != expected_suffix:
+        # The segmented fallback reconstructs only image data and the optional
+        # StreamingInfo. Refuse a layout with any other known field after the
+        # image block instead of silently dropping it.
+        return False
+
+    part4_start = typetree_end
     if part4_start < image_data_size_pos or part4_start > len(original_raw):
         return False
 
@@ -4837,14 +5964,21 @@ def _binary_patch_texture2d(
 
     # KR: 정확한 오프셋으로 필드 패치 (패턴 검색 대신 직접 오프셋 사용)
     # EN: Patches fields at exact offsets (uses direct offsets instead of pattern search)
-    if "m_Width" in field_offsets and field_offsets["m_Width"] + 4 <= len(part1):
-        _struct.pack_into("<i", part1, field_offsets["m_Width"], width)
-    if "m_Height" in field_offsets and field_offsets["m_Height"] + 4 <= len(part1):
-        _struct.pack_into("<i", part1, field_offsets["m_Height"], height)
-    if "m_CompleteImageSize" in field_offsets and field_offsets["m_CompleteImageSize"] + 4 <= len(part1):
-        _struct.pack_into("<I", part1, field_offsets["m_CompleteImageSize"], len(image_data))
+    if any(
+        field_offsets[name] < 0 or field_offsets[name] + 4 > len(part1)
+        for name in ("m_Width", "m_Height", "m_CompleteImageSize")
+    ):
+        return False
+    _struct.pack_into(f"{endian}i", part1, field_offsets["m_Width"], width)
+    _struct.pack_into(f"{endian}i", part1, field_offsets["m_Height"], height)
+    _struct.pack_into(
+        f"{endian}I",
+        part1,
+        field_offsets["m_CompleteImageSize"],
+        len(image_data),
+    )
 
-    image_size_prefix = _struct.pack("<i", len(image_data))
+    image_size_prefix = _struct.pack(f"{endian}i", len(image_data))
     image_block_size = len(image_size_prefix) + len(image_data)
     image_padding = b"\x00" * ((4 - image_block_size % 4) % 4)
     empty_stream_data = b""
@@ -4907,17 +6041,21 @@ def _cleanup_replace_call_resources(func: Callable[..., bool]) -> Callable[..., 
     @wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> bool:
         tmp_path: str | None = None
+        tmp_root: str | None = None
         deferred_payload_dir: str | None = None
         created_payload_dir = False
+        created_temp_root: str | None = None
         try:
             bound = inspect.signature(func).bind_partial(*args, **kwargs)
-            game_path = str(bound.arguments.get("game_path", ""))
             temp_root_dir = bound.arguments.get("temp_root_dir")
-            tmp_root = (
-                os.path.abspath(str(temp_root_dir))
-                if temp_root_dir is not None
-                else os.path.join(get_data_path(game_path), "temp")
-            )
+            if temp_root_dir is None:
+                created_temp_root = tempfile.mkdtemp(
+                    prefix="unity_font_replacer_call_"
+                )
+                register_temp_dir_for_cleanup(created_temp_root)
+                bound.arguments["temp_root_dir"] = created_temp_root
+                temp_root_dir = created_temp_root
+            tmp_root = os.path.abspath(str(temp_root_dir))
             tmp_path = os.path.join(tmp_root, "unity_font_replacer_temp")
             supplied_payload_dir = bound.arguments.get("_deferred_payload_dir")
             if supplied_payload_dir:
@@ -4930,21 +6068,41 @@ def _cleanup_replace_call_resources(func: Callable[..., bool]) -> Callable[..., 
                 deferred_payload_dir = tempfile.mkdtemp(
                     prefix="call_", dir=deferred_payload_root
                 )
-                kwargs["_deferred_payload_dir"] = deferred_payload_dir
+                bound.arguments["_deferred_payload_dir"] = deferred_payload_dir
                 created_payload_dir = True
-        except Exception:
-            tmp_path = None
-        try:
-            return func(*args, **kwargs)
+            return func(*bound.args, **bound.kwargs)
         except BaseException:
             if created_payload_dir and deferred_payload_dir:
                 shutil.rmtree(deferred_payload_dir, ignore_errors=True)
+            if created_temp_root:
+                shutil.rmtree(created_temp_root, ignore_errors=True)
             raise
         finally:
             if tmp_path and os.path.isdir(tmp_path):
                 try:
                     shutil.rmtree(tmp_path)
                 except Exception:
+                    pass
+            if created_temp_root and os.path.isdir(created_temp_root):
+                # Successful calls may leave deferred spill files for a later
+                # target. Remove only empty scaffolding now; the registered,
+                # uniquely-created root is cleaned at process exit otherwise.
+                if created_payload_dir and deferred_payload_dir:
+                    try:
+                        os.rmdir(deferred_payload_dir)
+                    except OSError:
+                        pass
+                if tmp_root:
+                    deferred_payload_root = os.path.join(
+                        tmp_root, "deferred_patch_payloads"
+                    )
+                    try:
+                        os.rmdir(deferred_payload_root)
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(created_temp_root)
+                except OSError:
                     pass
 
     return wrapper
@@ -4964,7 +6122,7 @@ def replace_fonts_in_file(
     force_raster: bool = False,
     material_scale_by_padding: bool = True,
     outline_ratio: float = 1.0,
-    prefer_original_compress: bool = False,
+    prefer_original_compress: bool = True,
     temp_root_dir: str | None = None,
     generator: TypeTreeGenerator | None = None,
     replacement_lookup: dict[tuple[str, str, str, int], str] | None = None,
@@ -4978,12 +6136,14 @@ def replace_fonts_in_file(
     deferred_material_plans: dict[str, dict[str, Any]] | None = None,
     deferred_material_atlas_plans: dict[str, dict[str, Any]] | None = None,
     collected_material_atlas_plans: dict[str, JsonDict] | None = None,
+    patched_material_identities: set[str] | None = None,
     pending_external_patch_files: set[str] | None = None,
     logical_file_key: str | None = None,
     phase_callback: Callable[[str, JsonDict], None] | None = None,
     lang: Language = "ko",
     deferred_transaction: _DeferredPatchTransaction | None = None,
     operation_outcome: JsonDict | None = None,
+    freeze_dynamic: bool = False,
     _deferred_payload_dir: str | None = None,
 ) -> bool:
     """KR: 단일 assets 파일의 TTF/SDF 폰트를 교체하고 저장합니다.
@@ -4992,43 +6152,43 @@ def replace_fonts_in_file(
     교체 pointSize에 맞춰 적용합니다.
     use_game_line_metrics=True면 게임 원본 줄 간격 메트릭을 그대로 사용합니다.
     pointSize는 옵션과 무관하게 교체 폰트 값을 유지합니다.
-    material_scale_by_padding=True면 SDF 머티리얼 float를 (게임 padding / 교체 padding) 비율로 보정합니다.
+    material_scale_by_padding은 이전 호출자 호환을 위해 유지됩니다. SDF 스타일 값은 padding 비율로
+    곱하지 않고, atlas 고유 값과 공식 shader ratio만 안전하게 갱신합니다.
     outline_ratio는 현재 선택된 Material 기준(_OutlineWidth/_OutlineSoftness)에 배율로 적용합니다.
+    freeze_dynamic=True면 Dynamic FontAsset을 Static으로 고정하고 runtime source Font PPtr을 해제합니다.
     prefer_original_compress=True면 원본 압축 우선, False면 무압축 계열 우선 저장 전략을 사용합니다.
     ps5_swizzle=True면 대상 Atlas의 swizzle 상태를 판별해 교체 Atlas를 자동 swizzle/unswizzle합니다.
     preview_export=True면 preview 폴더에 Atlas/Glyph crop 미리보기를 저장합니다.
     ps5_swizzle=True일 때는 unswizzle 기준으로 저장합니다.
-    temp_root_dir가 지정되면 임시 저장 디렉터리 루트로 사용합니다.
+    temp_root_dir가 지정되면 임시 저장 디렉터리 루트로 사용하고, 생략하면 시스템 임시
+    디렉터리에 호출별 격리 루트를 생성합니다.
     EN: Replaces TTF/SDF fonts in a single assets file and saves it.
 
     Default mode adjusts line-spacing metrics (LineHeight/Ascender/Descender etc.) by the game's original ratio
     and applies them scaled to the replacement pointSize.
     use_game_line_metrics=True uses the game's original line-spacing metrics as-is.
     pointSize always retains the replacement font's value regardless of options.
-    material_scale_by_padding=True adjusts SDF material floats by (game padding / replacement padding) ratio.
+    material_scale_by_padding is retained for caller compatibility. SDF style values are no longer
+    multiplied by a padding ratio; only atlas-specific values and official shader ratios are updated.
     outline_ratio applies as a multiplier to the selected Material's _OutlineWidth/_OutlineSoftness.
+    freeze_dynamic=True freezes Dynamic FontAssets to Static and clears their runtime source Font PPtr.
     prefer_original_compress=True uses original compression first; False uses uncompressed-first strategy.
     ps5_swizzle=True detects target Atlas swizzle state and auto-swizzles/unswizzles the replacement Atlas.
     preview_export=True saves Atlas/Glyph crop previews to the preview folder.
     When ps5_swizzle=True, saves based on unswizzle.
-    temp_root_dir, if specified, is used as the temp storage directory root.
+    temp_root_dir, if specified, is used as the temp storage directory root. Otherwise,
+    an isolated per-call root is created under the system temporary directory.
     """
     fn_without_path = os.path.basename(assets_file)
     if operation_outcome is not None:
         operation_outcome.clear()
     current_file_key = _resolve_current_file_key(assets_file, logical_file_key)
     data_path = get_data_path(game_path, lang=lang)
-    using_custom_temp_root = temp_root_dir is not None
-    tmp_root = (
-        os.path.abspath(temp_root_dir)
-        if using_custom_temp_root
-        else os.path.join(data_path, "temp")
-    )
+    if temp_root_dir is None:
+        raise RuntimeError("A per-call temporary root was not initialized")
+    tmp_root = os.path.abspath(temp_root_dir)
     tmp_path = os.path.join(tmp_root, "unity_font_replacer_temp")
-    if using_custom_temp_root:
-        register_temp_dir_for_cleanup(tmp_path)
-    else:
-        register_temp_dir_for_cleanup(tmp_root)
+    register_temp_dir_for_cleanup(tmp_path)
     bundle_signatures = BUNDLE_SIGNATURES
     source_bundle_signature = _read_bundle_signature(assets_file, bundle_signatures)
 
@@ -5131,8 +6291,7 @@ def replace_fonts_in_file(
     old_line_metric_scale_keys = _OLD_LINE_METRIC_SCALE_KEYS
     new_line_metric_keys = _NEW_LINE_METRIC_KEYS
     new_line_metric_scale_keys = _NEW_LINE_METRIC_SCALE_KEYS
-    material_padding_scale_keys = _MATERIAL_PADDING_SCALE_KEYS
-    replacement_padding_limit_warned: set[tuple[str, str, int]] = set()
+    _ = material_scale_by_padding
 
     if replace_sdf:
         for key, value in replacement_lookup.items():
@@ -5191,6 +6350,11 @@ def replace_fonts_in_file(
     staged_material_atlas_plans: dict[str, dict[str, Any]] = {}
     staged_pending_files: set[str] = set()
     ambiguous_material_fallback_warned: set[int] = set()
+    # Do not publish per-run Material completion until the containing file has
+    # been saved, validated, and atomically installed. A failed one-shot pass
+    # must leave split-save retries free to patch the same Material again in a
+    # freshly loaded UnityPy environment.
+    newly_patched_material_identities: set[str] = set()
     modified = False
     save_success = False
 
@@ -5333,18 +6497,16 @@ def replace_fonts_in_file(
                 )
                 continue
 
-            glyph_count = int(tmp_info.get("glyph_count", 0) or 0)
             atlas_file_id = int(tmp_info.get("atlas_file_id", 0) or 0)
             atlas_path_id = int(tmp_info.get("atlas_path_id", 0) or 0)
 
-            # KR: 외부 참조 stub만 제외하고 실제 TMP 폰트만 처리합니다.
-            # EN: Excludes only external reference stubs and processes actual TMP fonts.
-            if atlas_file_id != 0 and atlas_path_id == 0:
+            if atlas_path_id == 0:
+                if target_key in replacement_sdf_targets:
+                    raise ValueError(
+                        "Selected TMP FontAsset has a null atlas PPtr. This "
+                        "replacer cannot create a new Texture2D safely."
+                    )
                 continue
-            if glyph_count == 0:
-                if atlas_file_id == 0 and atlas_path_id == 0:
-                    continue
-
             objname = obj.peek_name()
             replacement_font = replacement_lookup.get(
                 ("SDF", fn_without_path, assets_name, pathid)
@@ -5405,6 +6567,7 @@ def replace_fonts_in_file(
                         )
 
             if replacement_font:
+                target_render_family = _detect_tmp_font_render_family(parse_dict)
                 replacement_meta = replacement_meta_lookup.get(
                     ("SDF", fn_without_path, assets_name, int(pathid)),
                     {},
@@ -5419,6 +6582,38 @@ def replace_fonts_in_file(
                     replacement_meta.get("force_raster")
                 )
                 effective_force_raster = force_raster or replacement_force_raster
+                _reject_unsafe_raster_conversion(effective_force_raster)
+                if target_render_family == "bitmap":
+                    raise ValueError(
+                        "Bitmap TMP FontAsset replacement is not yet supported "
+                        "because its shader and texture contract cannot be "
+                        "retargeted safely."
+                    )
+                if target_render_family == "conflict":
+                    raise ValueError(
+                        "TMP FontAsset render metadata is internally conflicting; "
+                        "refusing an unsafe replacement."
+                    )
+                if target_render_family != "sdf":
+                    raise ValueError(
+                        "Could not prove that the selected TMP FontAsset uses an "
+                        "SDF render mode; refusing an unsafe replacement."
+                    )
+                froze_dynamic = _prepare_static_tmp_population(
+                    parse_dict,
+                    allow_freeze=freeze_dynamic,
+                )
+                if froze_dynamic:
+                    if lang == "ko":
+                        _log_console(
+                            "  Dynamic FontAsset을 명시적으로 Static으로 고정하고 "
+                            "source Font PPtr을 해제합니다."
+                        )
+                    else:
+                        _log_console(
+                            "  Explicitly freezing Dynamic FontAsset to Static and "
+                            "clearing its source Font PPtr."
+                        )
                 _log_debug(
                     f"[replace_sdf] file={fn_without_path} assets={assets_name} path_id={pathid} "
                     f"font={objname} target={replacement_font} "
@@ -5466,11 +6661,11 @@ def replace_fonts_in_file(
                     if selected_padding_variant is not None:
                         if lang == "ko":
                             _log_console(
-                                f"  가장 가까운 내장 padding preset 선택: source {source_padding_hint:.2f} -> Padding_{selected_padding_variant}"
+                                f"  원본 이상인 안전한 내장 padding preset 선택: source {source_padding_hint:.2f} -> Padding_{selected_padding_variant}"
                             )
                         else:
                             _log_console(
-                                f"  Selected nearest built-in padding preset: source {source_padding_hint:.2f} -> Padding_{selected_padding_variant}"
+                                f"  Selected a safe built-in padding preset: source {source_padding_hint:.2f} -> Padding_{selected_padding_variant}"
                             )
                     source_atlas = assets["sdf_atlas"]
                     source_swizzled = parse_bool_flag(assets.get("sdf_swizzle"))
@@ -5493,22 +6688,61 @@ def replace_fonts_in_file(
                     if not isinstance(replace_data, dict):
                         replace_data = normalize_sdf_data(assets["sdf_data"])
                     try:
-                        replacement_render_mode = int(
-                            replace_data.get("m_AtlasRenderMode", 4118) or 0
+                        _validate_replacement_sdf_assets(
+                            replace_data,
+                            source_atlas,
                         )
                     except Exception:
-                        replacement_render_mode = 4118
-                    if effective_force_raster:
-                        replacement_render_mode &= ~0x1000
-                    replacement_is_sdf = (replacement_render_mode & 0x1000) != 0
-                    game_padding_for_material = 0.0
+                        _close_unique_images(source_atlas, atlas_linear_for_alpha8)
+                        assets["sdf_atlas"] = None
+                        raise
+                    try:
+                        replacement_render_mode = int(
+                            replace_data.get("m_AtlasRenderMode", 4169) or 0
+                        )
+                    except Exception:
+                        replacement_render_mode = 4169
+                    replacement_render_family = _detect_tmp_font_render_family(
+                        {"m_AtlasRenderMode": replacement_render_mode}
+                    )
+                    replacement_is_sdf = replacement_render_family == "sdf"
+                    if not replacement_is_sdf:
+                        raise ValueError(
+                            "SDF TMP FontAsset requires an SDF replacement atlas."
+                        )
+                    # The replacement is baked to a static single atlas below.
+                    # Preserve a proven target SDF enum verbatim: older Unity
+                    # releases used 0x26-family SDF values while newer releases
+                    # use 0x2A, and rewriting one generation into the other is
+                    # unnecessary for static rendering.
+                    serialized_render_mode = replacement_render_mode
+                    if "m_AtlasRenderMode" in parse_dict:
+                        try:
+                            target_render_mode = int(parse_dict["m_AtlasRenderMode"])
+                        except (TypeError, ValueError, OverflowError):
+                            target_render_mode = replacement_render_mode
+                        if (
+                            _detect_tmp_font_render_family(
+                                {"m_AtlasRenderMode": target_render_mode}
+                            )
+                            == "sdf"
+                        ):
+                            serialized_render_mode = target_render_mode
+                    game_padding_for_material = float(source_padding_hint or 0.0)
 
-                    # KR: GameObject/Script/Material/Atlas 참조는 기존 PathID를 유지해야 런타임 연결이 깨지지 않습니다.
-                    # EN: GameObject/Script/Material/Atlas references must keep existing PathIDs to avoid breaking runtime linkage.
-                    m_GameObject_FileID = parse_dict["m_GameObject"]["m_FileID"]
-                    m_GameObject_PathID = parse_dict["m_GameObject"]["m_PathID"]
-                    m_Script_FileID = parse_dict["m_Script"]["m_FileID"]
-                    m_Script_PathID = parse_dict["m_Script"]["m_PathID"]
+                    # Package and migrated TMP 4.x/TextCore FontAssets are
+                    # serialized as MonoBehaviours. Preserve optional links
+                    # only when the concrete target shape contains them.
+                    game_object_ref = (
+                        copy.deepcopy(parse_dict.get("m_GameObject"))
+                        if isinstance(parse_dict.get("m_GameObject"), dict)
+                        else None
+                    )
+                    script_ref = (
+                        copy.deepcopy(parse_dict.get("m_Script"))
+                        if isinstance(parse_dict.get("m_Script"), dict)
+                        else None
+                    )
                     has_source_font_ref = isinstance(
                         parse_dict.get("m_SourceFontFile"), dict
                     )
@@ -5535,6 +6769,7 @@ def replace_fonts_in_file(
                         parse_dict,
                         prefer_new=True,
                     )
+                    target_atlas_refs = _all_valid_atlas_refs(parse_dict)
                     target_old_atlas_ref = (
                         cast(JsonDict, parse_dict.get("atlas"))
                         if isinstance(parse_dict.get("atlas"), dict)
@@ -5578,20 +6813,6 @@ def replace_fonts_in_file(
 
                     if target_has_new_face:
                         game_face_info = parse_dict.get("m_FaceInfo", {})
-                        try:
-                            game_padding_for_material = float(
-                                parse_dict.get(
-                                    "m_AtlasPadding",
-                                    (
-                                        target_creation_settings.get("padding", 0)
-                                        if isinstance(target_creation_settings, dict)
-                                        else 0
-                                    ),
-                                )
-                            )
-                        except Exception:
-                            game_padding_for_material = 0.0
-
                         target_face_info = dict(replace_data["m_FaceInfo"])
                         if isinstance(game_face_info, dict):
                             if use_game_line_metrics:
@@ -5686,7 +6907,12 @@ def replace_fonts_in_file(
                             or 0
                         )
                     if "m_AtlasRenderMode" in parse_dict:
-                        parse_dict["m_AtlasRenderMode"] = replacement_render_mode
+                        parse_dict["m_AtlasRenderMode"] = serialized_render_mode
+                    for font_asset_type_key in list(parse_dict):
+                        if font_asset_type_key.replace("_", "").lower() == "fontassettype":
+                            parse_dict[font_asset_type_key] = (
+                                1 if replacement_is_sdf else 2
+                            )
                     if "m_UsedGlyphRects" in parse_dict:
                         parse_dict["m_UsedGlyphRects"] = replace_data.get(
                             "m_UsedGlyphRects", parse_dict.get("m_UsedGlyphRects", [])
@@ -5695,15 +6921,32 @@ def replace_fonts_in_file(
                         parse_dict["m_FreeGlyphRects"] = replace_data.get(
                             "m_FreeGlyphRects", parse_dict.get("m_FreeGlyphRects", [])
                         )
-                    if "m_FontWeightTable" in parse_dict:
-                        parse_dict["m_FontWeightTable"] = replace_data.get(
-                            "m_FontWeightTable", parse_dict.get("m_FontWeightTable", [])
-                        )
-                    for record_table_key in ("m_FontFeatureTable", "m_KerningTable"):
+                    # Font weight and fallback tables contain target-local PPtrs
+                    # to bold / italic / fallback assets. The replacement payload
+                    # cannot safely transplant those references, so preserve the
+                    # tables already connected by the game.
+                    for record_table_key in (
+                        "m_FontFeatureTable",
+                        "m_KerningTable",
+                        "m_kerningInfo",
+                    ):
                         if record_table_key in parse_dict:
+                            replacement_record_table = replace_data.get(
+                                record_table_key
+                            )
+                            if record_table_key in {
+                                "m_KerningTable",
+                                "m_kerningInfo",
+                            } and isinstance(
+                                parse_dict.get("m_FontFeatureTable"), dict
+                            ):
+                                # TMP 1.4+ upgrades a populated legacy table at
+                                # runtime and can overwrite the new feature
+                                # table. Keep only the canonical modern pairs.
+                                replacement_record_table = {"kerningPairs": []}
                             _sync_existing_record_table(
                                 parse_dict.get(record_table_key),
-                                replace_data.get(record_table_key),
+                                replacement_record_table,
                             )
 
                     if target_has_old_face or target_has_old_glyphs:
@@ -5831,6 +7074,11 @@ def replace_fonts_in_file(
                             atlas_height=atlas_height_for_cs,
                             padding=padding_for_cs,
                             point_size=point_size_for_cs,
+                            render_mode=(
+                                serialized_render_mode
+                                if "m_AtlasRenderMode" in parse_dict
+                                else None
+                            ),
                         )
 
                     # KR: 신형/구형 필드가 공존하면 신형 face 기준으로 legacy face도 동기화합니다.
@@ -5874,10 +7122,14 @@ def replace_fonts_in_file(
 
                     # KR: 포맷 분기 후 공통 참조를 원래 값으로 되돌립니다.
                     # EN: After format branching, restore common references to their original values.
-                    parse_dict["m_GameObject"]["m_FileID"] = m_GameObject_FileID
-                    parse_dict["m_GameObject"]["m_PathID"] = m_GameObject_PathID
-                    parse_dict["m_Script"]["m_FileID"] = m_Script_FileID
-                    parse_dict["m_Script"]["m_PathID"] = m_Script_PathID
+                    if game_object_ref is not None and isinstance(
+                        parse_dict.get("m_GameObject"), dict
+                    ):
+                        parse_dict["m_GameObject"] = game_object_ref
+                    if script_ref is not None and isinstance(
+                        parse_dict.get("m_Script"), dict
+                    ):
+                        parse_dict["m_Script"] = script_ref
 
                     if material_ref_key is not None:
                         parse_dict[material_ref_key]["m_FileID"] = m_Material_FileID
@@ -6017,185 +7269,131 @@ def replace_fonts_in_file(
                             "could_not_resolve_texture_target=True"
                         )
 
-                    atlas_fallback_payload: JsonDict = {
-                        "w": atlas_metadata_width,
-                        "h": atlas_metadata_height,
-                        "gs": None,
-                        "float_overrides": {},
-                        "color_overrides": {},
-                        "outline_ratio": outline_ratio,
-                        "reset_keywords": False,
-                        "prune_raster_material": False,
-                        "preserve_gradient_floor": False,
-                        "replacement_font": replacement_font,
-                        "source_entry": f"{fn_without_path}|{assets_name}|{pathid}",
-                    }
-                    if texture_key and texture_target_file_key:
-                        _store_consistent_patch_value(
-                            material_replacements_by_atlas,
-                            texture_key,
-                            atlas_fallback_payload,
-                            patch_kind="material_atlas",
-                            target_file_key=current_file_key,
-                            transaction=deferred_transaction,
+                    try:
+                        replacement_padding = float(
+                            replace_data.get("m_AtlasPadding", 0)
                         )
-                        if texture_target_file_key != current_file_key:
-                            _register_deferred_patch(
-                                staged_material_atlas_plans,
-                                texture_target_file_key,
-                                texture_key,
-                                atlas_fallback_payload,
-                                pending_files=staged_pending_files,
-                                patch_kind="material_atlas",
-                                transaction=deferred_transaction,
+                    except Exception:
+                        replacement_padding = 0.0
+                    if (
+                        replacement_is_sdf
+                        and game_padding_for_material > 0
+                        and replacement_padding > 0
+                        and game_padding_for_material > replacement_padding
+                    ):
+                        raise ValueError(
+                            "Replacement SDF padding is smaller than the target "
+                            f"Material contract ({replacement_padding:.2f} < "
+                            f"{game_padding_for_material:.2f}); refusing a clipped result."
+                        )
+                    material_payload = _build_sdf_material_payload(
+                        atlas_width=atlas_metadata_width,
+                        atlas_height=atlas_metadata_height,
+                        material_data=assets.get("sdf_materials"),
+                        replacement_is_sdf=replacement_is_sdf,
+                        force_raster=effective_force_raster,
+                        use_game_material=use_game_mat,
+                        outline_ratio=outline_ratio,
+                        replacement_padding=replacement_padding,
+                        replacement_font=replacement_font,
+                        source_entry=f"{fn_without_path}|{assets_name}|{pathid}",
+                    )
+                    material_payload["expected_shader_family"] = "sdf"
+                    if texture_target_file_key and texture_target_assets_name:
+                        material_payload["replacement_atlas_target"] = {
+                            "outer_file_key": texture_target_file_key,
+                            "assets_name": str(texture_target_assets_name),
+                            "path_id": int(m_AtlasTextures_PathID),
+                        }
+                    if material_payload.get("prune_raster_material"):
+                        if lang == "ko":
+                            _log_console(
+                                "  Raster 모드 감지: Material 필드를 최소 구성으로 재구성합니다."
                             )
+                        else:
+                            _log_console(
+                                "  Raster mode detected: rebuilding Material to minimal raster-safe fields."
+                            )
+
+                    # Presets and sub-materials can share the atlas without being
+                    # referenced by FontAsset.material. Apply the same atlas
+                    # contract to them, but only when they look like TMP shaders.
+                    atlas_refs_for_reconciliation = target_atlas_refs or [
+                        {
+                            "m_FileID": int(m_AtlasTextures_FileID),
+                            "m_PathID": int(m_AtlasTextures_PathID),
+                        }
+                    ]
+                    for old_atlas_ref in atlas_refs_for_reconciliation:
+                        old_atlas_file_id, old_atlas_path_id = _atlas_ref_ids(
+                            old_atlas_ref
+                        )
+                        if old_atlas_path_id == 0:
+                            continue
+                        old_atlas_assets_name = _resolve_target_assets_name(
+                            obj.assets_file,
+                            assets_name,
+                            old_atlas_file_id,
+                        )
+                        old_atlas_outer_key = _resolve_target_outer_file_key(
+                            current_file_key,
+                            obj.assets_file,
+                            old_atlas_file_id,
+                            old_atlas_assets_name,
+                            source_bundle_signature=source_bundle_signature,
+                            asset_file_index=asset_file_index,
+                        )
+                        if not old_atlas_assets_name or not old_atlas_outer_key:
+                            required_resolution_errors.append(
+                                "previous atlas "
+                                f"{old_atlas_file_id}:{old_atlas_path_id} "
+                                "target could not be resolved"
+                            )
+                            continue
+                        atlas_identity = _make_outer_assets_object_key(
+                            old_atlas_outer_key,
+                            old_atlas_assets_name,
+                            old_atlas_path_id,
+                        )
+                        atlas_fallback_payload = dict(material_payload)
+                        atlas_fallback_payload["require_tmp_signature"] = True
                         if collected_material_atlas_plans is not None:
-                            _store_consistent_patch_value(
+                            stored_atlas_plan, _ = _store_consistent_patch_value(
                                 collected_material_atlas_plans,
-                                texture_key,
+                                atlas_identity,
                                 atlas_fallback_payload,
                                 patch_kind="material_atlas",
                                 target_file_key="material_reconciliation",
                                 transaction=None,
                             )
+                            if stored_atlas_plan is None:
+                                required_resolution_errors.append(
+                                    f"conflicting atlas Material target {atlas_identity}"
+                                )
+                        else:
+                            stored_atlas_plan, _ = _store_consistent_patch_value(
+                                material_replacements_by_atlas,
+                                atlas_identity,
+                                atlas_fallback_payload,
+                                patch_kind="material_atlas",
+                                target_file_key=current_file_key,
+                                transaction=deferred_transaction,
+                            )
+                            if stored_atlas_plan is None:
+                                required_resolution_errors.append(
+                                    f"conflicting atlas Material target {atlas_identity}"
+                                )
+                            if old_atlas_outer_key != current_file_key:
+                                _register_deferred_patch(
+                                    staged_material_atlas_plans,
+                                    old_atlas_outer_key,
+                                    atlas_identity,
+                                    atlas_fallback_payload,
+                                    pending_files=staged_pending_files,
+                                    patch_kind="material_atlas",
+                                    transaction=deferred_transaction,
+                                )
                     if m_Material_PathID != 0:
-                        gradient_scale = None
-                        apply_replacement_material = not use_game_mat
-                        float_overrides: dict[str, float] = {}
-                        color_overrides: dict[str, JsonDict] = {}
-                        reset_keywords = False
-                        prune_raster_material = False
-                        preserve_gradient_floor = False
-                        preserve_game_style = False
-                        material_padding_ratio = 1.0
-                        material_data = assets.get("sdf_materials")
-                        if effective_force_raster and use_game_mat:
-                            if lang == "ko":
-                                _log_console(
-                                    "  경고: Raster 폰트에 --use-game-material 사용 시 박스 아티팩트가 생길 수 있습니다."
-                                )
-                            else:
-                                _log_console(
-                                    "  Warning: using --use-game-material with Raster fonts may cause box artifacts."
-                                )
-                        try:
-                            replacement_padding = float(
-                                replace_data.get("m_AtlasPadding", 0)
-                            )
-                        except Exception:
-                            replacement_padding = 0.0
-                        if (
-                            replacement_is_sdf
-                            and game_padding_for_material > 0
-                            and replacement_padding > 0
-                            and game_padding_for_material > replacement_padding
-                        ):
-                            warn_key = (
-                                str(assets_name),
-                                str(objname),
-                                int(pathid),
-                            )
-                            if warn_key not in replacement_padding_limit_warned:
-                                replacement_padding_limit_warned.add(warn_key)
-                                if lang == "ko":
-                                    _log_console(
-                                        "  경고: 원본 padding "
-                                        f"{game_padding_for_material:.2f}가 교체 padding {replacement_padding:.2f}보다 큽니다. "
-                                        "Material 보정을 적용하지만 외곽선/언더레이를 원본과 완전히 같게 복원하지 못할 수 있습니다."
-                                    )
-                                else:
-                                    _log_console(
-                                        "  Warning: source padding "
-                                        f"{game_padding_for_material:.2f} exceeds replacement padding {replacement_padding:.2f}. "
-                                        "Material correction is applied, but outline/underlay may not match the original exactly."
-                                    )
-                        if (
-                            replacement_is_sdf
-                            and material_scale_by_padding
-                            and game_padding_for_material > 0
-                            and replacement_padding > 0
-                        ):
-                            material_padding_ratio = (
-                                game_padding_for_material / replacement_padding
-                            )
-                            if material_padding_ratio <= 0:
-                                material_padding_ratio = 1.0
-                        if material_data and apply_replacement_material:
-                            preserve_game_style = (
-                                replacement_is_sdf and (not effective_force_raster)
-                            )
-                            material_props = material_data.get("m_SavedProperties", {})
-                            float_properties = material_props.get("m_Floats", [])
-                            color_properties = material_props.get("m_Colors", [])
-                            for prop in float_properties:
-                                if not isinstance(prop, (list, tuple)) or len(prop) < 2:
-                                    continue
-                                key = str(prop[0])
-                                if preserve_game_style and key in _MATERIAL_STYLE_FLOAT_KEYS:
-                                    continue
-                                try:
-                                    value = float(prop[1])
-                                except (TypeError, ValueError):
-                                    continue
-                                float_overrides[key] = value
-                            for prop in color_properties:
-                                if not isinstance(prop, (list, tuple)) or len(prop) < 2:
-                                    continue
-                                key = str(prop[0])
-                                if preserve_game_style and key in _MATERIAL_STYLE_COLOR_KEYS:
-                                    continue
-                                color_value = _color_value_to_dict(
-                                    prop[1],
-                                    {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
-                                )
-                                color_overrides[key] = color_value
-                            if material_padding_ratio != 1.0:
-                                for key in material_padding_scale_keys:
-                                    if key in float_overrides:
-                                        float_overrides[key] = float(
-                                            float_overrides[key]
-                                            * material_padding_ratio
-                                        )
-                            gradient_scale = float_overrides.get("_GradientScale")
-                        # KR: 교체 material에 _GradientScale이 없으면 m_AtlasPadding+1로 자동 추론합니다.
-                        # EN: If _GradientScale is missing from replacement material, auto-infer it as m_AtlasPadding+1.
-                        if gradient_scale is None and replacement_is_sdf and replacement_padding > 0:
-                            gradient_scale = float(replacement_padding + 1)
-                        if apply_replacement_material and effective_force_raster:
-                            # KR: Raster 모드에서는 SDF 계열 필드 0 덮기 대신 최소 필드만 남깁니다.
-                            # EN: In Raster mode, keep only minimal fields instead of zeroing out SDF-related fields.
-                            reset_keywords = True
-                            prune_raster_material = True
-                            gradient_scale = 1.0
-                            if lang == "ko":
-                                _log_console(
-                                    "  Raster 모드 감지: Material 필드를 최소 구성으로 재구성합니다."
-                                )
-                            else:
-                                _log_console(
-                                    "  Raster mode detected: rebuilding Material to minimal raster-safe fields."
-                                )
-                        if (
-                            apply_replacement_material
-                            and replacement_is_sdf
-                            and (not effective_force_raster)
-                        ):
-                            preserve_gradient_floor = True
-                        if (
-                            material_scale_by_padding
-                            and apply_replacement_material
-                            and material_padding_ratio != 1.0
-                        ):
-                            if lang == "ko":
-                                _log_console(
-                                    f"  Material padding 비율 보정 적용: {game_padding_for_material:.2f}/{replacement_padding:.2f} "
-                                    f"(x{material_padding_ratio:.3f})"
-                                )
-                            else:
-                                _log_console(
-                                    f"  Applied material padding ratio: {game_padding_for_material:.2f}/{replacement_padding:.2f} "
-                                    f"(x{material_padding_ratio:.3f})"
-                                )
                         material_target_assets_name = _resolve_target_assets_name(
                             obj.assets_file,
                             assets_name,
@@ -6209,24 +7407,6 @@ def replace_fonts_in_file(
                             source_bundle_signature=source_bundle_signature,
                             asset_file_index=asset_file_index,
                         )
-                        material_payload = {
-                            "w": atlas_metadata_width,
-                            "h": atlas_metadata_height,
-                            "gs": gradient_scale,
-                            "float_overrides": float_overrides,
-                            "color_overrides": color_overrides,
-                            "outline_ratio": outline_ratio,
-                            "reset_keywords": reset_keywords,
-                            "prune_raster_material": bool(prune_raster_material),
-                            "preserve_game_style": bool(preserve_game_style),
-                            "style_padding_scale_ratio": material_padding_ratio,
-                            "preserve_gradient_floor": bool(
-                                preserve_gradient_floor
-                            ),
-                            "replacement_padding": replacement_padding,
-                            "replacement_font": replacement_font,
-                            "source_entry": f"{fn_without_path}|{assets_name}|{pathid}",
-                        }
                         if material_target_assets_name and material_target_file_key:
                             material_key_exact = _make_assets_object_key(
                                 material_target_assets_name,
@@ -6527,9 +7707,17 @@ def replace_fonts_in_file(
                                     "  Applied binary patch (preserving extra bytes outside TypeTree)"
                                 )
                         else:
-                            _safe_save(obj, parse_dict)
+                            raise RuntimeError(
+                                "Texture2D has bytes outside its TypeTree, but "
+                                "its exact binary field layout could not be "
+                                "validated; refusing a potentially destructive save."
+                            )
                     else:
-                        _safe_save(obj, parse_dict)
+                        raise RuntimeError(
+                            "Texture2D has bytes outside its TypeTree, but the "
+                            "replacement image payload is invalid; refusing a "
+                            "potentially destructive save."
+                        )
                 else:
                     _safe_save(obj, parse_dict)
                 consumed_texture_ids.add(id(texture_plan))
@@ -6543,26 +7731,46 @@ def replace_fonts_in_file(
                             pass
         if obj.type.name == "Material":
             parse_dict = None
+            material_identity = _make_outer_assets_object_key(
+                current_file_key,
+                assets_name,
+                int(obj.path_id),
+            )
             material_key = _make_assets_object_key(assets_name, int(obj.path_id))
             mat_info = _lookup_patch_value(material_replacements, material_key)
+            is_direct_material_plan = mat_info is not None
             if mat_info is None:
                 fallback_path_id = int(obj.path_id)
                 if fallback_path_id in material_replacements_by_pathid:
                     if material_object_count_by_pathid.get(fallback_path_id, 0) == 1:
                         mat_info = material_replacements_by_pathid[fallback_path_id]
+                        is_direct_material_plan = True
                     elif fallback_path_id not in ambiguous_material_fallback_warned:
                         ambiguous_material_fallback_warned.add(fallback_path_id)
                         _log_warning(
                             f"[replace_material] file={fn_without_path} path_id={fallback_path_id} "
                             "fallback_pathid_only_match_ambiguous=True; skipped"
                         )
+            if (
+                mat_info is not None
+                and patched_material_identities is not None
+                and material_identity in patched_material_identities
+            ):
+                if is_direct_material_plan and id(mat_info) in (
+                    incoming_material_ids | required_local_material_ids
+                ):
+                    consumed_material_ids.add(id(mat_info))
+                continue
             if mat_info is None:
                 if parse_dict is None:
                     parse_dict = _safe_parse_as_object(obj)
-                atlas_key = _resolve_material_main_texture_key(
+                atlas_key = _resolve_material_main_texture_identity(
                     obj.assets_file,
                     assets_name,
+                    current_file_key,
                     parse_dict,
+                    source_bundle_signature=source_bundle_signature,
+                    asset_file_index=asset_file_index,
                 )
                 if atlas_key is not None:
                     mat_info = _lookup_patch_value(
@@ -6572,13 +7780,78 @@ def replace_fonts_in_file(
             if mat_info is not None:
                 if parse_dict is None:
                     parse_dict = _safe_parse_as_object(obj)
-                if _apply_material_replacement_to_object(parse_dict, mat_info):
+                saved_props = getattr(parse_dict, "m_SavedProperties", None)
+                if mat_info.get("expected_shader_family") == "sdf" and not (
+                    _has_tmp_sdf_shader_signature(saved_props)
+                ):
+                    if is_direct_material_plan:
+                        raise RuntimeError(
+                            "FontAsset Material does not use an SDF-compatible "
+                            "shader; refusing to keep an incompatible m_Shader PPtr."
+                        )
+                    continue
+                if bool(mat_info.get("require_tmp_signature", False)) and not (
+                    _has_tmp_material_signature(saved_props)
+                ):
+                    continue
+
+                material_rebound = False
+                replacement_atlas_target = mat_info.get(
+                    "replacement_atlas_target"
+                )
+                if isinstance(replacement_atlas_target, dict):
+                    target_outer_file_key = str(
+                        replacement_atlas_target.get("outer_file_key", "")
+                    )
+                    target_assets_name = str(
+                        replacement_atlas_target.get("assets_name", "")
+                    )
+                    target_atlas_path_id = int(
+                        replacement_atlas_target.get("path_id", 0) or 0
+                    )
+                    target_file_id = _find_pptr_file_id_for_target(
+                        obj.assets_file,
+                        current_file_key,
+                        target_outer_file_key,
+                        target_assets_name,
+                        source_bundle_signature=source_bundle_signature,
+                        asset_file_index=asset_file_index,
+                    )
+                    current_main_texture_ref = _material_main_texture_ref(parse_dict)
+                    if target_file_id is None or current_main_texture_ref is None:
+                        raise RuntimeError(
+                            "Could not safely retarget Material._MainTex to the "
+                            "replacement atlas."
+                        )
+                    desired_main_texture_ref = (
+                        int(target_file_id),
+                        target_atlas_path_id,
+                    )
+                    if current_main_texture_ref != desired_main_texture_ref:
+                        material_rebound = _set_material_main_texture_ref(
+                            parse_dict,
+                            *desired_main_texture_ref,
+                        )
+                        if _material_main_texture_ref(parse_dict) != (
+                            desired_main_texture_ref
+                        ):
+                            raise RuntimeError(
+                                "Material._MainTex retarget verification failed."
+                            )
+
+                material_properties_changed = _apply_material_replacement_to_object(
+                    parse_dict,
+                    mat_info,
+                )
+                if material_properties_changed or material_rebound:
                     _safe_save(obj, parse_dict)
-                    if id(mat_info) in (
-                        incoming_material_ids | required_local_material_ids
-                    ):
-                        consumed_material_ids.add(id(mat_info))
                     modified = True
+                if id(mat_info) in (
+                    incoming_material_ids | required_local_material_ids
+                ):
+                    consumed_material_ids.add(id(mat_info))
+                if patched_material_identities is not None:
+                    newly_patched_material_identities.add(material_identity)
 
     # Atlas-keyed material plans are compatibility fallbacks. They are
     # best-effort and may legitimately have no Material in the texture file.
@@ -6656,7 +7929,26 @@ def replace_fonts_in_file(
         else:
             raise DeferredPatchAtomicityError(failure_reason)
 
+    changed_object_manifest: list[JsonDict] = []
+    validation_manifest_path: str | None = None
     if modified and not save_blocked_by_deferred_patch:
+        changed_object_manifest = _collect_changed_object_manifest(env)
+        if not changed_object_manifest:
+            raise RuntimeError(
+                "The Unity environment is marked modified but no changed object "
+                "could be identified for strict save validation."
+            )
+        validation_manifest_path = os.path.join(
+            tmp_path,
+            ".unity_font_replacer_object_manifest.json",
+        )
+        with open(validation_manifest_path, "w", encoding="utf-8") as manifest_file:
+            json.dump(
+                changed_object_manifest,
+                manifest_file,
+                ensure_ascii=False,
+                indent=2,
+            )
         if lang == "ko":
             _log_console(f"'{fn_without_path}' 저장 중...")
         else:
@@ -6747,6 +8039,10 @@ def replace_fonts_in_file(
                     ]
                 for inner_name in validation_inner_names:
                     cmd.extend(["--_validate-inner-name", inner_name])
+                if validation_manifest_path:
+                    cmd.extend(
+                        ["--_validate-object-manifest", validation_manifest_path]
+                    )
                 proc = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -6915,8 +8211,8 @@ def replace_fonts_in_file(
                             _log_console("  Retrying with legacy bitmask packer...")
                         _try_save(legacy_none_packer, "4")
         else:
-            # KR: 기본은 무압축 계열 우선으로 저장해 시간을 줄이고, 실패 시 압축 모드로 폴백합니다.
-            # EN: By default, save with uncompressed-family first to reduce time; fall back to compressed mode on failure.
+            # KR: 명시적으로 원본 압축 우선을 끄면 무압축 계열부터 시도합니다.
+            # EN: When original-compression preference is disabled, try uncompressed-family modes first.
             if not _try_save(safe_none_packer, "1"):
                 if legacy_none_packer is not None:
                     if lang == "ko":
@@ -7005,6 +8301,8 @@ def replace_fonts_in_file(
                 _log_console(f"  Parse error: {sdf_parse_failure_reasons[-1]}")
 
     if modified and save_success:
+        if patched_material_identities is not None:
+            patched_material_identities.update(newly_patched_material_identities)
         _commit_staged_deferred_patches(
             staged_texture_plans,
             deferred_texture_plans,
@@ -7087,11 +8385,6 @@ def replace_fonts_in_file(
 
     if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
-    if not using_custom_temp_root and os.path.isdir(tmp_root):
-        try:
-            os.rmdir(tmp_root)
-        except OSError:
-            pass
 
     return save_success if modified else False
 
@@ -7256,6 +8549,7 @@ def run_validation_worker(
     bundle_path: str,
     lang: Language = "ko",
     inner_names: list[str] | None = None,
+    object_manifest_path: str | None = None,
 ) -> int:
     """KR: 저장 검증 전용 워커입니다. 가능한 경우 경량 structural 검증을 수행합니다.
     EN: Dedicated save-validation worker. Performs lightweight structural validation when possible.
@@ -7268,19 +8562,36 @@ def run_validation_worker(
                 _log_console("[validate] Validation failed: saved file does not exist.")
             return 2
 
+        object_manifest: list[JsonDict] = []
+        if object_manifest_path:
+            with open(object_manifest_path, "r", encoding="utf-8") as manifest_file:
+                loaded_manifest = json.load(manifest_file)
+            if not isinstance(loaded_manifest, list):
+                raise ValueError("object validation manifest must be a list")
+            object_manifest = [
+                cast(JsonDict, item)
+                for item in loaded_manifest
+                if isinstance(item, dict)
+            ]
+            if len(object_manifest) != len(loaded_manifest):
+                raise ValueError("object validation manifest contains invalid entries")
+
         signature = _read_bundle_signature(bundle_path, BUNDLE_SIGNATURES)
         if signature == "UnityFS":
             ok, reason = _structural_validate_unityfs_bundle(
                 bundle_path,
                 inner_names=inner_names,
             )
-            if ok:
+            if not ok:
+                if lang == "ko":
+                    _log_console(f"[validate] structural 검증 실패: {reason}")
+                else:
+                    _log_console(
+                        f"[validate] Structural validation failed: {reason}"
+                    )
+                return 2
+            if not object_manifest:
                 return 0
-            if lang == "ko":
-                _log_console(f"[validate] structural 검증 실패: {reason}")
-            else:
-                _log_console(f"[validate] Structural validation failed: {reason}")
-            return 2
 
         env = load_unitypy(bundle_path)
         files = getattr(env, "files", None)
@@ -7302,6 +8613,8 @@ def run_validation_worker(
                     "[validate] Validation failed: loaded object list is empty."
                 )
             return 2
+        if object_manifest:
+            _validate_object_manifest(env, object_manifest)
         return 0
     except Exception as e:
         if lang == "ko":
@@ -7503,14 +8816,15 @@ def main_cli(lang: Language = "ko") -> None:
             "스캔 제외 확장자 목록 (콤마 구분, 예: \"resS,.resource\")"
         )
         charset_help = "TTF/OTF에서 SDF 자동 생성 시 사용할 글자셋 파일 또는 직접 문자열 (기본: CharList_3911.txt)"
-        game_mat_help = "SDF 교체 시 게임 원본 Material 파라미터를 보정 없이 그대로 유지 (기본: 원본 스타일 유지 + atlas/padding 자동 보정)"
-        force_raster_help = "SDF 교체 시 교체 폰트를 Raster 모드로 강제 (렌더 모드/Material 효과값 Raster 기준 적용)"
+        game_mat_help = "이전 CLI 호환용. 게임 Material 스타일 보존은 기본이며 필수 atlas/shader 값은 항상 동기화"
+        force_raster_help = "지원 중단: 호환 Bitmap shader 연결을 안전하게 바꿀 수 없어 사용 시 오류"
+        freeze_dynamic_help = "Dynamic/DynamicOS TMP FontAsset을 baked Static atlas로 명시적으로 고정하고 source Font PPtr 해제"
         game_line_metrics_help = "SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용)"
         outline_ratio_help = (
             "SDF 외곽선 비율 배율 (기본: 1.0, _OutlineWidth/_OutlineSoftness에 적용)"
         )
         original_compress_help = (
-            "저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선)"
+            "저장 시 원본 압축 모드를 우선 사용 (기본값; --no-original-compress로 해제)"
         )
         temp_dir_help = "임시 저장 폴더 루트 경로 (가능하면 빠른 SSD/NVMe 권장)"
         output_only_help = (
@@ -7556,13 +8870,14 @@ Examples:
             "Additional scan-excluded extensions (comma-separated, e.g. \"resS,.resource\")"
         )
         charset_help = "Charset file or literal characters for TTF/OTF-to-SDF auto-generation (default: CharList_3911.txt)"
-        game_mat_help = "Keep original in-game Material parameters without correction for SDF replacement (default: preserve original style with automatic atlas/padding correction)"
-        force_raster_help = "Force replacement fonts into Raster mode for SDF replacement (render mode/material effects follow Raster behavior)"
+        game_mat_help = "Legacy CLI compatibility. Game Material style is preserved by default; required atlas/shader values are always synchronized"
+        force_raster_help = "Unsupported: fails safely because a compatible Bitmap shader cannot yet be retargeted"
+        freeze_dynamic_help = "Explicitly freeze Dynamic/DynamicOS TMP FontAssets to a baked Static atlas and clear the source Font PPtr"
         game_line_metrics_help = "Use original in-game line metrics for SDF replacement (default: adjusted replacement font metrics)"
         outline_ratio_help = (
             "SDF outline ratio multiplier (default: 1.0, applied to _OutlineWidth/_OutlineSoftness)"
         )
-        original_compress_help = "Prefer original compression mode on save (default: uncompressed-family first)"
+        original_compress_help = "Prefer original compression mode on save (default; disable with --no-original-compress)"
         temp_dir_help = "Root path for temporary save files (fast SSD/NVMe recommended)"
         output_only_help = "Keep originals untouched and write modified files only to this folder (preserve relative paths)"
         preview_help = "Export preview PNGs (Atlas + glyph crops) for all SDF fonts into preview folder (unswizzled when used with --ps5-swizzle)"
@@ -7598,6 +8913,9 @@ Examples:
     parser.add_argument("--charset", type=str, metavar="PATH_OR_TEXT", help=charset_help)
     parser.add_argument("--use-game-material", action="store_true", help=game_mat_help)
     parser.add_argument("--force-raster", action="store_true", help=force_raster_help)
+    parser.add_argument(
+        "--freeze-dynamic", action="store_true", help=freeze_dynamic_help
+    )
     parser.add_argument("--use-game-mat", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--use-game-line-metrics", action="store_true", help=game_line_metrics_help
@@ -7613,7 +8931,10 @@ Examples:
         "--use-game-line-matrics", action="store_true", help=argparse.SUPPRESS
     )
     parser.add_argument(
-        "--original-compress", action="store_true", help=original_compress_help
+        "--original-compress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=original_compress_help,
     )
     parser.add_argument("--temp-dir", type=str, metavar="PATH", help=temp_dir_help)
     parser.add_argument(
@@ -7652,6 +8973,12 @@ Examples:
         "--_validate-inner-name",
         action="append",
         metavar="INNER_NAME",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--_validate-object-manifest",
+        type=str,
+        metavar="JSON_PATH",
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -7817,6 +9144,19 @@ Examples:
                 "--outline-ratio must be a float greater than 0.",
                 lang=lang,
             )
+    if args.force_raster:
+        if is_ko:
+            exit_with_error(
+                "--force-raster는 호환 Bitmap shader의 Material.m_Shader 연결을 "
+                "안전하게 바꿀 수 없어 현재 지원하지 않습니다.",
+                lang=lang,
+            )
+        else:
+            exit_with_error(
+                "--force-raster is currently unsupported because Material.m_Shader "
+                "cannot yet be safely retargeted to a compatible Bitmap shader.",
+                lang=lang,
+            )
     interactive_mode_requested = len(explicit_primary_modes) == 0
     scan_jobs_explicit = any(
         arg == "--scan-jobs"
@@ -7928,15 +9268,6 @@ Examples:
             _log_console(
                 "Material mode: preserving original in-game Material style with automatic atlas/padding correction."
             )
-    if args.force_raster:
-        if is_ko:
-            _log_console(
-                "Raster 강제 모드: SDF 교체를 Raster 기준으로 처리합니다 (렌더 모드 + Material 효과값 보정)."
-            )
-        else:
-            _log_console(
-                "Forced Raster mode: processing SDF replacements with Raster behavior (render mode + material effect neutralization)."
-            )
     if args.ps5_swizzle:
         if is_ko:
             _log_console(
@@ -7969,6 +9300,7 @@ Examples:
                 args._validate_bundle,
                 lang=lang,
                 inner_names=args._validate_inner_name,
+                object_manifest_path=args._validate_object_manifest,
             )
         )
 
@@ -8190,9 +9522,15 @@ Examples:
 
     compile_method = get_compile_method(data_path)
     detected_unity_version = get_unity_version(game_path, lang=lang)
-    default_temp_root = register_temp_dir_for_cleanup(os.path.join(data_path, "temp"))
-    if os.path.exists(default_temp_root):
-        shutil.rmtree(default_temp_root)
+    generator_cache_root = args.temp_dir
+    if args.temp_dir is None:
+        args.temp_dir = register_temp_dir_for_cleanup(
+            tempfile.mkdtemp(prefix="unity_font_replacer_")
+        )
+        if is_ko:
+            _log_console(f"외부 임시 저장 경로: {args.temp_dir}")
+        else:
+            _log_console(f"External temporary save path: {args.temp_dir}")
 
     replace_ttf = not args.sdfonly
     replace_sdf = not args.ttfonly
@@ -8259,9 +9597,7 @@ Examples:
         f"replace_ttf={replace_ttf} replace_sdf={replace_sdf}"
     )
 
-    if replace_sdf and compile_method == "Il2cpp" and not os.path.exists(
-        os.path.join(data_path, "Managed")
-    ):
+    if replace_sdf and compile_method == "Il2cpp":
         binary_path = os.path.join(game_path, "GameAssembly.dll")
         metadata_path = os.path.join(
             data_path, "il2cpp_data", "Metadata", "global-metadata.dat"
@@ -8269,68 +9605,23 @@ Examples:
         if not os.path.exists(binary_path) or not os.path.exists(metadata_path):
             if is_ko:
                 exit_with_error(
-                    "Il2cpp 게임의 경우 'Managed' 폴더 또는 'GameAssembly.dll'과 'global-metadata.dat' 파일이 필요합니다.\n올바른 Unity 게임 폴더인지 확인해주세요.",
+                    "Il2cpp 게임은 'GameAssembly.dll'과 'global-metadata.dat' 파일이 필요합니다.\n올바른 Unity 게임 폴더인지 확인해주세요.",
                     lang=lang,
                 )
             else:
                 exit_with_error(
-                    "For Il2cpp games, the 'Managed' folder or 'GameAssembly.dll' and 'global-metadata.dat' files are required.\nPlease check that this is a valid Unity game folder.",
+                    "IL2CPP games require 'GameAssembly.dll' and 'global-metadata.dat'.\nPlease check that this is a valid Unity game folder.",
                     lang=lang,
                 )
-
-        dumper_path = os.path.join(get_script_dir(), "Il2CppDumper", "Il2CppDumper.exe")
-        target_path = os.path.join(data_path, "Managed_")
-        os.makedirs(target_path, exist_ok=True)
-        command = [
-            os.path.abspath(dumper_path),
-            os.path.abspath(binary_path),
-            os.path.abspath(metadata_path),
-            os.path.abspath(target_path),
-        ]
         if is_ko:
-            _log_console("Il2cpp 게임을 위한 Managed 폴더를 생성합니다...")
-        else:
-            _log_console("Creating Managed folder for Il2cpp game...")
-        _log_console(os.path.abspath(target_path))
-
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
-        try:
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                startupinfo=startupinfo,
-                encoding="utf-8",
+            _log_console(
+                "IL2CPP DummyDll을 외부 캐시에서 로드합니다 (게임 폴더는 변경하지 않음)."
             )
-            if process.returncode == 0:
-                _log_console(process.stdout)
-                shutil.move(
-                    os.path.join(data_path, "Managed_", "DummyDll"),
-                    os.path.join(data_path, "Managed"),
-                )
-                shutil.rmtree(os.path.join(data_path, "Managed_"))
-                if is_ko:
-                    _log_console("더미 DLL 생성에 성공했습니다!")
-                else:
-                    _log_console("Dummy DLL generated successfully!")
-                compile_method = get_compile_method(data_path)
-                if is_ko:
-                    _log_console(f"컴파일 방식 재감지: {compile_method}")
-                else:
-                    _log_console(f"Compile method re-detected: {compile_method}")
-            else:
-                _log_console(process.stderr)
-                if is_ko:
-                    exit_with_error("Il2cpp 더미 DLL 생성 실패", lang=lang)
-                else:
-                    exit_with_error("Failed to generate Il2cpp dummy DLL", lang=lang)
-        except Exception as e:
-            if is_ko:
-                exit_with_error(f"Il2CppDumper 실행 중 예외 발생: {e}", lang=lang)
-            else:
-                exit_with_error(f"Exception while running Il2CppDumper: {e}", lang=lang)
+        else:
+            _log_console(
+                "Loading IL2CPP DummyDll files from an external cache without "
+                "modifying the game folder."
+            )
 
     if mode == "parse":
         parse_fonts(
@@ -8516,6 +9807,7 @@ Examples:
             data_path,
             compile_method,
             lang=lang,
+            cache_root=generator_cache_root,
         )
         if replace_sdf
         else None
@@ -8579,6 +9871,23 @@ Examples:
     _log_debug(
         f"[runtime] matched_asset_files={len(asset_file_queue)} all_candidates={len(all_assets_files)}"
     )
+    if mode != "preview_export" and any(
+        len(key) == 4 and key[0] == "SDF" for key in replacement_lookup
+    ):
+        if is_ko:
+            _log_console("공유 TMP Atlas 소유권을 읽기 전용으로 사전 검사합니다...")
+        else:
+            _log_console("Preflighting shared TMP atlas ownership (read-only)...")
+        _preflight_shared_atlas_owners(
+            all_assets_files,
+            replacement_lookup,
+            generator,
+            asset_file_index,
+        )
+        if is_ko:
+            _log_console("공유 TMP Atlas 소유권 검사 완료")
+        else:
+            _log_console("Shared TMP atlas ownership preflight completed")
     deferred_transaction = (
         _DeferredPatchTransaction(
             os.path.join(
@@ -8602,11 +9911,13 @@ Examples:
     deferred_material_plans: dict[str, dict[str, Any]] = {}
     deferred_material_atlas_plans: dict[str, dict[str, Any]] = {}
     collected_material_atlas_plans: dict[str, JsonDict] = {}
+    patched_material_identities: set[str] = set()
     pending_external_patch_files: set[str] = set()
     pending_queue_keys: set[str] = set(asset_file_queue)
     prepared_output_targets: set[str] = set()
     terminal_failures: list[str] = []
     modified_count = 0
+    modified_asset_keys: set[str] = set()
     queue_index = 0
     while queue_index < len(asset_file_queue):
         asset_file_key = asset_file_queue[queue_index]
@@ -8712,6 +10023,7 @@ Examples:
                             replace_sdf=replace_sdf,
                             use_game_mat=args.use_game_material,
                             force_raster=args.force_raster,
+                            freeze_dynamic=args.freeze_dynamic,
                             use_game_line_metrics=args.use_game_line_metrics,
                             material_scale_by_padding=material_scale_by_padding,
                             outline_ratio=args.outline_ratio,
@@ -8729,6 +10041,7 @@ Examples:
                             deferred_material_plans=deferred_material_plans,
                             deferred_material_atlas_plans=deferred_material_atlas_plans,
                             collected_material_atlas_plans=collected_material_atlas_plans,
+                            patched_material_identities=patched_material_identities,
                             pending_external_patch_files=pending_external_patch_files,
                             logical_file_key=asset_file_key,
                             deferred_transaction=deferred_transaction,
@@ -8777,6 +10090,7 @@ Examples:
                                 replace_sdf=False,
                                 use_game_mat=args.use_game_material,
                                 force_raster=args.force_raster,
+                                freeze_dynamic=args.freeze_dynamic,
                                 use_game_line_metrics=args.use_game_line_metrics,
                                 material_scale_by_padding=material_scale_by_padding,
                                 outline_ratio=args.outline_ratio,
@@ -8794,6 +10108,7 @@ Examples:
                                 deferred_material_plans=deferred_material_plans,
                                 deferred_material_atlas_plans=deferred_material_atlas_plans,
                                 collected_material_atlas_plans=collected_material_atlas_plans,
+                                patched_material_identities=patched_material_identities,
                                 pending_external_patch_files=pending_external_patch_files,
                                 logical_file_key=asset_file_key,
                                 deferred_transaction=deferred_transaction,
@@ -8897,6 +10212,7 @@ Examples:
                                         replace_sdf=True,
                                         use_game_mat=args.use_game_material,
                                         force_raster=args.force_raster,
+                                        freeze_dynamic=args.freeze_dynamic,
                                         use_game_line_metrics=args.use_game_line_metrics,
                                         material_scale_by_padding=material_scale_by_padding,
                                         outline_ratio=args.outline_ratio,
@@ -8914,6 +10230,7 @@ Examples:
                                         deferred_material_plans=deferred_material_plans,
                                         deferred_material_atlas_plans=deferred_material_atlas_plans,
                                         collected_material_atlas_plans=collected_material_atlas_plans,
+                                        patched_material_identities=patched_material_identities,
                                         pending_external_patch_files=pending_external_patch_files,
                                         logical_file_key=asset_file_key,
                                         deferred_transaction=deferred_transaction,
@@ -9038,6 +10355,7 @@ Examples:
                         replace_sdf,
                         use_game_mat=args.use_game_material,
                         force_raster=args.force_raster,
+                        freeze_dynamic=args.freeze_dynamic,
                         use_game_line_metrics=args.use_game_line_metrics,
                         material_scale_by_padding=material_scale_by_padding,
                         outline_ratio=args.outline_ratio,
@@ -9055,6 +10373,7 @@ Examples:
                         deferred_material_plans=deferred_material_plans,
                         deferred_material_atlas_plans=deferred_material_atlas_plans,
                         collected_material_atlas_plans=collected_material_atlas_plans,
+                        patched_material_identities=patched_material_identities,
                         pending_external_patch_files=pending_external_patch_files,
                         logical_file_key=asset_file_key,
                         deferred_transaction=deferred_transaction,
@@ -9094,7 +10413,9 @@ Examples:
                         deferred_transaction.fail(failure)
 
             if file_modified:
-                modified_count += 1
+                if asset_file_key not in modified_asset_keys:
+                    modified_asset_keys.add(asset_file_key)
+                    modified_count += 1
 
             if (
                 deferred_transaction is not None
@@ -9122,7 +10443,7 @@ Examples:
                 )
 
     reconciliation_buckets = _build_material_atlas_reconciliation_buckets(
-        asset_file_queue,
+        asset_path_by_key.keys(),
         collected_material_atlas_plans,
     )
     if (
@@ -9142,12 +10463,24 @@ Examples:
             if not assets_file:
                 continue
             working_assets_file = assets_file
+            created_output_copy = False
             if output_only_root:
                 working_assets_file = resolve_output_only_path(
                     assets_file,
                     data_path,
                     output_only_root,
                 )
+                if not os.path.exists(working_assets_file):
+                    output_parent = os.path.dirname(working_assets_file)
+                    if output_parent:
+                        os.makedirs(output_parent, exist_ok=True)
+                    if deferred_transaction is not None:
+                        deferred_transaction.backup(
+                            working_assets_file,
+                            allow_missing=True,
+                        )
+                    shutil.copy2(assets_file, working_assets_file)
+                    created_output_copy = True
             reconciliation_outcome: JsonDict = {}
             try:
                 replace_fonts_in_file(
@@ -9159,6 +10492,7 @@ Examples:
                     replace_sdf=False,
                     use_game_mat=args.use_game_material,
                     force_raster=args.force_raster,
+                    freeze_dynamic=args.freeze_dynamic,
                     use_game_line_metrics=args.use_game_line_metrics,
                     material_scale_by_padding=material_scale_by_padding,
                     outline_ratio=args.outline_ratio,
@@ -9171,6 +10505,7 @@ Examples:
                     charset_source=args.charset,
                     asset_file_index=asset_file_index,
                     deferred_material_atlas_plans=reconciliation_buckets,
+                    patched_material_identities=patched_material_identities,
                     logical_file_key=asset_file_key,
                     deferred_transaction=deferred_transaction,
                     operation_outcome=reconciliation_outcome,
@@ -9186,6 +10521,15 @@ Examples:
                     terminal_failures.append(failure)
                     if deferred_transaction is not None:
                         deferred_transaction.fail(failure)
+                elif bool(reconciliation_outcome.get("modified")):
+                    if asset_file_key not in modified_asset_keys:
+                        modified_asset_keys.add(asset_file_key)
+                        modified_count += 1
+                elif created_output_copy:
+                    try:
+                        os.remove(working_assets_file)
+                    except FileNotFoundError:
+                        pass
             except Exception as exc:
                 failure = (
                     f"{os.path.basename(assets_file)}: material reconciliation "
@@ -9199,6 +10543,46 @@ Examples:
                 and deferred_transaction.has_failures
             ):
                 break
+
+    if (
+        mode != "preview_export"
+        and not terminal_failures
+        and not (
+            deferred_transaction is not None
+            and deferred_transaction.has_failures
+        )
+    ):
+        try:
+            changed_catalogs = _update_addressables_catalogs_for_modified_bundles(
+                data_path=data_path,
+                output_only_root=output_only_root,
+                modified_asset_keys=modified_asset_keys,
+                asset_path_by_key=asset_path_by_key,
+                transaction=deferred_transaction,
+            )
+            for catalog_path in changed_catalogs:
+                catalog_key = _normalize_asset_file_key(catalog_path) or catalog_path
+                if catalog_key not in modified_asset_keys:
+                    modified_asset_keys.add(catalog_key)
+                    modified_count += 1
+            if changed_catalogs:
+                if is_ko:
+                    _log_console(
+                        f"Addressables catalog CRC/크기 갱신: {len(changed_catalogs)}개"
+                    )
+                else:
+                    _log_console(
+                        "Updated Addressables catalog CRC/size records: "
+                        f"{len(changed_catalogs)}"
+                    )
+        except Exception as exc:
+            failure = (
+                "Addressables catalog update failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            terminal_failures.append(failure)
+            if deferred_transaction is not None:
+                deferred_transaction.fail(failure)
 
     for remaining_bucket in reconciliation_buckets.values():
         _cleanup_deferred_patch_bucket(remaining_bucket)

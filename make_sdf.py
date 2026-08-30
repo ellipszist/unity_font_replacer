@@ -40,6 +40,7 @@ import argparse
 import io
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -270,6 +271,282 @@ def _get_ttf_name_info(ttf_data: bytes, fallback_name: str) -> tuple[str, str, i
     return family_name, style_name, units_per_em
 
 
+def _resolve_unicode_glyph_map(
+    ttf_data: bytes,
+    unicodes: list[int],
+) -> list[tuple[int, int]]:
+    """Resolve Unicode values to the source font's real glyph indices."""
+    if TTFont is None:
+        raise RuntimeError("fontTools is required to resolve source glyph indices")
+    try:
+        with TTFont(io.BytesIO(ttf_data), lazy=True) as font:
+            cmap = font.getBestCmap() or {}
+            resolved: list[tuple[int, int]] = []
+            seen_unicodes: set[int] = set()
+            for raw_codepoint in unicodes:
+                codepoint = int(raw_codepoint)
+                if codepoint in seen_unicodes or not (0 <= codepoint <= 0x10FFFF):
+                    continue
+                seen_unicodes.add(codepoint)
+                glyph_name = cmap.get(codepoint)
+                if glyph_name is None:
+                    continue
+                try:
+                    glyph_index = int(font.getGlyphID(glyph_name))
+                except Exception:
+                    continue
+                if glyph_index < 0:
+                    continue
+                resolved.append((codepoint, glyph_index))
+            return resolved
+    except Exception as exc:
+        raise ValueError("Could not resolve the TTF/OTF cmap glyph indices") from exc
+
+
+def _tmp_value_record(
+    *,
+    x_placement: float = 0.0,
+    y_placement: float = 0.0,
+    x_advance: float = 0.0,
+    y_advance: float = 0.0,
+    modern: bool,
+) -> JsonDict:
+    """Return the exact serialized names used by one TMP value-record family."""
+    prefix = "m_" if modern else ""
+    return {
+        f"{prefix}XPlacement" if modern else "xPlacement": float(x_placement),
+        f"{prefix}YPlacement" if modern else "yPlacement": float(y_placement),
+        f"{prefix}XAdvance" if modern else "xAdvance": float(x_advance),
+        f"{prefix}YAdvance" if modern else "yAdvance": float(y_advance),
+    }
+
+
+def _quantize_tmp_font_units(value: float) -> float:
+    """Match Unity FontEngine's 1/64-pixel, half-away-from-zero rounding."""
+    scaled = float(value) * 64.0
+    rounded = math.floor(scaled + 0.5) if scaled >= 0 else math.ceil(scaled - 0.5)
+    return float(rounded / 64.0)
+
+
+def _validate_supported_open_type_features(ttf_data: bytes) -> None:
+    """Fail before atlas generation when features cannot be represented safely."""
+    if TTFont is None:
+        raise RuntimeError("fontTools is required to preserve font features")
+    try:
+        with TTFont(io.BytesIO(ttf_data), lazy=True) as font:
+            unsupported_tables = [tag for tag in ("GPOS", "GSUB") if tag in font]
+            if unsupported_tables:
+                raise ValueError(
+                    "Automatic TMP feature conversion does not yet support "
+                    + "/".join(unsupported_tables)
+                    + "; refusing to silently discard positioning or substitution data"
+                )
+            kern = font.get("kern")
+            if kern is not None and int(getattr(kern, "version", -1)) != 0:
+                raise ValueError("Unsupported non-version-0 OpenType kern table")
+            populated_subtables = 0
+            for subtable in getattr(kern, "kernTables", []) if kern else []:
+                raw_pairs = getattr(subtable, "kernTable", None)
+                if not isinstance(raw_pairs, dict) or not raw_pairs:
+                    continue
+                populated_subtables += 1
+                coverage = int(getattr(subtable, "coverage", 0) or 0)
+                if int(getattr(subtable, "format", 0) or 0) != 0:
+                    raise ValueError("Unsupported non-format-0 OpenType kern subtable")
+                if not (coverage & 0x1) or (coverage & 0x6):
+                    raise ValueError("Unsupported vertical/minimum OpenType kern subtable")
+            if populated_subtables > 1:
+                raise ValueError("Multiple OpenType kern subtables are not yet supported")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Could not read OpenType font feature tables") from exc
+
+
+def apply_tmp_gdef_classes(ttf_data: bytes, sdf_data: JsonDict) -> None:
+    """Copy selected OpenType GDEF glyph classes into TMP glyph records."""
+    if TTFont is None:
+        raise RuntimeError("fontTools is required to preserve glyph classes")
+    glyph_table = sdf_data.get("m_GlyphTable")
+    if not isinstance(glyph_table, list):
+        return
+    try:
+        with TTFont(io.BytesIO(ttf_data), lazy=True) as font:
+            if "GDEF" not in font:
+                return
+            gdef = font["GDEF"].table
+            attach_list = getattr(gdef, "AttachList", None)
+            lig_caret_list = getattr(gdef, "LigCaretList", None)
+            mark_attach = getattr(gdef, "MarkAttachClassDef", None)
+            mark_sets = getattr(gdef, "MarkGlyphSetsDef", None)
+            unsupported_gdef = {
+                "AttachList": bool(getattr(attach_list, "AttachPoint", [])),
+                "LigCaretList": bool(getattr(lig_caret_list, "LigGlyph", [])),
+                "MarkAttachClassDef": bool(
+                    getattr(mark_attach, "classDefs", {})
+                ),
+                "MarkGlyphSetsDef": bool(getattr(mark_sets, "Coverage", [])),
+            }
+            for field_name, is_nonempty in unsupported_gdef.items():
+                if is_nonempty:
+                    raise ValueError(
+                        f"Unsupported nonempty OpenType GDEF {field_name} data"
+                    )
+            class_defs = getattr(getattr(gdef, "GlyphClassDef", None), "classDefs", {})
+            if not isinstance(class_defs, dict):
+                return
+            class_by_index = {
+                int(font.getGlyphID(str(glyph_name))): int(class_value)
+                for glyph_name, class_value in class_defs.items()
+            }
+            for glyph in glyph_table:
+                if not isinstance(glyph, dict):
+                    continue
+                glyph_index = _safe_int(glyph.get("m_Index", -1), -1)
+                if glyph_index in class_by_index:
+                    glyph["m_ClassDefinitionType"] = class_by_index[glyph_index]
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Could not read OpenType GDEF glyph classes") from exc
+
+
+def build_tmp_font_feature_payload(
+    ttf_data: bytes,
+    sdf_data: JsonDict,
+) -> JsonDict:
+    """Build TMP pair-adjustment and legacy kerning records from OpenType kern."""
+    if TTFont is None:
+        raise RuntimeError("fontTools is required to preserve font features")
+    _validate_supported_open_type_features(ttf_data)
+
+    glyph_table = sdf_data.get("m_GlyphTable")
+    character_table = sdf_data.get("m_CharacterTable")
+    face_info = sdf_data.get("m_FaceInfo")
+    if (
+        not isinstance(glyph_table, list)
+        or not isinstance(character_table, list)
+        or not isinstance(face_info, dict)
+    ):
+        raise ValueError("SDF metadata is missing glyph, character, or face data")
+
+    allowed_glyphs = {
+        _safe_int(glyph.get("m_Index", -1), -1)
+        for glyph in glyph_table
+        if isinstance(glyph, dict)
+    }
+    allowed_glyphs.discard(-1)
+    unicodes_by_glyph: dict[int, set[int]] = {}
+    for character in character_table:
+        if not isinstance(character, dict):
+            continue
+        unicode_value = _safe_int(character.get("m_Unicode", -1), -1)
+        glyph_index = _safe_int(character.get("m_GlyphIndex", -1), -1)
+        if unicode_value < 0 or glyph_index not in allowed_glyphs:
+            continue
+        unicodes_by_glyph.setdefault(glyph_index, set()).add(unicode_value)
+
+    point_size = float(face_info.get("m_PointSize", 0) or 0)
+    units_per_em = float(face_info.get("m_UnitsPerEM", 0) or 0)
+    if point_size <= 0 or units_per_em <= 0:
+        raise ValueError("SDF face point size and units-per-em must be positive")
+    scale = point_size / units_per_em
+
+    pair_values: dict[tuple[int, int], float] = {}
+    try:
+        with TTFont(io.BytesIO(ttf_data), lazy=True) as font:
+            kern = font.get("kern")
+            for subtable in getattr(kern, "kernTables", []) if kern else []:
+                raw_pairs = getattr(subtable, "kernTable", None)
+                if not isinstance(raw_pairs, dict) or not raw_pairs:
+                    continue
+                coverage = int(getattr(subtable, "coverage", 0) or 0)
+                if int(getattr(subtable, "format", 0) or 0) != 0:
+                    raise ValueError("Unsupported non-format-0 OpenType kern subtable")
+                if not (coverage & 0x1) or (coverage & 0x6):
+                    raise ValueError("Unsupported vertical/minimum OpenType kern subtable")
+                override = bool(coverage & 0x8)
+                for raw_pair, raw_value in raw_pairs.items():
+                    if not isinstance(raw_pair, tuple) or len(raw_pair) != 2:
+                        continue
+                    try:
+                        left = (
+                            int(raw_pair[0])
+                            if isinstance(raw_pair[0], int)
+                            else int(font.getGlyphID(str(raw_pair[0])))
+                        )
+                        right = (
+                            int(raw_pair[1])
+                            if isinstance(raw_pair[1], int)
+                            else int(font.getGlyphID(str(raw_pair[1])))
+                        )
+                        value = float(raw_value) * scale
+                    except Exception:
+                        continue
+                    if left not in allowed_glyphs or right not in allowed_glyphs:
+                        continue
+                    key = (left, right)
+                    pair_values[key] = value if override else pair_values.get(key, 0.0) + value
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Could not read OpenType font feature tables") from exc
+
+    modern_pairs: list[JsonDict] = []
+    legacy_pairs: list[JsonDict] = []
+    for (left, right), raw_value in sorted(pair_values.items()):
+        value = _quantize_tmp_font_units(raw_value)
+        if value == 0.0:
+            continue
+        modern_first_value = _tmp_value_record(x_advance=value, modern=True)
+        modern_second_value = _tmp_value_record(modern=True)
+        modern_pairs.append(
+            {
+                "m_FirstAdjustmentRecord": {
+                    "m_GlyphIndex": int(left),
+                    "m_GlyphValueRecord": modern_first_value,
+                },
+                "m_SecondAdjustmentRecord": {
+                    "m_GlyphIndex": int(right),
+                    "m_GlyphValueRecord": modern_second_value,
+                },
+                "m_FeatureLookupFlags": 0,
+            }
+        )
+        legacy_first_value = _tmp_value_record(x_advance=value, modern=False)
+        legacy_second_value = _tmp_value_record(modern=False)
+        for left_unicode in sorted(unicodes_by_glyph.get(left, set())):
+            for right_unicode in sorted(unicodes_by_glyph.get(right, set())):
+                legacy_pairs.append(
+                    {
+                        "AscII_Left": int(left_unicode),
+                        "AscII_Right": int(right_unicode),
+                        "XadvanceOffset": value,
+                        "m_FirstGlyph": int(left_unicode),
+                        "m_FirstGlyphAdjustments": legacy_first_value,
+                        "m_SecondGlyph": int(right_unicode),
+                        "m_SecondGlyphAdjustments": legacy_second_value,
+                        "xOffset": 0.0,
+                        "m_IgnoreSpacingAdjustments": 0,
+                    }
+                )
+
+    legacy_pairs.sort(key=lambda pair: (pair["AscII_Left"], pair["AscII_Right"]))
+
+    legacy_table = {"kerningPairs": legacy_pairs}
+    return {
+        "m_FontFeatureTable": {
+            "m_MultipleSubstitutionRecords": [],
+            "m_LigatureSubstitutionRecords": [],
+            "m_GlyphPairAdjustmentRecords": modern_pairs,
+            "m_MarkToBaseAdjustmentRecords": [],
+            "m_MarkToMarkAdjustmentRecords": [],
+        },
+        "m_KerningTable": legacy_table,
+        "m_kerningInfo": legacy_table,
+    }
+
+
 # --------------------------------------------------------------------------- #
 #  KR: 글리프 메트릭 측정
 #  EN: Glyph metric measurement
@@ -409,7 +686,16 @@ def _pack_rectangles_shelf(
             return None
 
         placements[glyph_index] = (x, y, rect_w, rect_h)
-        used_rects.append({"m_X": x, "m_Y": y, "m_Width": rect_w, "m_Height": rect_h})
+        # Shelf placement uses PIL's top-origin coordinates, but Unity
+        # GlyphRect (including m_UsedGlyphRects) uses a bottom-origin Y.
+        used_rects.append(
+            {
+                "m_X": x,
+                "m_Y": atlas_height - y - rect_h,
+                "m_Width": rect_w,
+                "m_Height": rect_h,
+            }
+        )
         x += rect_w
         row_height = max(row_height, rect_h)
 
@@ -657,6 +943,17 @@ def generate_sdf_assets_from_ttf(
     # KR: TTF 메타데이터(패밀리명, 스타일, unitsPerEm) 추출
     # EN: Extract TTF metadata (family name, style, unitsPerEm)
     family_name, style_name, units_per_em = _get_ttf_name_info(ttf_data, font_name)
+    resolved_characters = _resolve_unicode_glyph_map(ttf_data, unicodes)
+    if not resolved_characters:
+        _emit("[cmap] none of the requested characters exist in the source font.")
+        return None
+    if len(resolved_characters) != len(set(map(int, unicodes))):
+        _emit(
+            "[cmap] skipped "
+            f"{len(set(map(int, unicodes))) - len(resolved_characters)} "
+            "characters missing from the source font."
+        )
+    _validate_supported_open_type_features(ttf_data)
 
     # KR: 레이아웃 캐시: 동일 포인트 크기 재계산 방지
     # EN: Layout cache: avoid recomputation for same point size
@@ -678,10 +975,19 @@ def generate_sdf_assets_from_ttf(
             return None
 
         ascent, descent = font.getmetrics()
-        glyph_entries: list[JsonDict] = []
+        glyph_entries_by_index: dict[int, JsonDict] = {}
+        character_entries: list[JsonDict] = []
         rectangles: list[tuple[int, int, int]] = []
 
-        for code in unicodes:
+        for code, glyph_index in resolved_characters:
+            character_entries.append(
+                {
+                    "unicode": int(code),
+                    "glyph_index": int(glyph_index),
+                }
+            )
+            if glyph_index in glyph_entries_by_index:
+                continue
             glyph_w, glyph_h, metrics = _measure_glyph_metrics(
                 font, int(code), int(ascent)
             )
@@ -696,16 +1002,14 @@ def generate_sdf_assets_from_ttf(
                 rect_w = 1
                 rect_h = 1
 
-            rectangles.append((int(code), rect_w, rect_h))
-            glyph_entries.append(
-                {
-                    "unicode": int(code),
-                    "glyph_index": int(code),
-                    "width": glyph_w,
-                    "height": glyph_h,
-                    "metrics": metrics,
-                }
-            )
+            rectangles.append((int(glyph_index), rect_w, rect_h))
+            glyph_entries_by_index[glyph_index] = {
+                "unicode": int(code),
+                "glyph_index": int(glyph_index),
+                "width": glyph_w,
+                "height": glyph_h,
+                "metrics": metrics,
+            }
 
         packed_result = _pack_rectangles_shelf(rectangles, atlas_width, atlas_height)
 
@@ -717,7 +1021,7 @@ def generate_sdf_assets_from_ttf(
         valid_layout, reason = _validate_layout_rectangles(
             placements=placements,
             used_rects=used_rects,
-            glyph_indices={int(code) for code in unicodes},
+            glyph_indices=set(glyph_entries_by_index),
             atlas_width=atlas_width,
             atlas_height=atlas_height,
         )
@@ -733,7 +1037,8 @@ def generate_sdf_assets_from_ttf(
             "point_size": int(candidate_point_size),
             "ascent": int(ascent),
             "descent": int(descent),
-            "glyph_entries": glyph_entries,
+            "glyph_entries": list(glyph_entries_by_index.values()),
+            "character_entries": character_entries,
             "placements": placements,
             "used_rects": used_rects,
             "atlas_w": int(atlas_width),
@@ -796,6 +1101,7 @@ def generate_sdf_assets_from_ttf(
     # EN: Unpack the selected layout
     selected_font = selected_layout["font"]
     selected_entries = selected_layout["glyph_entries"]
+    selected_character_entries = selected_layout["character_entries"]
     selected_placements = selected_layout["placements"]
     selected_used_rects = selected_layout["used_rects"]
     selected_atlas_w = int(selected_layout["atlas_w"])
@@ -940,15 +1246,6 @@ def generate_sdf_assets_from_ttf(
                 "m_ClassDefinitionType": 0,
             }
         )
-        char_table.append(
-            {
-                "m_ElementType": 1,
-                "m_Unicode": unicode_value,
-                "m_GlyphIndex": glyph_index,
-                "m_Scale": 1.0,
-            }
-        )
-
         if idx == 1 or idx == total_entries or idx % progress_step == 0:
             _emit(f"[render] glyph {idx}/{total_entries}")
 
@@ -977,6 +1274,17 @@ def generate_sdf_assets_from_ttf(
             + ", ".join(str(x) for x in sorted(set(duplicate_glyph_indices)))
         )
     glyph_table = unique_glyph_table
+
+    char_table = [
+        {
+            "m_ElementType": 1,
+            "m_Unicode": int(entry["unicode"]),
+            "m_GlyphIndex": int(entry["glyph_index"]),
+            "m_Scale": 1.0,
+        }
+        for entry in selected_character_entries
+        if int(entry["glyph_index"]) in glyph_index_seen
+    ]
 
     # KR: 동일 (unicode, glyph_index) 쌍 중복 제거 + 글리프 테이블에 없는 항목 제외
     # EN: Deduplicate (unicode, glyph_index) pairs + exclude entries not in glyph table
@@ -1069,13 +1377,13 @@ def generate_sdf_assets_from_ttf(
     atlas_rgba[:, :, 3] = atlas_alpha
     atlas_image = Image.fromarray(atlas_rgba, mode="RGBA")
 
-    # KR: TMP m_AtlasRenderMode 값:
-    #     4118 (0x1016) = SDFAA_HINTED -- SDF + 안티앨리어싱 + 힌팅
-    #     4    (0x0004) = Raster_Hinted -- 비트맵 래스터 + 힌팅
-    # EN: TMP m_AtlasRenderMode values:
-    #     4118 (0x1016) = SDFAA_HINTED -- SDF + anti-aliasing + hinting
-    #     4    (0x0004) = Raster_Hinted -- bitmap raster + hinting
-    atlas_render_mode_value = 4118 if normalized_render_mode == "sdf" else 4
+    # KR: Unity TextCore GlyphRenderMode enum의 정확한 값입니다.
+    #     4169 (0x1049) = SDFAA_HINTED, 4121 (0x1019) = SMOOTH_HINTED.
+    #     0x1000은 SDF 표식이 아니라 두 계열이 공유하는 1x sampling bit입니다.
+    # EN: Exact Unity TextCore GlyphRenderMode enum values.
+    #     4169 (0x1049) = SDFAA_HINTED; 4121 (0x1019) = SMOOTH_HINTED.
+    #     0x1000 is the shared 1x sampling bit, not an SDF marker.
+    atlas_render_mode_value = 4169 if normalized_render_mode == "sdf" else 4121
     generated_sdf_data: JsonDict = {
         "m_FaceInfo": face_info,
         "m_GlyphTable": glyph_table,
@@ -1089,6 +1397,10 @@ def generate_sdf_assets_from_ttf(
         "m_FreeGlyphRects": [],
         "m_FontWeightTable": _default_font_weight_table(),
     }
+    apply_tmp_gdef_classes(ttf_data, generated_sdf_data)
+    generated_sdf_data.update(
+        build_tmp_font_feature_payload(ttf_data, generated_sdf_data)
+    )
 
     # ------------------------------------------------------------------ #
     #  KR: Material 셰이더 파라미터

@@ -18,7 +18,8 @@ from unitypy_runtime import (
 
 ROOT = Path(__file__).resolve().parents[1]
 UNITYPY_ROOT = ROOT.parent / "UnityPy"
-SAMPLE_BUNDLE = UNITYPY_ROOT / "tests" / "samples" / "atlas_test"
+ACTIVE_UNITYPY_ROOT = Path(UnityPy.__file__).resolve().parents[1]
+SAMPLE_BUNDLE = ACTIVE_UNITYPY_ROOT / "tests" / "samples" / "atlas_test"
 
 
 class UnityPyRuntimeTests(unittest.TestCase):
@@ -121,10 +122,11 @@ class UnityPyRuntimeTests(unittest.TestCase):
             )
             path_id = texture.path_id
             parsed = texture.parse_as_object()
+            source_image_data = bytes(parsed.get_image_data())
             self.assertTrue(
                 core._binary_patch_texture2d(
                     texture,
-                    image_data=bytes(parsed.image_data),
+                    image_data=source_image_data,
                     width=int(parsed.m_Width),
                     height=int(parsed.m_Height),
                     lang="en",
@@ -144,6 +146,7 @@ class UnityPyRuntimeTests(unittest.TestCase):
                 strict = saved.parse_as_object()
                 self.assertEqual(int(strict.m_Width), int(parsed.m_Width))
                 self.assertEqual(int(strict.m_Height), int(parsed.m_Height))
+                self.assertEqual(bytes(strict.get_image_data()), source_image_data)
             finally:
                 close_unitypy_env(reloaded)
 

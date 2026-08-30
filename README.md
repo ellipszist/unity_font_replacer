@@ -82,8 +82,9 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 
 | 옵션 | 설명 |
 |------|------|
-| `--use-game-material` | 게임 원본 Material 파라미터를 보정 없이 그대로 유지 (기본: 원본 스타일 유지 + atlas/padding 자동 보정) |
-| `--force-raster` | SDF 교체를 Raster 기준으로 강제 (렌더 모드 + Material 효과값 Raster 보정) |
+| `--use-game-material` | 이전 CLI 호환용. 게임 Material 스타일 보존은 기본이며 필수 atlas/shader 값은 항상 동기화 |
+| `--force-raster` | 이전 CLI 호환용. 호환 Bitmap shader를 안전하게 연결할 수 없어 현재는 지정 시 오류로 중단 |
+| `--freeze-dynamic` | Dynamic/DynamicOS TMP FontAsset을 명시적으로 baked Static으로 고정하고 runtime source Font PPtr 해제 |
 | `--use-game-line-metrics` | 게임 원본 줄 간격 메트릭 사용 (pointSize는 교체값 유지) |
 | `--outline-ratio <float>` | 현재 선택된 Material 기준 `_OutlineWidth`, `_OutlineSoftness`에 배율 적용 (기본 `1.0`) |
 | `--charset <파일/문자열>` | TTF/OTF에서 SDF 자동 생성 시 사용할 글자셋 지정 (기본 `CharList_3911.txt`) |
@@ -92,7 +93,7 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 
 | 옵션 | 설명 |
 |------|------|
-| `--original-compress` | 저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선) |
+| `--original-compress` / `--no-original-compress` | 원본 압축 우선 저장 (기본 활성화) / 무압축 계열 우선 저장 |
 | `--temp-dir <경로>` | 임시 저장 폴더 루트 경로 지정 (빠른 SSD/NVMe 권장) |
 | `--output-only <경로>` | 원본은 유지하고, 수정된 파일만 지정 폴더에 저장 (상대 경로 유지) |
 | `--split-save-force` | one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장 |
@@ -153,8 +154,8 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --use-game
 :: 게임 원본 줄 간격 메트릭 유지
 unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --use-game-line-metrics
 
-:: SDF 교체를 Raster 기준으로 강제
-unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --force-raster
+:: Dynamic FontAsset이 있는 게임에서 동적 글리프 추가를 포기하고 Static으로 교체
+unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --freeze-dynamic
 
 :: 현재 선택된 Material 기준 외곽선 1.25배
 unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --outline-ratio 1.25
@@ -227,10 +228,10 @@ JSON 예시 (`--ps5-swizzle` 미사용):
 
 | 필드 | 설명 |
 |------|------|
-| `force_raster` | 해당 항목만 Raster 방식으로 강제 처리 (`"True"` / `"False"`, 기본 `"False"`) |
+| `force_raster` | 이전 JSON 호환용 (`"True"` / `"False"`, 기본 `"False"`) |
 
-- `force_raster: "True"`이면 해당 SDF 교체 항목에서 렌더 모드를 Raster 기준으로 강제하고 Material 효과값 보정을 적용합니다.
-- `--force-raster`를 함께 쓰면 JSON 값과 무관하게 모든 SDF 교체 항목에 Raster 강제가 적용됩니다.
+- SDF와 Bitmap Material은 shader 계약이 달라 `m_AtlasRenderMode`만 바꾸는 변환은 안전하지 않습니다.
+- `force_raster: "True"` 또는 `--force-raster`를 지정하면 파일을 수정하기 전에 명시적 오류로 중단합니다.
 
 ### PS5 swizzle 필드
 
@@ -269,11 +270,11 @@ JSON 예시 (`--ps5-swizzle` 사용, SDF):
 |------|------|
 | 폰트 이름 | `Mulmaru`, `NanumGothic` |
 | TTF 파일 | `Mulmaru.ttf` |
-| SDF JSON | `Mulmaru SDF.json`, `Mulmaru Raster.json` |
-| SDF Atlas | `Mulmaru SDF Atlas.png`, `Mulmaru Raster Atlas.png` |
+| SDF JSON | `Mulmaru SDF.json` |
+| SDF Atlas | `Mulmaru SDF Atlas.png` |
 | Material | `NGothic Material.json` |
 
-SDF 항목의 `Replace_to`에 `.ttf` 또는 `.otf` 파일 경로를 넣으면, 대상 게임 SDF 폰트의 `m_AtlasPadding` 값에 맞춰 임시 SDF/Raster 세트를 자동 생성한 뒤 교체합니다.
+SDF 항목의 `Replace_to`에 `.ttf` 또는 `.otf` 파일 경로를 넣으면, 대상 게임 SDF 폰트의 `m_AtlasPadding` 값에 맞춰 임시 SDF 세트를 자동 생성한 뒤 교체합니다.
 
 ---
 
@@ -392,11 +393,11 @@ EXE 대신 Python 소스로 실행하려면:
 ### 요구 사항
 
 - Python 3.12 권장
-- 패키지: `UnityPy 1.25.2 커스텀 포크`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`, `psutil`
+- 패키지: `UnityPy 1.25.3 커스텀 포크`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`, `psutil`
 
 ```bash
 pip install TypeTreeGeneratorAPI Pillow fonttools numpy scipy psutil
-pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@4018e7600357e185f9986af536d6f105729f0950
+pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@bccc488474556a5aab30121d7a6c7500c54a80c7
 ```
 
 이 저장소와 `UnityPy` 저장소가 같은 상위 폴더에 있으면 소스 실행 시 sibling
@@ -416,11 +417,12 @@ python export_fonts_ko.py "D:\MyGame"
 
 ### 저장
 
-- 저장 기본 모드는 무압축 계열 우선(`safe-none -> legacy-none`)이며, 실패 시 `original -> lz4` 순으로 폴백합니다.
-- 저장 시 원본 압축 우선이 필요하면 `--original-compress`를 사용하세요.
-- 외부 파일의 TMP Atlas/Material 패치는 모두 검증된 경우에만 확정되며, 대상 누락·충돌·저장 실패 시 관련 파일을 실행 전 상태로 롤백합니다.
+- 기본 저장 순서는 `original -> lz4 -> safe-none -> legacy-none`입니다. `--no-original-compress`일 때만 `safe-none -> legacy-none -> original -> lz4` 순서로 시도합니다.
+- 저장된 모든 변경 객체는 파일을 다시 열어 정확한 CAB 이름, signed PathID, raw object SHA-256으로 검증합니다.
+- 외부 파일의 TMP Atlas/Material 및 로컬 Addressables catalog 패치는 모두 검증된 경우에만 확정되며, 대상 누락·충돌·저장 실패 시 관련 파일 전체를 실행 전 상태로 롤백합니다.
+- 로컬 Standalone Addressables bundle은 catalog의 CRC를 0으로 설정하고 실제 크기를 동기화합니다. `m_Hash`는 로컬 `LoadFromFile` 경로에서 사용되지 않아 보존합니다. 원격·UnityWebRequest 강제·비 Standalone 경로는 안전하게 거부합니다.
 - Unity `.split0/.split1` 분할 에셋은 안전한 재분할 저장을 지원하지 않아 교체 대상에서 제외됩니다. 추출기는 `.split0`을 통해 한 번만 읽습니다.
-- 저장 속도가 느리면 `--temp-dir`로 빠른 SSD/NVMe 경로를 지정해 보세요.
+- CLI 임시 파일과 IL2CPP `DummyDll` cache는 게임 폴더 밖의 시스템 임시 경로에 생성됩니다. 저장 속도가 느리면 `--temp-dir`로 빠른 SSD/NVMe 경로를 지정하세요.
 - 프로그램 종료 시 임시 폴더는 자동 정리됩니다.
 - 대형 SDF 다건 교체에서는 기본적으로 one-shot 실패 시 적응형 분할 저장(배치 크기 자동 조절)으로 폴백합니다.
 
@@ -439,22 +441,23 @@ python export_fonts_ko.py "D:\MyGame"
 
 - 기본 줄 간격 메트릭 모드는 게임 원본 비율을 기준으로 교체 폰트 pointSize에 맞게 보정 적용합니다.
 - 게임 원본 줄 간격 메트릭을 그대로 쓰려면 `--use-game-line-metrics`를 사용하세요. (pointSize는 항상 교체 폰트 값)
-- SDF 교체 시 기본은 `KR_ASSETS/* SDF Material.json` 머티리얼 float를 적용하며, padding 비율 기준 보정도 함께 적용합니다.
-- 기본 SDF 교체는 게임 원본 Material 스타일을 유지하고 atlas/padding 차이만 자동 보정합니다.
-- atlas/padding 보정 없이 게임 원본 Material 파라미터를 그대로 쓰려면 `--use-game-material`을 사용하세요.
-- `--nanumgothic` / `--mulmaru` 일괄 교체는 원본 `m_AtlasPadding`에 가장 가까운 내장 preset(`Padding_5` / `Padding_7` / `Padding_15`)을 자동 선택합니다.
-- `--font <TTF/OTF>` 또는 JSON `Replace_to`의 TTF/OTF 지정은 원본 `m_AtlasPadding` 값에 맞춰 임시 SDF/Raster atlas를 자동 생성합니다.
+- 기본 SDF 교체는 게임 원본 Material 스타일·색·weight를 유지하면서 `_MainTex`, texture width/height, `_GradientScale` 및 공식 `_ScaleRatioA/B/C`만 새 atlas에 맞춥니다.
+- `--use-game-material`은 이전 CLI 호환용입니다. SDF 교체에서는 옵션과 관계없이 게임 원본 스타일을 보존하고, 새 atlas에 필요한 `_MainTex`, 크기, `_GradientScale`, shader ratio는 항상 동기화합니다.
+- 직접 연결된 Material뿐 아니라 같은 atlas를 참조하는 preset/submaterial도 exact outer file/CAB/signed PathID로 찾아 함께 갱신합니다.
+- `--nanumgothic` / `--mulmaru` 일괄 교체는 원본보다 작지 않은 최소 내장 preset(`Padding_5` / `Padding_7` / `Padding_15`)을 선택하고, 15보다 크면 TTF에서 정확한 padding으로 생성합니다.
+- `--font <TTF/OTF>` 또는 JSON `Replace_to`의 TTF/OTF 지정은 원본 `m_AtlasPadding` 값에 맞춰 임시 SDF atlas를 자동 생성합니다.
 - 자동 생성은 기본 문자셋 `CharList_3911.txt`, atlas `4096x4096`, point size 자동 탐색을 사용합니다.
+- TTF의 실제 glyph ID와 단순 OpenType `kern` pair를 TMP feature record로 다시 생성합니다. 지원하지 않는 GPOS/GSUB/GDEF lookup이 필요한 폰트는 잘못된 shaping을 조용히 저장하지 않고 중단합니다.
 - 번역문에 기본 문자셋에 없는 한글/한자/특수문자가 있으면 `--charset <파일>`로 실제 사용 문자 목록을 지정하세요. JSON 항목별로는 `Charset` 또는 `charset` 필드를 사용할 수 있습니다.
 - 글리프가 0개인 TMP fallback FontAsset도 atlas 참조가 있으면 SDF 교체 대상에 포함합니다. 일부 게임의 `* SDF - Fallback` 빈 에셋이 남아 누락 글자가 빈칸으로 떨어지는 문제를 줄이기 위한 처리입니다.
-- 원본 padding이 선택된 교체 atlas padding보다 크면, Material 보정은 계속 적용되지만 외곽선/언더레이가 원본과 완전히 같지 않을 수 있다는 경고를 출력합니다.
+- 하나의 atlas를 여러 FontAsset이 공유하면 모든 소유자를 같은 폰트로 선택한 경우에만 교체합니다. 일부만 선택하거나 서로 다른 폰트로 지정하면 중단합니다.
+- 교체 결과는 static single-atlas로 정규화됩니다. 원래 Dynamic/DynamicOS인 FontAsset은 기본적으로 중단하며, 동적 글리프 추가를 포기할 의도가 명확할 때만 `--freeze-dynamic`으로 Static 고정 및 runtime source Font PPtr 해제를 허용합니다. 이때 필요한 모든 문자를 `--charset`에 포함해야 합니다.
+- Bitmap TMP FontAsset 및 SDF↔Raster 변환은 호환 shader PPtr를 증명할 수 없어 현재 지원하지 않습니다.
 - `--outline-ratio`는 현재 선택된 Material 기준값을 1.0으로 보고 `_OutlineWidth`, `_OutlineSoftness`에 추가 배율을 곱합니다.
 - `--outline-ratio 1.25`는 외곽선을 25% 두껍게, `--outline-ratio 0.6`은 더 얇게 만듭니다.
-- `--use-game-material --outline-ratio 1.25`면 보정 없는 게임 원본 Material 기준으로, 기본 모드에서 `--outline-ratio 1.25`면 atlas/padding 보정이 적용된 게임 원본 스타일 기준으로 배율이 적용됩니다.
-- JSON 항목별 `force_raster: "True"`로 개별 Raster 강제를 지정할 수 있습니다. (`--parse` 기본값: `"False"`)
-- 전체 SDF 교체 항목을 Raster 방식으로 강제하려면 `--force-raster`를 사용하세요.
-- Raster 방식으로 처리되는 SDF 교체(개별 `force_raster` 또는 `--force-raster`)에서는 SDF 머티리얼 효과값(Outline/Underlay/Glow 등)을 0으로 보정하고 `m_AtlasRenderMode`의 SDF 플래그(0x1000)를 해제해 Raster 경로로 처리합니다.
-- Material 참조가 외부 assets 파일(`m_FileID != 0`)이어도 동일하게 보정 대상에 포함됩니다.
+- `--outline-ratio`는 `--use-game-material` 사용 여부와 관계없이 현재 게임 Material의 outline 값을 기준으로 적용됩니다.
+- `force_raster: "True"`와 `--force-raster`는 이전 설정 파일/CLI 호환을 위해 파싱하지만 현재는 안전 오류로 중단합니다.
+- 공식 TMP 0.1.x~4.0 pre 소스에서 확인된 구형·hybrid·신형 형태를 실제 TypeTree 필드 기준으로 판별합니다. 실제 binary의 TypeTree를 읽고 저장 후 재검증할 수 있을 때만 진행하며, 알 수 없거나 모순된 render/schema는 버전 숫자로 추측하지 않고 중단합니다.
 
 ### Preview Export
 

@@ -82,8 +82,9 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 
 | Option | Description |
 |------|------|
-| `--use-game-material` | Keep original in-game Material parameters without correction (default: preserve original style with automatic atlas/padding correction) |
-| `--force-raster` | Force SDF replacement into Raster behavior (render mode + material effect neutralization) |
+| `--use-game-material` | Legacy CLI compatibility. Game Material style is preserved by default; required atlas/shader values are always synchronized |
+| `--force-raster` | Legacy CLI compatibility only. Currently fails safely because a compatible Bitmap shader cannot be retargeted |
+| `--freeze-dynamic` | Explicitly freeze Dynamic/DynamicOS TMP FontAssets to baked Static and clear the runtime source Font PPtr |
 | `--use-game-line-metrics` | Keep in-game line metrics (pointSize still follows replacement font) |
 | `--outline-ratio <float>` | Apply a multiplier to `_OutlineWidth` and `_OutlineSoftness` on the currently selected Material baseline (default `1.0`) |
 | `--charset <file/text>` | Charset for TTF/OTF-to-SDF auto-generation (default `CharList_3911.txt`) |
@@ -92,7 +93,7 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 
 | Option | Description |
 |------|------|
-| `--original-compress` | Prefer original compression mode on save (default: uncompressed-family first) |
+| `--original-compress` / `--no-original-compress` | Prefer original compression (default) / prefer uncompressed-family saving |
 | `--temp-dir <path>` | Set root path for temporary save files (fast SSD/NVMe recommended) |
 | `--output-only <path>` | Keep originals untouched; write modified files only to this folder (preserve relative paths) |
 | `--split-save-force` | Skip one-shot and force one-by-one SDF split save |
@@ -153,8 +154,8 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --use-game
 :: Keep in-game line metrics
 unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --use-game-line-metrics
 
-:: Force Raster behavior for SDF replacement
-unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --force-raster
+:: Replace a Dynamic FontAsset as Static when runtime glyph addition is intentionally disabled
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --freeze-dynamic
 
 :: Make outlines 25% thicker on the current material baseline
 unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --outline-ratio 1.25
@@ -227,10 +228,10 @@ In `--parse` JSON, `force_raster` is included **only for SDF entries**, with def
 
 | Field | Description |
 |------|------|
-| `force_raster` | Force Raster behavior for this entry only (`"True"` / `"False"`, default `"False"`) |
+| `force_raster` | Legacy JSON compatibility field (`"True"` / `"False"`, default `"False"`) |
 
-- If `force_raster: "True"`, that SDF entry is processed with Raster behavior (render mode + material effect neutralization).
-- If `--force-raster` is used, Raster behavior is forced for all SDF entries regardless of JSON values.
+- SDF and Bitmap Materials have different shader contracts, so changing only `m_AtlasRenderMode` is unsafe.
+- `force_raster: "True"` or `--force-raster` stops with an explicit error before any file is modified.
 
 ### PS5 swizzle fields
 
@@ -269,11 +270,11 @@ If `Replace_to` is empty, that font is skipped.
 |------|------|
 | Font name | `Mulmaru`, `NanumGothic` |
 | TTF file | `Mulmaru.ttf` |
-| SDF JSON | `Mulmaru SDF.json`, `Mulmaru Raster.json` |
-| SDF Atlas | `Mulmaru SDF Atlas.png`, `Mulmaru Raster Atlas.png` |
+| SDF JSON | `Mulmaru SDF.json` |
+| SDF Atlas | `Mulmaru SDF Atlas.png` |
 | Material | `NGothic Material.json` |
 
-If an SDF entry's `Replace_to` points to a `.ttf` or `.otf`, the tool auto-generates a temporary SDF/Raster set using that target font's `m_AtlasPadding`, then applies the replacement.
+If an SDF entry's `Replace_to` points to a `.ttf` or `.otf`, the tool auto-generates a temporary SDF set using that target font's `m_AtlasPadding`, then applies the replacement.
 
 ---
 
@@ -392,11 +393,11 @@ If you prefer Python scripts instead of EXEs:
 ### Requirements
 
 - Python 3.12 recommended
-- Packages: `custom UnityPy 1.25.2 fork`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`, `psutil`
+- Packages: `custom UnityPy 1.25.3 fork`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`, `psutil`
 
 ```bash
 pip install TypeTreeGeneratorAPI Pillow fonttools numpy scipy psutil
-pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@4018e7600357e185f9986af536d6f105729f0950
+pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@bccc488474556a5aab30121d7a6c7500c54a80c7
 ```
 
 When this repository and `UnityPy` share the same parent directory, source runs
@@ -416,11 +417,12 @@ python export_fonts_en.py "D:\MyGame"
 
 ### Save
 
-- Default save order prefers uncompressed-family modes (`safe-none -> legacy-none`), then falls back to `original -> lz4`.
-- Use `--original-compress` to prefer original compression mode first.
-- Cross-file TMP Atlas/Material patches commit only after every target validates; missing targets, conflicts, or save failures roll related files back to their pre-run state.
+- The default save order is `original -> lz4 -> safe-none -> legacy-none`. Only `--no-original-compress` changes it to `safe-none -> legacy-none -> original -> lz4`.
+- Every changed object is verified after reopening the saved file by exact CAB name, signed PathID, and raw-object SHA-256.
+- Cross-file TMP Atlas/Material and local Addressables catalog patches commit only after every target validates; missing targets, conflicts, or save failures roll the whole related set back.
+- For local Standalone Addressables bundles, the catalog CRC is set to zero and the actual size is synchronized. `m_Hash` is preserved because the local `LoadFromFile` path does not use it. Remote, forced-UnityWebRequest, and non-Standalone paths are refused.
 - Unity `.split0/.split1` assets are skipped for replacement because safe re-splitting is not supported. The exporter reads the set once through `.split0`.
-- If save is slow, try `--temp-dir` and point it to a fast SSD/NVMe path.
+- CLI temporary files and the IL2CPP `DummyDll` cache are created outside the game under the system temporary path. Use `--temp-dir` to select a fast SSD/NVMe path.
 - For large multi-SDF replacements, split-save fallback is enabled by default when one-shot fails (adaptive batch size).
 
 ### Scan
@@ -438,21 +440,23 @@ python export_fonts_en.py "D:\MyGame"
 
 - Default line metrics mode scales original proportions to the replacement font's pointSize.
 - Use `--use-game-line-metrics` to keep original in-game line metrics. (pointSize still follows replacement font.)
-- Default SDF replacement preserves the original in-game Material style and only corrects atlas/padding-dependent differences.
-- Use `--use-game-material` when you want the original in-game Material parameters without atlas/padding correction.
-- Bulk `--nanumgothic` / `--mulmaru` replacement automatically chooses the nearest built-in preset (`Padding_5` / `Padding_7` / `Padding_15`) from the source `m_AtlasPadding`.
-- `--font <TTF/OTF>` or a JSON `Replace_to` TTF/OTF path auto-generates temporary SDF/Raster atlases using the source `m_AtlasPadding`.
+- Default SDF replacement preserves in-game Material style, colors, and weights while updating `_MainTex`, texture dimensions, `_GradientScale`, and the official `_ScaleRatioA/B/C` values for the new atlas.
+- `--use-game-material` is retained for legacy CLI compatibility. SDF replacement always preserves the in-game style while synchronizing `_MainTex`, dimensions, `_GradientScale`, and shader ratios required by the new atlas.
+- Direct Materials and every preset/submaterial referencing the same atlas are resolved by exact outer file, CAB, and signed PathID and updated together.
+- Bulk `--nanumgothic` / `--mulmaru` replacement chooses the smallest built-in preset (`Padding_5` / `Padding_7` / `Padding_15`) that is not smaller than the source. Padding above 15 is generated exactly from the TTF.
+- `--font <TTF/OTF>` or a JSON `Replace_to` TTF/OTF path auto-generates a temporary SDF atlas using the source `m_AtlasPadding`.
 - Automatic generation uses default charset `CharList_3911.txt`, a `4096x4096` atlas, and automatic point-size search.
+- Actual TTF glyph IDs and simple OpenType `kern` pairs are rebuilt into TMP feature records. Fonts requiring unsupported GPOS/GSUB/GDEF structures are refused instead of silently saving incorrect shaping.
 - If translated text contains Hangul, CJK, or special characters outside the default charset, pass the real character list with `--charset <file>`. Per JSON entry, use `Charset` or `charset`.
 - Empty TMP fallback FontAssets are included as SDF replacement targets when they still have an atlas reference. This prevents unresolved characters from falling back into an unchanged `* SDF - Fallback` asset with no glyphs.
-- When the source padding is larger than the selected replacement atlas padding, the tool still applies Material correction but prints a warning that outline/underlay may not match the original exactly.
+- When FontAssets share an atlas, every owner must be selected for the same replacement. Partial selection or conflicting replacement fonts are refused.
+- Results are normalized to a static single atlas. Dynamic/DynamicOS targets are refused by default; use `--freeze-dynamic` only when disabling runtime glyph addition is intentional. It freezes the asset to Static and clears the runtime source Font PPtr, so every required character must be included with `--charset`.
+- Bitmap TMP FontAssets and SDF-to-Raster conversion are currently unsupported because a compatible shader PPtr cannot be proven.
 - `--outline-ratio` treats the current Material baseline as `1.0` and multiplies `_OutlineWidth` / `_OutlineSoftness` after the baseline is chosen.
 - `--outline-ratio 1.25` makes outlines 25% thicker, while `--outline-ratio 0.6` makes them thinner.
-- With `--use-game-material --outline-ratio 1.25`, the baseline is the uncorrected original in-game Material. Without `--use-game-material`, the baseline is the atlas/padding-corrected original style.
-- You can set per-entry Raster forcing with JSON `force_raster: "True"` (default from `--parse`: `"False"`).
-- Use `--force-raster` to force Raster behavior for all SDF replacement entries.
-- For Raster-mode SDF replacement (per-entry `force_raster` or global `--force-raster`), SDF material effect floats (outline/underlay/glow) are neutralized to `0`, and the SDF flag (0x1000) is cleared from `m_AtlasRenderMode` so rendering follows the Raster path.
-- External Material references (`m_FileID != 0`) are also included in the same neutralization path.
+- `--outline-ratio` uses the current in-game Material outline values regardless of whether `--use-game-material` is present.
+- `force_raster: "True"` and `--force-raster` are still parsed for legacy configuration/CLI compatibility, but now fail safely.
+- Old, hybrid, and modern shapes identified in the official TMP 0.1.x through 4.0 preview sources are selected from actual TypeTree fields. Processing continues only when the real binary TypeTree can be read and the saved result can be reopened; unknown or contradictory render/schema data is refused instead of guessed from a version number.
 
 ### Preview Export
 
