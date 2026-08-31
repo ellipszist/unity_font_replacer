@@ -7891,10 +7891,7 @@ def replace_fonts_in_file(
                             "raster_texture_contract": bool(effective_force_raster),
                             "raster_full_color_storage": bool(
                                 effective_force_raster
-                                and (
-                                    allow_unsafe_full_color_shader_fallback
-                                    or allow_unsafe_gui_text_fallback
-                                )
+                                and allow_unsafe_full_color_shader_fallback
                             ),
                         }
                         if preview_export:
