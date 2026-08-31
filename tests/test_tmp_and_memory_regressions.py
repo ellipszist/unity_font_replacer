@@ -985,6 +985,68 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
                 )
             )
 
+    def test_raster_rgba32_storage_preserves_white_rgb_and_coverage(self) -> None:
+        from UnityPy.export import Texture2DConverter
+
+        class Texture:
+            def __init__(self) -> None:
+                self.m_TextureFormat = 1
+                self.m_Width = 0
+                self.m_Height = 0
+                self.m_MipMap = True
+                self.m_MipCount = 4
+                self.m_CompleteImageSize = 0
+                self.m_StreamData = SimpleNamespace(path="atlas.resS", offset=1, size=2)
+                self.image_data = b""
+
+            def set_image(
+                self,
+                image: Image.Image,
+                *,
+                target_format: int,
+                mipmap_count: int,
+            ) -> None:
+                data, actual_format = Texture2DConverter.image_to_texture2d(
+                    image,
+                    target_format,
+                )
+                self.m_TextureFormat = actual_format
+                self.m_Width, self.m_Height = image.size
+                self.m_MipMap = mipmap_count > 1
+                self.m_MipCount = mipmap_count
+                self.m_CompleteImageSize = len(data)
+                self.image_data = data
+                self.m_StreamData.path = ""
+                self.m_StreamData.offset = 0
+                self.m_StreamData.size = 0
+
+        source = Image.new("RGBA", (2, 1), (0, 0, 0, 0))
+        source.putpixel((1, 0), (0, 0, 0, 128))
+        texture = Texture()
+        try:
+            core._apply_raster_rgba32_storage(texture, source)
+        finally:
+            source.close()
+
+        self.assertEqual(int(texture.m_TextureFormat), 4)
+        self.assertEqual(texture.m_MipCount, 1)
+        self.assertFalse(texture.m_MipMap)
+        self.assertEqual(texture.m_StreamData.path, "")
+        self.assertEqual(
+            list(texture.image_data),
+            [255, 255, 255, 0, 255, 255, 255, 128],
+        )
+
+        missing_image = Image.new("RGBA", (1, 1))
+        try:
+            with self.assertRaises(RuntimeError):
+                core._apply_raster_rgba32_storage(
+                    SimpleNamespace(),
+                    missing_image,
+                )
+        finally:
+            missing_image.close()
+
     def test_replacement_sdf_json_and_png_are_validated_as_one_unit(self) -> None:
         valid = {
             "m_FaceInfo": {"m_FamilyName": "Test"},

@@ -84,8 +84,8 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 |------|------|
 | `--use-game-material` | Legacy CLI compatibility. Game Material style is preserved by default; required atlas/shader values are always synchronized |
 | `--force-raster` | Generate an Alpha8 raster atlas and retarget each Material to a reachable TMP Bitmap shader |
-| `--allow-unsafe-full-color-shader-fallback` | Testing only. Explicitly allow `TextMeshPro/Sprite`/`Bitmap Custom Atlas` fallbacks whose RGB is not guaranteed by Alpha8 storage |
-| `--allow-unsafe-gui-text-fallback` | Testing only. Explicitly allow the `GUI/Text Shader` fallback without TMP UI masking or depth support |
+| `--allow-unsafe-full-color-shader-fallback` | Testing only. Store raster atlases as white-RGB RGBA32 and explicitly allow `TextMeshPro/Sprite`/`Bitmap Custom Atlas` fallbacks |
+| `--allow-unsafe-gui-text-fallback` | Testing only. Use RGBA32 storage and explicitly allow the `GUI/Text Shader` fallback without TMP UI masking or depth support |
 | `--freeze-dynamic` | Explicitly freeze Dynamic/DynamicOS TMP FontAssets to baked Static and clear the runtime source Font PPtr |
 | `--use-game-line-metrics` | Keep in-game line metrics (pointSize still follows replacement font) |
 | `--outline-ratio <float>` | Apply a multiplier to `_OutlineWidth` and `_OutlineSoftness` on the currently selected Material baseline (default `1.0`) |
@@ -456,8 +456,8 @@ python export_fonts_en.py "D:\MyGame"
 - Results are normalized to a static single atlas. Dynamic/DynamicOS targets are refused by default; use `--freeze-dynamic` only when disabling runtime glyph addition is intentional. It freezes the asset to Static and clears the runtime source Font PPtr, so every required character must be included with `--charset`.
 - Existing Bitmap TMP FontAssets automatically receive a raster atlas. Use `force_raster: "True"` or `--force-raster` to convert an SDF FontAsset to raster.
 - Raster conversion uses only shaders reachable through existing PPtr routes and preserves the currently linked compatible PPtr first. The officially safe automatic Alpha8 candidates are `TextMeshPro/Bitmap` and `TextMeshPro/Mobile/Bitmap`; the concrete compiled property contract is verified before selection. The tool fails before saving when no safe candidate is reachable.
-- `TextMeshPro/Sprite` and `TextMeshPro/Bitmap Custom Atlas` consume full RGB samples, while Alpha8 storage discards the generated white RGB channels. `--allow-unsafe-full-color-shader-fallback` is an explicit UGUI diagnostics exception and does not guarantee output through 3D `TextMeshPro`/MeshRenderer paths.
-- `--allow-unsafe-gui-text-fallback` is a last-resort manual-diagnostics option. `GUI/Text Shader` can draw the basic glyph mesh, but it has no stencil/`RectMask2D` contract and always passes the depth test, so text can escape masks or show through 3D geometry.
+- `TextMeshPro/Sprite` and `TextMeshPro/Bitmap Custom Atlas` consume full RGB samples, so connecting an unchanged Alpha8 atlas produces black glyphs. `--allow-unsafe-full-color-shader-fallback` stores raster atlases as RGBA32 with `RGB=(255,255,255), A=coverage`. Raw texture memory is four times that of Alpha8.
+- `--allow-unsafe-gui-text-fallback` also uses RGBA32 storage to avoid black multiplication. `GUI/Text Shader` still has no stencil/`RectMask2D` contract and always passes the depth test, so text can escape masks or show through 3D geometry.
 - Raster shaders do not implement SDF outline, underlay, glow, or gradient properties. Conversion removes those properties and stale keywords while preserving face color, supported clip/stencil values, and the `UNITY_UI_ALPHACLIP` toggle.
 - TTF/OTF-generated raster atlases do not inherit SDF effect padding. They use a five-texel transparent margin, covering TMP bitmap's one-texel baseline plus the optional four-texel `Extra Padding` UV expansion while avoiding wasted atlas resolution.
 - `--outline-ratio` treats the current Material baseline as `1.0` and multiplies `_OutlineWidth` / `_OutlineSoftness` after the baseline is chosen.

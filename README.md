@@ -84,8 +84,8 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 |------|------|
 | `--use-game-material` | 이전 CLI 호환용. 게임 Material 스타일 보존은 기본이며 필수 atlas/shader 값은 항상 동기화 |
 | `--force-raster` | Alpha8 Raster atlas를 생성하고, 각 Material을 현재 파일에서 실제로 도달 가능한 TMP Bitmap shader로 재연결 |
-| `--allow-unsafe-full-color-shader-fallback` | 테스트 전용. Alpha8에서 RGB가 보장되지 않는 `TextMeshPro/Sprite`/`Bitmap Custom Atlas` fallback을 명시적으로 허용 |
-| `--allow-unsafe-gui-text-fallback` | 테스트 전용. TMP UI mask/depth를 지원하지 않는 `GUI/Text Shader` fallback을 명시적으로 허용 |
+| `--allow-unsafe-full-color-shader-fallback` | 테스트 전용. Raster atlas를 흰색 RGB가 보존되는 RGBA32로 저장하고 `TextMeshPro/Sprite`/`Bitmap Custom Atlas` fallback을 명시적으로 허용 |
+| `--allow-unsafe-gui-text-fallback` | 테스트 전용. RGBA32 저장과 함께 TMP UI mask/depth를 지원하지 않는 `GUI/Text Shader` fallback을 명시적으로 허용 |
 | `--freeze-dynamic` | Dynamic/DynamicOS TMP FontAsset을 명시적으로 baked Static으로 고정하고 runtime source Font PPtr 해제 |
 | `--use-game-line-metrics` | 게임 원본 줄 간격 메트릭 사용 (pointSize는 교체값 유지) |
 | `--outline-ratio <float>` | 현재 선택된 Material 기준 `_OutlineWidth`, `_OutlineSoftness`에 배율 적용 (기본 `1.0`) |
@@ -457,8 +457,8 @@ python export_fonts_ko.py "D:\MyGame"
 - 교체 결과는 static single-atlas로 정규화됩니다. 원래 Dynamic/DynamicOS인 FontAsset은 기본적으로 중단하며, 동적 글리프 추가를 포기할 의도가 명확할 때만 `--freeze-dynamic`으로 Static 고정 및 runtime source Font PPtr 해제를 허용합니다. 이때 필요한 모든 문자를 `--charset`에 포함해야 합니다.
 - 원래 Bitmap인 TMP FontAsset은 자동으로 Raster atlas를 생성합니다. SDF FontAsset은 `force_raster: "True"` 또는 `--force-raster`로 Raster 변환할 수 있습니다.
 - Raster 변환은 기존 PPtr 경로로 도달 가능한 shader만 사용하고, 현재 연결된 호환 PPtr을 우선 보존합니다. Alpha8에서 공식적으로 안전한 자동 후보는 `TextMeshPro/Bitmap`과 `TextMeshPro/Mobile/Bitmap`이며, compiled Shader의 실제 property 계약까지 검증합니다. 안전한 후보가 없으면 저장 전에 중단합니다.
-- `TextMeshPro/Sprite`와 `TextMeshPro/Bitmap Custom Atlas`는 RGB 전체를 읽지만 Alpha8 저장은 생성된 흰색 RGB 채널을 보존하지 않습니다. `--allow-unsafe-full-color-shader-fallback`은 UGUI 실기 진단을 위한 명시적 예외이며, 3D `TextMeshPro`/MeshRenderer까지의 출력을 보장하지 않습니다.
-- `--allow-unsafe-gui-text-fallback`은 수동 진단용 마지막 수단입니다. `GUI/Text Shader`는 기본 glyph mesh를 그릴 수 있지만 stencil/`RectMask2D`가 없고 depth test가 항상 통과하므로, 마스크 밖으로 글자가 새거나 3D 물체를 뚫고 보일 수 있습니다.
+- `TextMeshPro/Sprite`와 `TextMeshPro/Bitmap Custom Atlas`는 RGB 전체를 읽으므로 Alpha8 atlas를 그대로 연결하면 검정 glyph가 됩니다. `--allow-unsafe-full-color-shader-fallback`은 해당 교체 작업의 Raster atlas를 `RGB=(255,255,255), A=coverage`인 RGBA32로 저장합니다. 원시 texture 메모리는 Alpha8의 4배가 됩니다.
+- `--allow-unsafe-gui-text-fallback`도 검정 곱셈을 막기 위해 RGBA32 저장을 사용합니다. `GUI/Text Shader` 자체에는 stencil/`RectMask2D`가 없고 depth test가 항상 통과하므로, 마스크 밖으로 글자가 새거나 3D 물체를 뚫고 보이는 한계는 남습니다.
 - Raster shader에는 SDF의 outline/underlay/glow/gradient 계약이 없으므로 해당 속성과 keyword를 제거합니다. face color와 shader가 지원하는 clip/stencil 값 및 `UNITY_UI_ALPHACLIP` toggle은 보존합니다.
 - TTF/OTF에서 생성하는 Raster atlas는 SDF effect padding을 상속하지 않고 5 texel의 투명 여백을 사용합니다. 이는 TMP bitmap의 기본 1 texel과 `Extra Padding`의 추가 4 texel UV 확장을 모두 보호하면서 atlas 해상도 낭비를 줄입니다.
 - `--outline-ratio`는 현재 선택된 Material 기준값을 1.0으로 보고 `_OutlineWidth`, `_OutlineSoftness`에 추가 배율을 곱합니다.
