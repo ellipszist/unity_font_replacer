@@ -139,6 +139,98 @@ class SaveRegressionTests(unittest.TestCase):
                     else:
                         self.assertEqual(output_target.read_bytes(), preexisting)
 
+    def test_requeued_file_applies_only_new_deferred_patches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "Game"
+            data_path = root / "Game_Data"
+            data_path.mkdir(parents=True)
+            first = data_path / "first.assets"
+            second = data_path / "second.assets"
+            first.write_bytes(b"FIRST")
+            second.write_bytes(b"SECOND")
+            replacements = {
+                "first": {
+                    "File": first.name,
+                    "assets_name": "CAB-first",
+                    "Path_ID": 1,
+                    "Type": "SDF",
+                    "Replace_to": "NanumGothic",
+                    "Name": "First",
+                },
+                "second": {
+                    "File": second.name,
+                    "assets_name": "CAB-second",
+                    "Path_ID": 2,
+                    "Type": "SDF",
+                    "Replace_to": "NanumGothic",
+                    "Name": "Second",
+                },
+            }
+            calls: list[tuple[str, list[str]]] = []
+            first_key = core._normalize_asset_file_key(str(first))
+
+            def fake_replace(*args, **kwargs):
+                path = Path(args[2])
+                calls.append((path.name, list(args[3])))
+                outcome = kwargs["operation_outcome"]
+                if path == second:
+                    kwargs["deferred_material_plans"][first_key] = {
+                        "CAB-first|9": {"replacement_font": "NanumGothic"}
+                    }
+                    kwargs["pending_external_patch_files"].add(first_key)
+                elif len(calls) == 3:
+                    kwargs["deferred_material_plans"].pop(first_key)
+                outcome.update(
+                    requested_targets=len(args[3]),
+                    satisfied_targets=len(args[3]),
+                    modified=True,
+                    save_success=True,
+                    already_satisfied=False,
+                )
+                return True
+
+            argv = ["prog", "--gamepath", str(root), "--nanumgothic"]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(
+                    core,
+                    "resolve_game_path",
+                    return_value=(str(root), str(data_path)),
+                ),
+                patch.object(core, "get_compile_method", return_value="Mono"),
+                patch.object(core, "get_unity_version", return_value="2021.3.0f1"),
+                patch.object(
+                    core,
+                    "create_batch_replacements",
+                    return_value=replacements,
+                ),
+                patch.object(core, "_ensure_custom_unitypy_streaming_save"),
+                patch.object(core, "_create_generator", return_value=object()),
+                patch.object(
+                    core,
+                    "find_assets_files",
+                    return_value=[str(first), str(second)],
+                ),
+                patch.object(core, "_preflight_shared_atlas_owners"),
+                patch.object(core, "replace_fonts_in_file", side_effect=fake_replace),
+                patch.object(
+                    core,
+                    "_update_addressables_catalogs_for_modified_bundles",
+                    return_value=[],
+                ),
+                patch.object(core, "_pause_before_exit"),
+            ):
+                core.main_cli(lang="en")
+
+            self.assertEqual(
+                calls,
+                [
+                    (first.name, ["first"]),
+                    (second.name, ["second"]),
+                    (first.name, []),
+                ],
+            )
+
     def test_preview_success_is_not_a_replacement_failure_but_exception_is_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "Game"

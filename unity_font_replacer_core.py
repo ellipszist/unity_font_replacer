@@ -10731,6 +10731,7 @@ Examples:
     terminal_failures: list[str] = []
     modified_count = 0
     modified_asset_keys: set[str] = set()
+    processed_direct_replacement_keys: set[str] = set()
     queue_index = 0
     while queue_index < len(asset_file_queue):
         asset_file_key = asset_file_queue[queue_index]
@@ -10777,13 +10778,17 @@ Examples:
                 _log_console(f"\nProcessing: {fn}")
             # KR: 기본은 split-save 폴백을 사용하고, --oneshot-save-force일 때만 비활성화합니다.
             # EN: By default, use split-save fallback; only disable when --oneshot-save-force is set.
-            file_replacements = {
-                key: value
-                for key, value in replacements.items()
-                if isinstance(value, dict)
-                and value.get("File") == fn
-                and value.get("Replace_to")
-            }
+            file_replacements = (
+                {}
+                if asset_file_key in processed_direct_replacement_keys
+                else {
+                    key: value
+                    for key, value in replacements.items()
+                    if isinstance(value, dict)
+                    and value.get("File") == fn
+                    and value.get("Replace_to")
+                }
+            )
             file_ttf_replacements = {
                 key: value
                 for key, value in file_replacements.items()
@@ -11164,12 +11169,16 @@ Examples:
                             "  Note: --oneshot-save-force disables split-save fallback and may increase memory peak."
                         )
                 direct_outcome: JsonDict = {}
+                direct_replacements = (
+                    replacements if mode == "preview_export" else file_replacements
+                )
+                direct_lookup, _ = build_replacement_lookup(direct_replacements)
                 try:
                     direct_ok = replace_fonts_in_file(
                         unity_version,
                         game_path,
                         working_assets_file,
-                        replacements,
+                        direct_replacements,
                         replace_ttf,
                         replace_sdf,
                         use_game_mat=args.use_game_material,
@@ -11183,7 +11192,7 @@ Examples:
                         prefer_original_compress=args.original_compress,
                         temp_root_dir=args.temp_dir,
                         generator=generator,
-                        replacement_lookup=replacement_lookup,
+                        replacement_lookup=direct_lookup,
                         ps5_swizzle=args.ps5_swizzle,
                         preview_export=args.preview_export,
                         preview_root=preview_root,
@@ -11232,6 +11241,12 @@ Examples:
                     terminal_failures.append(failure)
                     if deferred_transaction is not None:
                         deferred_transaction.fail(failure)
+
+            if file_replacements and not terminal_failures and not (
+                deferred_transaction is not None
+                and deferred_transaction.has_failures
+            ):
+                processed_direct_replacement_keys.add(asset_file_key)
 
             if file_modified:
                 if asset_file_key not in modified_asset_keys:
