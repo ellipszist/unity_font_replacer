@@ -82,13 +82,13 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 
 | Option | Description |
 |------|------|
-| `--use-game-material` | Legacy CLI compatibility. Game Material style is preserved by default; required atlas/shader values are always synchronized |
+| `--use-game-material` | Keep the in-game Material style instead of compatible replacement-Material style values (required atlas values are always synchronized) |
 | `--force-raster` | Generate an Alpha8 raster atlas and retarget each Material to a reachable TMP Bitmap shader |
 | `--allow-unsafe-full-color-shader-fallback` | Testing only. Store raster atlases as white-RGB RGBA32 and explicitly allow `TextMeshPro/Sprite`/`Bitmap Custom Atlas` fallbacks |
 | `--allow-unsafe-gui-text-fallback` | Testing only. Use RGBA32 storage and explicitly allow the `GUI/Text Shader` fallback without TMP UI masking or depth support |
 | `--freeze-dynamic` | Explicitly freeze Dynamic/DynamicOS TMP FontAssets to baked Static and clear the runtime source Font PPtr |
 | `--use-game-line-metrics` | Keep in-game line metrics (pointSize still follows replacement font) |
-| `--outline-ratio <float>` | Apply a multiplier to `_OutlineWidth` and `_OutlineSoftness` on the currently selected Material baseline (default `1.0`) |
+| `--outline-ratio <float>` | Multiply classic/SRP outline thickness and softness on the currently selected Material baseline (default `1.0`) |
 | `--charset <file/text>` | Charset for TTF/OTF-to-SDF/raster atlas generation (default `CharList_3911.txt`) |
 
 #### Save / Output
@@ -443,9 +443,9 @@ python export_fonts_en.py "D:\MyGame"
 
 - Default line metrics mode scales original proportions to the replacement font's pointSize.
 - Use `--use-game-line-metrics` to keep original in-game line metrics. (pointSize still follows replacement font.)
-- Default SDF replacement preserves in-game Material style, colors, and weights while updating `_MainTex`, texture dimensions, `_GradientScale`, and the official `_ScaleRatioA/B/C` values for the new atlas.
-- `--use-game-material` is retained for legacy CLI compatibility. SDF replacement always preserves the in-game style while synchronizing `_MainTex`, dimensions, `_GradientScale`, and shader ratios required by the new atlas.
-- Direct Materials and every preset/submaterial referencing the same atlas are resolved by exact outer file, CAB, and signed PathID and updated together.
+- By default, the Material referenced directly by a FontAsset receives compatible same-name float/color style values from the replacement font Material. The in-game shader, keywords, auxiliary textures, and stencil/mask/clip/render state are preserved.
+- `--use-game-material` also keeps the direct Material's in-game style values. Both modes synchronize `_MainTex` and the new padding-based `_GradientScale`. Classic SDF Materials also receive actual texture dimensions and recomputed official `_ScaleRatioA/B/C` values; `_IsoPerimeter`-based SRP Materials neither receive absent classic fields nor have stale classic values rewritten.
+- Presets/submaterials that reference the same atlas are resolved by exact outer file, CAB, and signed PathID and receive the atlas contract while retaining each preset's own color, outline, underlay, and keywords.
 - Bulk `--nanumgothic` / `--mulmaru` replacement chooses the smallest built-in preset (`Padding_5` / `Padding_7` / `Padding_15`) that is not smaller than the source. Padding above 15 is generated exactly from the TTF.
 - `--font <TTF/OTF>` or a JSON `Replace_to` TTF/OTF path auto-generates a temporary SDF atlas using the source `m_AtlasPadding`.
 - Automatic generation uses default charset `CharList_3911.txt`, a `4096x4096` atlas, and automatic point-size search.
@@ -458,11 +458,11 @@ python export_fonts_en.py "D:\MyGame"
 - Raster conversion uses only shaders reachable through existing PPtr routes and preserves the currently linked compatible PPtr first. The officially safe automatic Alpha8 candidates are `TextMeshPro/Bitmap` and `TextMeshPro/Mobile/Bitmap`; the concrete compiled property contract is verified before selection. The tool fails before saving when no safe candidate is reachable.
 - `TextMeshPro/Sprite` and `TextMeshPro/Bitmap Custom Atlas` consume full RGB samples, so connecting an unchanged Alpha8 atlas produces black glyphs. `--allow-unsafe-full-color-shader-fallback` stores raster atlases as RGBA32 with `RGB=(255,255,255), A=coverage`. Raw texture memory is four times that of Alpha8.
 - `--allow-unsafe-gui-text-fallback` also uses RGBA32 storage to avoid black multiplication. `GUI/Text Shader` still has no stencil/`RectMask2D` contract and always passes the depth test, so text can escape masks or show through 3D geometry.
-- Raster shaders do not implement SDF outline, underlay, glow, or gradient properties. Conversion removes those properties and stale keywords while preserving face color, supported clip/stencil values, and the `UNITY_UI_ALPHACLIP` toggle.
+- Raster shaders do not implement SDF outline, underlay, glow, or gradient properties, so conversion removes those properties and stale keywords. The default applies the replacement face tint to the direct Material, while `--use-game-material` keeps its in-game tint; linked-preset tints, supported clip/stencil values, and the `UNITY_UI_ALPHACLIP` toggle are always preserved.
 - TTF/OTF-generated raster atlases do not inherit SDF effect padding. They use a five-texel transparent margin, covering TMP bitmap's one-texel baseline plus the optional four-texel `Extra Padding` UV expansion while avoiding wasted atlas resolution.
-- `--outline-ratio` treats the current Material baseline as `1.0` and multiplies `_OutlineWidth` / `_OutlineSoftness` after the baseline is chosen.
+- `--outline-ratio` treats the current Material baseline as `1.0` and multiplies classic `_OutlineWidth`, `_OutlineSoftness`, and `_Outline2Width`, plus the outline components (Y/Z/W) of SRP `_IsoPerimeter` / `_Softness`. SRP face components (X) and outline position offsets remain unchanged.
 - `--outline-ratio 1.25` makes outlines 25% thicker, while `--outline-ratio 0.6` makes them thinner.
-- `--outline-ratio` uses the current in-game Material outline values regardless of whether `--use-game-material` is present.
+- `--outline-ratio` uses an explicitly supplied replacement outline value by default (falling back to that Material's in-game value when absent), and the in-game value with `--use-game-material` or for linked presets. A zero baseline remains zero at every ratio.
 - Raster conversion synchronizes the creation setting and runtime render mode, selecting modern TextCore `RASTER_MODE_BITMAP` or the legacy TMP bitmap enum from the serialized shape.
 - Old, hybrid, and modern shapes identified in the official TMP 0.1.x through 4.0 preview sources are selected from actual TypeTree fields. Processing continues only when the real binary TypeTree can be read and the saved result can be reopened; unknown or contradictory render/schema data is refused instead of guessed from a version number.
 

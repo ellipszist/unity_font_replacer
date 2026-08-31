@@ -82,13 +82,13 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 
 | 옵션 | 설명 |
 |------|------|
-| `--use-game-material` | 이전 CLI 호환용. 게임 Material 스타일 보존은 기본이며 필수 atlas/shader 값은 항상 동기화 |
+| `--use-game-material` | 교체 폰트 Material의 호환 스타일값 대신 게임 원본 Material 스타일값 유지 (atlas 필수값은 항상 동기화) |
 | `--force-raster` | Alpha8 Raster atlas를 생성하고, 각 Material을 현재 파일에서 실제로 도달 가능한 TMP Bitmap shader로 재연결 |
 | `--allow-unsafe-full-color-shader-fallback` | 테스트 전용. Raster atlas를 흰색 RGB가 보존되는 RGBA32로 저장하고 `TextMeshPro/Sprite`/`Bitmap Custom Atlas` fallback을 명시적으로 허용 |
 | `--allow-unsafe-gui-text-fallback` | 테스트 전용. RGBA32 저장과 함께 TMP UI mask/depth를 지원하지 않는 `GUI/Text Shader` fallback을 명시적으로 허용 |
 | `--freeze-dynamic` | Dynamic/DynamicOS TMP FontAsset을 명시적으로 baked Static으로 고정하고 runtime source Font PPtr 해제 |
 | `--use-game-line-metrics` | 게임 원본 줄 간격 메트릭 사용 (pointSize는 교체값 유지) |
-| `--outline-ratio <float>` | 현재 선택된 Material 기준 `_OutlineWidth`, `_OutlineSoftness`에 배율 적용 (기본 `1.0`) |
+| `--outline-ratio <float>` | 현재 선택된 Material 기준 classic/SRP outline 두께·softness에 배율 적용 (기본 `1.0`) |
 | `--charset <파일/문자열>` | TTF/OTF에서 SDF/Raster atlas 자동 생성 시 사용할 글자셋 지정 (기본 `CharList_3911.txt`) |
 
 #### 저장
@@ -444,9 +444,9 @@ python export_fonts_ko.py "D:\MyGame"
 
 - 기본 줄 간격 메트릭 모드는 게임 원본 비율을 기준으로 교체 폰트 pointSize에 맞게 보정 적용합니다.
 - 게임 원본 줄 간격 메트릭을 그대로 쓰려면 `--use-game-line-metrics`를 사용하세요. (pointSize는 항상 교체 폰트 값)
-- 기본 SDF 교체는 게임 원본 Material 스타일·색·weight를 유지하면서 `_MainTex`, texture width/height, `_GradientScale` 및 공식 `_ScaleRatioA/B/C`만 새 atlas에 맞춥니다.
-- `--use-game-material`은 이전 CLI 호환용입니다. SDF 교체에서는 옵션과 관계없이 게임 원본 스타일을 보존하고, 새 atlas에 필요한 `_MainTex`, 크기, `_GradientScale`, shader ratio는 항상 동기화합니다.
-- 직접 연결된 Material뿐 아니라 같은 atlas를 참조하는 preset/submaterial도 exact outer file/CAB/signed PathID로 찾아 함께 갱신합니다.
+- 기본 SDF 교체는 FontAsset이 직접 참조하는 Material에 교체 폰트 Material의 호환 가능한 동일 이름 float/color 스타일값을 적용합니다. 게임 shader·keyword·보조 texture와 stencil/mask/clip/render 상태는 유지합니다.
+- `--use-game-material`을 지정하면 직접 Material도 게임 원본 스타일값을 유지합니다. 두 모드 모두 `_MainTex`와 새 padding 기반 `_GradientScale`을 동기화합니다. Classic SDF는 실제 texture width/height와 공식 `_ScaleRatioA/B/C`도 갱신하지만, `_IsoPerimeter` 기반 SRP Material에는 존재하지 않는 classic 필드를 주입하거나 남아 있는 stale 값을 변경하지 않습니다.
+- 같은 atlas를 참조하는 preset/submaterial은 exact outer file/CAB/signed PathID로 찾아 atlas 계약을 함께 갱신하되, 각 preset 고유의 색·outline·underlay·keyword는 유지합니다.
 - `--nanumgothic` / `--mulmaru` 일괄 교체는 원본보다 작지 않은 최소 내장 preset(`Padding_5` / `Padding_7` / `Padding_15`)을 선택하고, 15보다 크면 TTF에서 정확한 padding으로 생성합니다.
 - `--font <TTF/OTF>` 또는 JSON `Replace_to`의 TTF/OTF 지정은 원본 `m_AtlasPadding` 값에 맞춰 임시 SDF atlas를 자동 생성합니다.
 - 자동 생성은 기본 문자셋 `CharList_3911.txt`, atlas `4096x4096`, point size 자동 탐색을 사용합니다.
@@ -459,11 +459,11 @@ python export_fonts_ko.py "D:\MyGame"
 - Raster 변환은 기존 PPtr 경로로 도달 가능한 shader만 사용하고, 현재 연결된 호환 PPtr을 우선 보존합니다. Alpha8에서 공식적으로 안전한 자동 후보는 `TextMeshPro/Bitmap`과 `TextMeshPro/Mobile/Bitmap`이며, compiled Shader의 실제 property 계약까지 검증합니다. 안전한 후보가 없으면 저장 전에 중단합니다.
 - `TextMeshPro/Sprite`와 `TextMeshPro/Bitmap Custom Atlas`는 RGB 전체를 읽으므로 Alpha8 atlas를 그대로 연결하면 검정 glyph가 됩니다. `--allow-unsafe-full-color-shader-fallback`은 해당 교체 작업의 Raster atlas를 `RGB=(255,255,255), A=coverage`인 RGBA32로 저장합니다. 원시 texture 메모리는 Alpha8의 4배가 됩니다.
 - `--allow-unsafe-gui-text-fallback`도 검정 곱셈을 막기 위해 RGBA32 저장을 사용합니다. `GUI/Text Shader` 자체에는 stencil/`RectMask2D`가 없고 depth test가 항상 통과하므로, 마스크 밖으로 글자가 새거나 3D 물체를 뚫고 보이는 한계는 남습니다.
-- Raster shader에는 SDF의 outline/underlay/glow/gradient 계약이 없으므로 해당 속성과 keyword를 제거합니다. face color와 shader가 지원하는 clip/stencil 값 및 `UNITY_UI_ALPHACLIP` toggle은 보존합니다.
+- Raster shader에는 SDF의 outline/underlay/glow/gradient 계약이 없으므로 해당 속성과 keyword를 제거합니다. 기본 모드는 직접 Material에 교체 Material의 face tint를 적용하고 `--use-game-material`은 게임 tint를 유지하며, 연결 preset의 tint와 shader가 지원하는 clip/stencil 값 및 `UNITY_UI_ALPHACLIP` toggle은 항상 보존합니다.
 - TTF/OTF에서 생성하는 Raster atlas는 SDF effect padding을 상속하지 않고 5 texel의 투명 여백을 사용합니다. 이는 TMP bitmap의 기본 1 texel과 `Extra Padding`의 추가 4 texel UV 확장을 모두 보호하면서 atlas 해상도 낭비를 줄입니다.
-- `--outline-ratio`는 현재 선택된 Material 기준값을 1.0으로 보고 `_OutlineWidth`, `_OutlineSoftness`에 추가 배율을 곱합니다.
+- `--outline-ratio`는 현재 선택된 Material 기준값을 1.0으로 보고 classic의 `_OutlineWidth`, `_OutlineSoftness`, `_Outline2Width`와 SRP의 `_IsoPerimeter`/`_Softness` 중 outline 성분(Y/Z/W)에 추가 배율을 곱합니다. SRP의 face 성분(X)과 outline 위치 offset은 유지합니다.
 - `--outline-ratio 1.25`는 외곽선을 25% 두껍게, `--outline-ratio 0.6`은 더 얇게 만듭니다.
-- `--outline-ratio`는 `--use-game-material` 사용 여부와 관계없이 현재 게임 Material의 outline 값을 기준으로 적용됩니다.
+- `--outline-ratio`의 기준은 기본 모드에서 교체 Material에 명시된 outline 값(없으면 해당 게임 값), `--use-game-material`과 연결 preset에서는 게임 값입니다. 기준값이 `0`이면 배율을 적용해도 `0`을 유지합니다.
 - Raster 변환은 현대 TextCore의 `RASTER_MODE_BITMAP`과 구형 TMP의 bitmap enum을 직렬화 형태에 맞게 선택하며, 생성 설정과 runtime render mode를 함께 동기화합니다.
 - 공식 TMP 0.1.x~4.0 pre 소스에서 확인된 구형·hybrid·신형 형태를 실제 TypeTree 필드 기준으로 판별합니다. 실제 binary의 TypeTree를 읽고 저장 후 재검증할 수 있을 때만 진행하며, 알 수 없거나 모순된 render/schema는 버전 숫자로 추측하지 않고 중단합니다.
 

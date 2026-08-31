@@ -1430,23 +1430,91 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
         self.assertIs(buckets[normalized_resources][atlas_key], payload)
         self.assertIs(buckets[normalized_shared][atlas_key], payload)
 
-    def test_sdf_material_payload_keeps_style_and_updates_atlas_contract(self) -> None:
-        payload = core._build_sdf_material_payload(
+    def test_material_patch_completion_orders_direct_above_linked(self) -> None:
+        identity = "font.bundle|CAB-font|7"
+        direct_key = core._material_patch_completion_key(identity, direct=True)
+        linked_key = core._material_patch_completion_key(identity, direct=False)
+
+        self.assertTrue(
+            core._material_patch_was_completed(
+                {direct_key},
+                identity,
+                direct=True,
+            )
+        )
+        self.assertTrue(
+            core._material_patch_was_completed(
+                {direct_key},
+                identity,
+                direct=False,
+            )
+        )
+        self.assertFalse(
+            core._material_patch_was_completed(
+                {linked_key},
+                identity,
+                direct=True,
+            )
+        )
+        self.assertTrue(
+            core._material_patch_was_completed(
+                {linked_key},
+                identity,
+                direct=False,
+            )
+        )
+        for direct in (False, True):
+            with self.subTest(legacy_identity=True, direct=direct):
+                self.assertTrue(
+                    core._material_patch_was_completed(
+                        {identity},
+                        identity,
+                        direct=direct,
+                    )
+                )
+
+    def test_sdf_material_payload_selects_style_source_and_updates_contract(
+        self,
+    ) -> None:
+        material_data = {
+            "m_SavedProperties": {
+                "m_Floats": [
+                    ["_GradientScale", 8.0],
+                    ["_TextureWidth", 1024.0],
+                    ["_ScaleRatioA", 0.25],
+                    ["_LightAngle", 1.25],
+                    ["_WeightBold", 0.75],
+                    ["_OutlineWidth", 0.0],
+                    ["_Stencil", 6.0],
+                    ["_CullMode", 2.0],
+                    ["_MaskSoftnessX", 4.0],
+                    ["_ScaleX", 2.0],
+                    ["_VertexOffsetX", 3.0],
+                ],
+                "m_Colors": [
+                    ["_FaceColor", {"r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0}],
+                    ["_ClipRect", {"r": -1.0, "g": -1.0, "b": 1.0, "a": 1.0}],
+                    ["_MaskCoord", {"r": 1.0, "g": 2.0, "b": 3.0, "a": 4.0}],
+                ],
+            },
+            "m_ValidKeywords": ["GLOW_ON"],
+        }
+        replacement_payload = core._build_sdf_material_payload(
             atlas_width=4096,
             atlas_height=2048,
-            material_data={
-                "m_SavedProperties": {
-                    "m_Floats": [
-                        ["_GradientScale", 8.0],
-                        ["_TextureWidth", 1024.0],
-                        ["_LightAngle", 1.25],
-                        ["_WeightBold", 0.75],
-                    ],
-                    "m_Colors": [
-                        ["_FaceColor", {"r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0}]
-                    ],
-                }
-            },
+            material_data=material_data,
+            replacement_is_sdf=True,
+            force_raster=False,
+            use_game_material=False,
+            outline_ratio=1.0,
+            replacement_padding=7.0,
+            replacement_font="Test",
+            source_entry="bundle|CAB|1",
+        )
+        game_payload = core._build_sdf_material_payload(
+            atlas_width=4096,
+            atlas_height=2048,
+            material_data=material_data,
             replacement_is_sdf=True,
             force_raster=False,
             use_game_material=True,
@@ -1456,11 +1524,652 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
             source_entry="bundle|CAB|1",
         )
 
-        self.assertEqual(payload["gs"], 8.0)
-        self.assertTrue(payload["preserve_game_style"])
-        self.assertTrue(payload["recompute_shader_ratios"])
-        self.assertEqual(payload["float_overrides"], {})
-        self.assertEqual(payload["color_overrides"], {})
+        for payload in (replacement_payload, game_payload):
+            self.assertEqual(payload["gs"], 8.0)
+            self.assertEqual(payload["w"], 4096)
+            self.assertEqual(payload["h"], 2048)
+            self.assertTrue(payload["recompute_shader_ratios"])
+
+        self.assertFalse(replacement_payload["preserve_game_style"])
+        self.assertEqual(
+            replacement_payload["float_overrides"],
+            {
+                "_LightAngle": 1.25,
+                "_OutlineWidth": 0.0,
+                "_WeightBold": 0.75,
+            },
+        )
+        self.assertEqual(
+            replacement_payload["color_overrides"],
+            {"_FaceColor": {"r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0}},
+        )
+        self.assertTrue(game_payload["preserve_game_style"])
+        self.assertEqual(game_payload["float_overrides"], {})
+        self.assertEqual(game_payload["color_overrides"], {})
+        self.assertNotIn("style_keywords", replacement_payload)
+
+        for invalid_ratio in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(invalid_ratio=invalid_ratio):
+                with self.assertRaisesRegex(ValueError, "positive finite"):
+                    core._build_sdf_material_payload(
+                        atlas_width=4096,
+                        atlas_height=2048,
+                        material_data=material_data,
+                        replacement_is_sdf=True,
+                        force_raster=False,
+                        use_game_material=False,
+                        outline_ratio=invalid_ratio,
+                        replacement_padding=7.0,
+                        replacement_font="Test",
+                        source_entry="bundle|CAB|1",
+                    )
+
+    def test_linked_material_payload_keeps_preset_style_and_atlas_contract(self) -> None:
+        direct = {
+            "w": 4096,
+            "h": 2048,
+            "gs": 8.0,
+            "float_overrides": {"_OutlineWidth": 0.2},
+            "color_overrides": {
+                "_FaceColor": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0}
+            },
+            "outline_ratio": 1.5,
+            "prune_raster_material": False,
+            "recompute_shader_ratios": True,
+        }
+
+        linked = core._build_linked_material_payload(direct)
+
+        self.assertIsNot(linked, direct)
+        self.assertEqual((linked["w"], linked["h"], linked["gs"]), (4096, 2048, 8.0))
+        self.assertEqual(linked["outline_ratio"], 1.5)
+        self.assertTrue(linked["recompute_shader_ratios"])
+        self.assertTrue(linked["preserve_game_style"])
+        self.assertTrue(linked["require_tmp_signature"])
+        self.assertEqual(linked["float_overrides"], {})
+        self.assertEqual(linked["color_overrides"], {})
+        self.assertEqual(direct["float_overrides"], {"_OutlineWidth": 0.2})
+
+    def test_tmp_sdf_signature_does_not_require_classic_texture_dimensions(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "classic",
+                [
+                    ("_GradientScale", 8.0),
+                    ("_WeightNormal", 0.0),
+                    ("_TextureWidth", 1024.0),
+                    ("_TextureHeight", 1024.0),
+                ],
+                [],
+                True,
+            ),
+            (
+                "srp",
+                [("_GradientScale", 8.0)],
+                [("_IsoPerimeter", {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0})],
+                True,
+            ),
+            ("gradient-only", [("_GradientScale", 8.0)], [], False),
+            (
+                "iso-perimeter-in-float-bucket",
+                [("_GradientScale", 8.0), ("_IsoPerimeter", 0.0)],
+                [],
+                False,
+            ),
+            (
+                "iso-perimeter-only",
+                [],
+                [("_IsoPerimeter", {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0})],
+                False,
+            ),
+            ("weight-only", [("_WeightNormal", 0.0)], [], False),
+            (
+                "weight-in-color-bucket",
+                [("_GradientScale", 8.0)],
+                [("_WeightNormal", {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0})],
+                False,
+            ),
+            (
+                "dimensions-without-weight",
+                [
+                    ("_GradientScale", 8.0),
+                    ("_TextureWidth", 1024.0),
+                    ("_TextureHeight", 1024.0),
+                ],
+                [],
+                False,
+            ),
+        )
+        for name, floats, colors, expected in cases:
+            with self.subTest(name=name):
+                saved = SimpleNamespace(m_Floats=floats, m_Colors=colors)
+                self.assertEqual(core._has_tmp_material_signature(saved), expected)
+
+    def test_sdf_material_payload_accepts_official_srp_style_properties_only(
+        self,
+    ) -> None:
+        vector = {"r": 0.1, "g": 0.2, "b": 0.3, "a": 0.4}
+        material_data = {
+            "m_SavedProperties": {
+                "m_Floats": [
+                    ["_GradientScale", 8.0],
+                    ["_BevelAmount", 0.25],
+                    ["_BevelType", 1.0],
+                    ["_OutlineMode", 1.0],
+                    ["_TextureWidth", 1024.0],
+                    ["_ZTestMode", 4.0],
+                ],
+                "m_Colors": [
+                    ["_IsoPerimeter", vector],
+                    ["_Softness", vector],
+                    ["_OutlineOffset1", vector],
+                    ["_OutlineColor1", vector],
+                    ["_UnderlayOffset", vector],
+                    ["_FaceUVSpeed", vector],
+                    ["_OutlineUVSpeed", vector],
+                    ["_FaceTex_ST", vector],
+                    ["_ClipRect", vector],
+                ],
+            }
+        }
+
+        payload = core._build_sdf_material_payload(
+            atlas_width=4096,
+            atlas_height=2048,
+            material_data=material_data,
+            replacement_is_sdf=True,
+            force_raster=False,
+            use_game_material=False,
+            outline_ratio=1.0,
+            replacement_padding=7.0,
+            replacement_font="Test",
+            source_entry="bundle|CAB|1",
+        )
+
+        self.assertEqual(
+            payload["float_overrides"],
+            {
+                "_BevelAmount": 0.25,
+                "_BevelType": 1.0,
+                "_OutlineMode": 1.0,
+            },
+        )
+        self.assertEqual(
+            payload["color_overrides"],
+            {
+                "_IsoPerimeter": vector,
+                "_Softness": vector,
+                "_OutlineOffset1": vector,
+                "_OutlineColor1": vector,
+                "_UnderlayOffset": vector,
+                "_FaceUVSpeed": vector,
+                "_OutlineUVSpeed": vector,
+            },
+        )
+
+    def test_srp_sdf_contract_does_not_inject_absent_classic_dimensions(
+        self,
+    ) -> None:
+        payload = {
+            "w": 4096,
+            "h": 2048,
+            "gs": 8.0,
+            "float_overrides": {},
+            "color_overrides": {},
+            "outline_ratio": 1.0,
+            "preserve_game_style": True,
+            "require_tmp_signature": True,
+            "recompute_shader_ratios": True,
+        }
+
+        def make_material(*, srp: bool, dimensions: bool) -> SimpleNamespace:
+            floats = [("_GradientScale", 6.0)]
+            if not srp:
+                floats.append(("_WeightNormal", 0.0))
+            if dimensions:
+                floats.extend(
+                    [
+                        ("_TextureWidth", 1024.0),
+                        ("_TextureHeight", 512.0),
+                    ]
+                )
+            if srp and dimensions:
+                floats.extend(
+                    [
+                        ("_UnderlayDilate", 0.1),
+                        ("_WeightNormal", 0.2),
+                        ("_FaceDilate", 0.3),
+                        ("_OutlineWidth", 0.4),
+                        ("_ScaleRatioA", 0.5),
+                    ]
+                )
+            colors = (
+                [
+                    (
+                        "_IsoPerimeter",
+                        {"r": 0.0, "g": 0.1, "b": 0.2, "a": 0.3},
+                    ),
+                    (
+                        "_FaceColor",
+                        {"r": 0.1, "g": 0.1, "b": 0.1, "a": 1.0},
+                    ),
+                    (
+                        "_OutlineColor",
+                        {"r": 0.2, "g": 0.2, "b": 0.2, "a": 1.0},
+                    ),
+                ]
+                if srp
+                else []
+            )
+            return SimpleNamespace(
+                m_SavedProperties=SimpleNamespace(
+                    m_Floats=floats,
+                    m_Colors=colors,
+                    m_Ints=[],
+                    m_TexEnvs=[],
+                )
+            )
+
+        srp_without_dimensions = make_material(srp=True, dimensions=False)
+        self.assertTrue(
+            core._apply_material_replacement_to_object(
+                srp_without_dimensions,
+                payload,
+            )
+        )
+        srp_floats = dict(srp_without_dimensions.m_SavedProperties.m_Floats)
+        self.assertEqual(srp_floats["_GradientScale"], 8.0)
+        self.assertNotIn("_TextureWidth", srp_floats)
+        self.assertNotIn("_TextureHeight", srp_floats)
+
+        srp_with_dimensions = make_material(srp=True, dimensions=True)
+        self.assertTrue(
+            core._apply_material_replacement_to_object(srp_with_dimensions, payload)
+        )
+        srp_hybrid_floats = dict(srp_with_dimensions.m_SavedProperties.m_Floats)
+        self.assertEqual(srp_hybrid_floats["_TextureWidth"], 1024.0)
+        self.assertEqual(srp_hybrid_floats["_TextureHeight"], 512.0)
+        self.assertEqual(srp_hybrid_floats["_ScaleRatioA"], 0.5)
+
+        replacement_style_payload = dict(payload)
+        replacement_style_payload["preserve_game_style"] = False
+        replacement_style_payload["float_overrides"] = {
+            "_UnderlayDilate": 0.7,
+            "_WeightNormal": 0.8,
+            "_FaceDilate": 0.9,
+            "_OutlineWidth": 1.0,
+        }
+        replacement_style_payload["color_overrides"] = {
+            "_FaceColor": {"r": 0.8, "g": 0.7, "b": 0.6, "a": 1.0},
+            "_OutlineColor": {"r": 0.9, "g": 0.8, "b": 0.7, "a": 1.0},
+        }
+        self.assertTrue(
+            core._apply_material_replacement_to_object(
+                srp_with_dimensions,
+                replacement_style_payload,
+            )
+        )
+        srp_stale_floats = dict(srp_with_dimensions.m_SavedProperties.m_Floats)
+        self.assertEqual(srp_stale_floats["_UnderlayDilate"], 0.7)
+        self.assertEqual(srp_stale_floats["_WeightNormal"], 0.2)
+        self.assertEqual(srp_stale_floats["_FaceDilate"], 0.3)
+        self.assertEqual(srp_stale_floats["_OutlineWidth"], 0.4)
+        srp_colors = dict(srp_with_dimensions.m_SavedProperties.m_Colors)
+        self.assertEqual(
+            srp_colors["_FaceColor"],
+            {"r": 0.8, "g": 0.7, "b": 0.6, "a": 1.0},
+        )
+        self.assertEqual(
+            srp_colors["_OutlineColor"],
+            {"r": 0.2, "g": 0.2, "b": 0.2, "a": 1.0},
+        )
+
+        classic_without_dimensions = make_material(srp=False, dimensions=False)
+        self.assertTrue(
+            core._apply_material_replacement_to_object(
+                classic_without_dimensions,
+                payload,
+            )
+        )
+        classic_floats = dict(classic_without_dimensions.m_SavedProperties.m_Floats)
+        self.assertEqual(classic_floats["_TextureWidth"], 4096.0)
+        self.assertEqual(classic_floats["_TextureHeight"], 2048.0)
+
+    def test_raster_material_payload_selects_direct_tint_but_always_rebuilds(
+        self,
+    ) -> None:
+        material_data = {
+            "m_SavedProperties": {
+                "m_Floats": [["_Stencil", 6.0]],
+                "m_Colors": [
+                    ["_FaceColor", {"r": 0.8, "g": 0.7, "b": 0.6, "a": 1.0}],
+                    ["_ClipRect", {"r": -1.0, "g": -1.0, "b": 1.0, "a": 1.0}],
+                ],
+            }
+        }
+
+        payloads = {}
+        for use_game_material in (False, True):
+            payloads[use_game_material] = core._build_sdf_material_payload(
+                atlas_width=2048,
+                atlas_height=1024,
+                material_data=material_data,
+                replacement_is_sdf=False,
+                force_raster=True,
+                use_game_material=use_game_material,
+                outline_ratio=1.0,
+                replacement_padding=0.0,
+                replacement_font="Test",
+                source_entry="bundle|CAB|1",
+            )
+
+        for payload in payloads.values():
+            self.assertEqual(payload["gs"], 1.0)
+            self.assertTrue(payload["prune_raster_material"])
+            self.assertTrue(payload["retarget_raster_shader"])
+            self.assertTrue(payload["reset_keywords"])
+        self.assertEqual(
+            payloads[False]["color_overrides"],
+            {"_FaceColor": {"r": 0.8, "g": 0.7, "b": 0.6, "a": 1.0}},
+        )
+        self.assertEqual(payloads[True]["color_overrides"], {})
+        self.assertEqual(
+            core._build_linked_material_payload(payloads[False])["color_overrides"],
+            {},
+        )
+
+    def test_replacement_material_style_preserves_target_local_state_and_keywords(
+        self,
+    ) -> None:
+        original_clip_rect = {"r": -10.0, "g": -20.0, "b": 30.0, "a": 40.0}
+        material = SimpleNamespace(
+            m_ShaderKeywords="UNDERLAY_ON UNITY_UI_ALPHACLIP",
+            m_ValidKeywords=["GLOW_ON"],
+            m_InvalidKeywords=["CUSTOM_VARIANT"],
+            m_SavedProperties=SimpleNamespace(
+                m_Floats=[
+                    ("_GradientScale", 10.0),
+                    ("_TextureWidth", 1024.0),
+                    ("_TextureHeight", 1024.0),
+                    ("_FaceDilate", 0.1),
+                    ("_OutlineWidth", 0.2),
+                    ("_OutlineSoftness", 0.05),
+                    ("_WeightNormal", 0.0),
+                    ("_WeightBold", 0.75),
+                    ("_GlowOffset", 0.1),
+                    ("_GlowOuter", 0.2),
+                    ("_UnderlayOffsetX", 0.2),
+                    ("_UnderlayOffsetY", -0.3),
+                    ("_UnderlayDilate", 0.1),
+                    ("_UnderlaySoftness", 0.2),
+                    ("_LightAngle", 0.25),
+                    ("_Stencil", 3.0),
+                    ("_MaskSoftnessX", 4.0),
+                    ("_ScaleRatioA", 0.1),
+                    ("_ScaleRatioB", 0.1),
+                    ("_ScaleRatioC", 0.1),
+                ],
+                m_Colors=[
+                    ("_FaceColor", {"r": 0.2, "g": 0.3, "b": 0.4, "a": 1.0}),
+                    ("_ClipRect", original_clip_rect.copy()),
+                ],
+            ),
+        )
+        payload = {
+            "w": 4096,
+            "h": 2048,
+            "gs": 8.0,
+            "float_overrides": {
+                "_FaceDilate": 0.0,
+                "_OutlineWidth": 0.0,
+                "_OutlineSoftness": 0.0,
+                "_WeightBold": 0.5,
+                "_LightAngle": 1.25,
+                "_Stencil": 99.0,
+                "_MaskSoftnessX": 99.0,
+            },
+            "color_overrides": {
+                "_FaceColor": {"r": 1.0, "g": 0.0, "b": 0.0, "a": 1.0},
+                "_ClipRect": {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
+            },
+            "outline_ratio": 2.0,
+            "preserve_game_style": False,
+            "recompute_shader_ratios": True,
+        }
+
+        self.assertTrue(core._apply_material_replacement_to_object(material, payload))
+        floats = dict(material.m_SavedProperties.m_Floats)
+
+        self.assertEqual(floats["_GradientScale"], 8.0)
+        self.assertEqual(floats["_TextureWidth"], 4096.0)
+        self.assertEqual(floats["_TextureHeight"], 2048.0)
+        self.assertEqual(floats["_FaceDilate"], 0.0)
+        self.assertEqual(floats["_OutlineWidth"], 0.0)
+        self.assertEqual(floats["_OutlineSoftness"], 0.0)
+        self.assertEqual(floats["_WeightBold"], 0.5)
+        self.assertEqual(floats["_LightAngle"], 1.25)
+        self.assertEqual(floats["_Stencil"], 3.0)
+        self.assertEqual(floats["_MaskSoftnessX"], 4.0)
+        self.assertAlmostEqual(floats["_ScaleRatioA"], 0.875)
+        self.assertAlmostEqual(floats["_ScaleRatioB"], 0.765625)
+        self.assertAlmostEqual(floats["_ScaleRatioC"], 0.765625)
+        self.assertEqual(
+            material.m_SavedProperties.m_Colors[0][1],
+            {"r": 1.0, "g": 0.0, "b": 0.0, "a": 1.0},
+        )
+        self.assertEqual(material.m_SavedProperties.m_Colors[1][1], original_clip_rect)
+        self.assertEqual(
+            material.m_ShaderKeywords,
+            "UNDERLAY_ON UNITY_UI_ALPHACLIP",
+        )
+        self.assertEqual(material.m_ValidKeywords, ["GLOW_ON"])
+        self.assertEqual(material.m_InvalidKeywords, ["CUSTOM_VARIANT"])
+
+    def test_outline_ratio_uses_the_selected_baseline_and_preserves_zero(self) -> None:
+        cases = (
+            ("replacement", False, {"_OutlineWidth": 0.1}, 0.3, False, 0.2, True),
+            ("game", True, {"_OutlineWidth": 0.1}, 0.3, False, 0.6, True),
+            (
+                "replacement-zero",
+                False,
+                {"_OutlineWidth": 0.0},
+                0.3,
+                False,
+                0.0,
+                True,
+            ),
+            ("replacement-missing", False, {}, 0.3, False, 0.6, True),
+            (
+                "linked-then-replacement",
+                False,
+                {"_OutlineWidth": 0.1},
+                0.6,
+                True,
+                0.2,
+                True,
+            ),
+            ("linked-then-game", True, {}, 0.6, True, 0.6, False),
+            (
+                "linked-then-replacement-missing",
+                False,
+                {},
+                0.6,
+                True,
+                0.6,
+                False,
+            ),
+        )
+        for (
+            name,
+            preserve_game_style,
+            overrides,
+            baseline,
+            ratio_already_applied,
+            expected,
+            expected_changed,
+        ) in cases:
+            with self.subTest(name=name):
+                material = SimpleNamespace(
+                    m_SavedProperties=SimpleNamespace(
+                        m_Floats=[("_OutlineWidth", baseline)],
+                        m_Colors=[],
+                    )
+                )
+                payload = {
+                    "float_overrides": overrides,
+                    "color_overrides": {},
+                    "outline_ratio": 2.0,
+                    "preserve_game_style": preserve_game_style,
+                    "game_outline_ratio_already_applied": ratio_already_applied,
+                    "recompute_shader_ratios": False,
+                }
+
+                self.assertEqual(
+                    core._apply_material_replacement_to_object(material, payload),
+                    expected_changed,
+                )
+                self.assertEqual(
+                    dict(material.m_SavedProperties.m_Floats)["_OutlineWidth"],
+                    expected,
+                )
+
+        outline2 = SimpleNamespace(
+            m_SavedProperties=SimpleNamespace(
+                m_Floats=[("_Outline2Width", 0.3)],
+                m_Colors=[],
+            )
+        )
+        self.assertTrue(
+            core._apply_material_replacement_to_object(
+                outline2,
+                {
+                    "float_overrides": {"_Outline2Width": 0.1},
+                    "color_overrides": {},
+                    "outline_ratio": 2.0,
+                    "preserve_game_style": False,
+                    "recompute_shader_ratios": False,
+                },
+            )
+        )
+        self.assertEqual(
+            dict(outline2.m_SavedProperties.m_Floats)["_Outline2Width"],
+            0.2,
+        )
+
+    def test_outline_ratio_scales_only_srp_outline_vector_components(self) -> None:
+        game_iso = {"r": 0.9, "g": 0.4, "b": 0.5, "a": 0.6}
+        game_softness = {"r": 0.7, "g": 0.1, "b": 0.2, "a": 0.3}
+        game_offset = {"r": 0.2, "g": -0.3, "b": 0.0, "a": 0.0}
+        replacement_iso = {"r": 0.1, "g": 0.2, "b": 0.3, "a": 0.4}
+        replacement_softness = {"r": 0.5, "g": 0.05, "b": 0.1, "a": 0.15}
+        replacement_offset = {"r": -0.4, "g": 0.6, "b": 0.0, "a": 0.0}
+        replacement_overrides = {
+            "_IsoPerimeter": replacement_iso,
+            "_Softness": replacement_softness,
+            "_OutlineOffset1": replacement_offset,
+        }
+        cases = (
+            (
+                "replacement",
+                False,
+                replacement_overrides,
+                False,
+                {"r": 0.1, "g": 0.4, "b": 0.6, "a": 0.8},
+                {"r": 0.5, "g": 0.1, "b": 0.2, "a": 0.3},
+                True,
+            ),
+            (
+                "game",
+                True,
+                replacement_overrides,
+                False,
+                {"r": 0.9, "g": 0.8, "b": 1.0, "a": 1.2},
+                {"r": 0.7, "g": 0.2, "b": 0.4, "a": 0.6},
+                True,
+            ),
+            (
+                "replacement-missing",
+                False,
+                {},
+                False,
+                {"r": 0.9, "g": 0.8, "b": 1.0, "a": 1.2},
+                {"r": 0.7, "g": 0.2, "b": 0.4, "a": 0.6},
+                True,
+            ),
+            (
+                "linked-then-replacement",
+                False,
+                replacement_overrides,
+                True,
+                {"r": 0.1, "g": 0.4, "b": 0.6, "a": 0.8},
+                {"r": 0.5, "g": 0.1, "b": 0.2, "a": 0.3},
+                True,
+            ),
+            (
+                "linked-then-game",
+                True,
+                {},
+                True,
+                game_iso,
+                game_softness,
+                False,
+            ),
+            (
+                "linked-then-replacement-missing",
+                False,
+                {},
+                True,
+                game_iso,
+                game_softness,
+                False,
+            ),
+        )
+        for (
+            name,
+            preserve_game_style,
+            overrides,
+            ratio_already_applied,
+            expected_iso,
+            expected_softness,
+            expected_changed,
+        ) in cases:
+            with self.subTest(name=name):
+                material = SimpleNamespace(
+                    m_SavedProperties=SimpleNamespace(
+                        m_Floats=[("_GradientScale", 8.0)],
+                        m_Colors=[
+                            ("_IsoPerimeter", game_iso.copy()),
+                            ("_Softness", game_softness.copy()),
+                            ("_OutlineOffset1", game_offset.copy()),
+                        ],
+                    )
+                )
+                payload = {
+                    "float_overrides": {},
+                    "color_overrides": {
+                        key: value.copy() for key, value in overrides.items()
+                    },
+                    "outline_ratio": 2.0,
+                    "preserve_game_style": preserve_game_style,
+                    "game_outline_ratio_already_applied": ratio_already_applied,
+                    "recompute_shader_ratios": False,
+                }
+
+                self.assertEqual(
+                    core._apply_material_replacement_to_object(material, payload),
+                    expected_changed,
+                )
+                colors = dict(material.m_SavedProperties.m_Colors)
+                self.assertEqual(colors["_IsoPerimeter"], expected_iso)
+                self.assertEqual(colors["_Softness"], expected_softness)
+                expected_offset = (
+                    replacement_offset
+                    if not preserve_game_style and "_OutlineOffset1" in overrides
+                    else game_offset
+                )
+                self.assertEqual(colors["_OutlineOffset1"], expected_offset)
 
     def test_material_style_is_preserved_and_all_scale_ratios_are_recomputed(self) -> None:
         original_face_color = {"r": 0.2, "g": 0.3, "b": 0.4, "a": 1.0}
@@ -1534,6 +2243,8 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
             ("_FaceDilate", 0.0),
             ("_OutlineWidth", 0.0),
             ("_OutlineSoftness", 0.0),
+            ("_GlowOffset", 0.0),
+            ("_UnderlayOffsetX", 0.0),
             ("_ScaleRatioA", 0.25),
             ("_ScaleRatioB", 0.25),
             ("_ScaleRatioC", 0.25),
@@ -1544,6 +2255,48 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
         self.assertEqual(ratios["_ScaleRatioA"], 1.0)
         self.assertEqual(ratios["_ScaleRatioB"], 1.0)
         self.assertEqual(ratios["_ScaleRatioC"], 1.0)
+
+    def test_ratios_off_in_invalid_keyword_list_is_still_enabled(self) -> None:
+        material = SimpleNamespace(
+            m_ShaderKeywords="",
+            m_ValidKeywords=[],
+            m_InvalidKeywords=["RATIOS_OFF"],
+        )
+        floats = [
+            ("_GradientScale", 8.0),
+            ("_FaceDilate", 0.0),
+            ("_OutlineWidth", 0.0),
+            ("_OutlineSoftness", 0.0),
+            ("_GlowOffset", 0.0),
+            ("_UnderlayOffsetX", 0.0),
+            ("_ScaleRatioA", 0.25),
+            ("_ScaleRatioB", 0.25),
+            ("_ScaleRatioC", 0.25),
+        ]
+
+        self.assertTrue(core._recompute_tmp_shader_scale_ratios(material, floats))
+        ratios = dict(floats)
+        self.assertEqual(ratios["_ScaleRatioA"], 1.0)
+        self.assertEqual(ratios["_ScaleRatioB"], 1.0)
+        self.assertEqual(ratios["_ScaleRatioC"], 1.0)
+
+    def test_shader_ratio_b_and_c_require_their_effect_properties(self) -> None:
+        material = SimpleNamespace(m_ShaderKeywords="", m_ValidKeywords=[])
+        floats = [
+            ("_GradientScale", 8.0),
+            ("_FaceDilate", 0.0),
+            ("_OutlineWidth", 0.0),
+            ("_OutlineSoftness", 0.0),
+            ("_ScaleRatioA", 0.25),
+            ("_ScaleRatioB", 0.25),
+            ("_ScaleRatioC", 0.25),
+        ]
+
+        self.assertTrue(core._recompute_tmp_shader_scale_ratios(material, floats))
+        ratios = dict(floats)
+        self.assertEqual(ratios["_ScaleRatioA"], 0.875)
+        self.assertEqual(ratios["_ScaleRatioB"], 0.25)
+        self.assertEqual(ratios["_ScaleRatioC"], 0.25)
 
     def test_only_singular_atlas_reference_is_detected(self) -> None:
         data = {

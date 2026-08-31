@@ -269,8 +269,123 @@ _NEW_LINE_METRIC_SCALE_KEYS = (
 # KR: 외곽선 비율 보정 대상 키
 # EN: Outline ratio correction target keys
 _MATERIAL_OUTLINE_RATIO_KEYS = (
-    "_OutlineWidth",
+    "_Outline2Width",
     "_OutlineSoftness",
+    "_OutlineWidth",
+)
+_MATERIAL_OUTLINE_RATIO_VECTOR_KEYS = frozenset(
+    {
+        "_IsoPerimeter",
+        "_Softness",
+    }
+)
+# KR: TMP 버전과 SDF shader가 달라도 값의 의미가 유지되는 시각 스타일 속성입니다.
+# atlas 계약, UI clipping/stencil, camera/layout 보정값은 의도적으로 제외합니다.
+# EN: Visual-style properties whose meaning remains portable across TMP versions and
+# SDF shaders. Atlas-contract, UI clipping/stencil, and camera/layout values are
+# deliberately excluded.
+_TMP_PORTABLE_STYLE_FLOAT_KEYS = frozenset(
+    {
+        "_Ambient",
+        "_Bevel",
+        "_BevelAmount",
+        "_BevelClamp",
+        "_BevelOffset",
+        "_BevelRoundness",
+        "_BevelType",
+        "_BevelWidth",
+        "_BumpFace",
+        "_BumpOutline",
+        "_Diffuse",
+        "_FaceDilate",
+        "_FaceShininess",
+        "_FaceUVSpeedX",
+        "_FaceUVSpeedY",
+        "_GlowInner",
+        "_GlowOffset",
+        "_GlowOuter",
+        "_GlowPower",
+        "_LightAngle",
+        "_Outline2Width",
+        "_OutlineShininess",
+        "_OutlineSoftness",
+        "_OutlineMode",
+        "_OutlineUVSpeedX",
+        "_OutlineUVSpeedY",
+        "_OutlineWidth",
+        "_Reflectivity",
+        "_ShaderFlags",
+        "_Sharpness",
+        "_SpecularPower",
+        "_UnderlayDilate",
+        "_UnderlayOffsetX",
+        "_UnderlayOffsetY",
+        "_UnderlaySoftness",
+        "_WeightBold",
+        "_WeightNormal",
+    }
+)
+_TMP_PORTABLE_STYLE_COLOR_KEYS = frozenset(
+    {
+        "_Color",
+        "_EnvMatrixRotation",
+        "_FaceColor",
+        "_FaceUVSpeed",
+        "_GlowColor",
+        "_IsoPerimeter",
+        "_Outline2Color",
+        "_OutlineColor",
+        "_OutlineColor1",
+        "_OutlineColor2",
+        "_OutlineColor3",
+        "_OutlineOffset1",
+        "_OutlineOffset2",
+        "_OutlineOffset3",
+        "_OutlineUVSpeed",
+        "_ReflectFaceColor",
+        "_ReflectOutlineColor",
+        "_Softness",
+        "_SpecColor",
+        "_SpecularColor",
+        "_UnderlayColor",
+        "_UnderlayOffset",
+    }
+)
+_TMP_SRP_PORTABLE_STYLE_FLOAT_KEYS = frozenset(
+    {
+        "_Ambient",
+        "_BevelAmount",
+        "_BevelClamp",
+        "_BevelOffset",
+        "_BevelRoundness",
+        "_BevelType",
+        "_BevelWidth",
+        "_Diffuse",
+        "_LightAngle",
+        "_OutlineMode",
+        "_Reflectivity",
+        "_SpecularPower",
+        "_UnderlayDilate",
+        "_UnderlaySoftness",
+    }
+)
+_TMP_SRP_PORTABLE_STYLE_COLOR_KEYS = frozenset(
+    {
+        "_FaceColor",
+        "_FaceUVSpeed",
+        "_IsoPerimeter",
+        "_OutlineColor1",
+        "_OutlineColor2",
+        "_OutlineColor3",
+        "_OutlineOffset1",
+        "_OutlineOffset2",
+        "_OutlineOffset3",
+        "_OutlineUVSpeed",
+        "_Softness",
+        "_SpecularColor",
+        "_UnderlayColor",
+        "_UnderlayOffset",
+    }
 )
 # KR: 로그 포맷 상수
 # EN: Log format constants
@@ -2620,6 +2735,34 @@ def _make_outer_assets_object_key(
     return f"{normalized_outer}|{_make_assets_object_key(assets_name, path_id)}"
 
 
+def _material_patch_completion_key(
+    material_identity: str,
+    *,
+    direct: bool,
+) -> str:
+    """Distinguish a direct style patch from an atlas-linked contract patch."""
+    role = "direct" if direct else "linked"
+    return f"{role}|{material_identity}"
+
+
+def _material_patch_was_completed(
+    completed: set[str],
+    material_identity: str,
+    *,
+    direct: bool,
+) -> bool:
+    """Return whether an equal-or-stronger Material patch already succeeded."""
+    # Bare identities were emitted before completion roles were introduced.
+    # Treat them as the stronger direct completion for caller compatibility.
+    if material_identity in completed:
+        return True
+    direct_key = _material_patch_completion_key(material_identity, direct=True)
+    if direct:
+        return direct_key in completed
+    linked_key = _material_patch_completion_key(material_identity, direct=False)
+    return direct_key in completed or linked_key in completed
+
+
 def _resolve_material_main_texture_identity(
     source_assets_file: Any,
     current_assets_name: str,
@@ -3610,6 +3753,8 @@ def _apply_color_override(current_value: Any, override: JsonDict) -> Any:
             val = float(override[key])
         except Exception:
             continue
+        if not math.isfinite(val):
+            continue
         if isinstance(current_value, dict):
             current_value[key] = val
         if hasattr(current_value, attr):
@@ -4127,6 +4272,13 @@ def _material_shader_keywords(material: Any) -> set[str]:
     valid_keywords = getattr(material, "m_ValidKeywords", None)
     if isinstance(valid_keywords, (list, tuple, set)):
         keywords.update(str(token) for token in valid_keywords if str(token))
+    # Unity's split keyword serialization can retain enabled keywords that the
+    # currently assigned shader does not recognize in m_InvalidKeywords. TMP's
+    # RATIOS_OFF is a C# control keyword rather than a shader pragma, so it can
+    # legitimately live here and must still affect ratio calculation.
+    invalid_keywords = getattr(material, "m_InvalidKeywords", None)
+    if isinstance(invalid_keywords, (list, tuple, set)):
+        keywords.update(str(token) for token in invalid_keywords if str(token))
     return keywords
 
 
@@ -4221,7 +4373,7 @@ def _recompute_tmp_shader_scale_ratios(
 
     effect_range = (weight + face_dilate) * (scale - 1.0)
     available_range = max(0.0, scale - 1.0 - effect_range)
-    if "_ScaleRatioB" in float_values:
+    if "_GlowOffset" in float_values and "_ScaleRatioB" in float_values:
         glow_span = max(
             1.0,
             float_values.get("_GlowOffset", 0.0)
@@ -4230,7 +4382,7 @@ def _recompute_tmp_shader_scale_ratios(
         ratio_values["_ScaleRatioB"] = (
             available_range / (scale * glow_span) if ratios_enabled else 1.0
         )
-    if "_ScaleRatioC" in float_values:
+    if "_UnderlayOffsetX" in float_values and "_ScaleRatioC" in float_values:
         underlay_span = max(
             1.0,
             max(
@@ -4276,7 +4428,14 @@ def _build_sdf_material_payload(
     source_entry: str,
 ) -> JsonDict:
     """Build one compatibility payload for a font's direct and preset Materials."""
-    preserve_game_style = bool(replacement_is_sdf and not force_raster)
+    try:
+        resolved_outline_ratio = float(outline_ratio)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("outline_ratio must be a positive finite number") from exc
+    if not math.isfinite(resolved_outline_ratio) or resolved_outline_ratio <= 0:
+        raise ValueError("outline_ratio must be a positive finite number")
+
+    preserve_game_style = bool(use_game_material)
     apply_replacement_material = not use_game_material
     float_overrides: dict[str, float] = {}
     color_overrides: dict[str, JsonDict] = {}
@@ -4298,6 +4457,10 @@ def _build_sdf_material_payload(
         else []
     )
 
+    # Keep the target shader, auxiliary texture PPtrs, and keywords. Their
+    # compiled variants and object references are build-local, so replacement
+    # JSON can safely contribute only same-name portable scalar/vector values.
+
     for prop in replacement_floats:
         if not isinstance(prop, (list, tuple)) or len(prop) < 2:
             continue
@@ -4311,7 +4474,7 @@ def _build_sdf_material_payload(
         if key == "_GradientScale":
             replacement_gradient_scale = value
             continue
-        if key in {"_TextureWidth", "_TextureHeight"}:
+        if key not in _TMP_PORTABLE_STYLE_FLOAT_KEYS:
             continue
         if apply_replacement_material and not preserve_game_style:
             float_overrides[key] = value
@@ -4320,10 +4483,18 @@ def _build_sdf_material_payload(
         for prop in replacement_colors:
             if not isinstance(prop, (list, tuple)) or len(prop) < 2:
                 continue
-            color_overrides[str(prop[0])] = _color_value_to_dict(
-                prop[1],
-                {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
-            )
+            key = str(prop[0])
+            if key not in _TMP_PORTABLE_STYLE_COLOR_KEYS:
+                continue
+            try:
+                color_value = _color_value_to_dict(
+                    prop[1],
+                    {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if all(math.isfinite(float(value)) for value in color_value.values()):
+                color_overrides[key] = color_value
 
     gradient_scale: float | None = None
     if replacement_is_sdf and not force_raster:
@@ -4345,7 +4516,7 @@ def _build_sdf_material_payload(
         "gs": gradient_scale,
         "float_overrides": float_overrides,
         "color_overrides": color_overrides,
-        "outline_ratio": float(outline_ratio),
+        "outline_ratio": resolved_outline_ratio,
         "reset_keywords": prune_raster_material,
         "prune_raster_material": prune_raster_material,
         "retarget_raster_shader": prune_raster_material,
@@ -4355,6 +4526,16 @@ def _build_sdf_material_payload(
         "replacement_font": replacement_font,
         "source_entry": source_entry,
     }
+
+
+def _build_linked_material_payload(material_payload: JsonDict) -> JsonDict:
+    """Keep each atlas-linked preset's style while synchronizing its atlas contract."""
+    linked_payload = dict(material_payload)
+    linked_payload["float_overrides"] = {}
+    linked_payload["color_overrides"] = {}
+    linked_payload["preserve_game_style"] = True
+    linked_payload["require_tmp_signature"] = True
+    return linked_payload
 
 
 def _prepare_static_tmp_population(
@@ -4629,32 +4810,30 @@ def _select_tmp_raster_render_modes(
     return atlas_render_mode, creation_render_mode
 
 
-def _has_tmp_sdf_shader_signature(saved_props: Any) -> bool:
-    """Match the shader properties TMP itself uses to identify SDF Materials."""
-    float_props = getattr(saved_props, "m_Floats", None)
-    if not isinstance(float_props, list):
-        return False
-    names = {
+def _saved_material_property_names(saved_props: Any, bucket_name: str) -> set[str]:
+    """Return exact property names from one serialized Material value bucket."""
+    bucket = getattr(saved_props, bucket_name, None)
+    if not isinstance(bucket, list):
+        return set()
+    return {
         str(entry[0])
-        for entry in float_props
+        for entry in bucket
         if isinstance(entry, (list, tuple)) and len(entry) >= 2
     }
-    return "_GradientScale" in names and "_WeightNormal" in names
+
+
+def _has_tmp_sdf_shader_signature(saved_props: Any) -> bool:
+    """Recognize official classic and SRP TMP SDF Material contracts."""
+    float_names = _saved_material_property_names(saved_props, "m_Floats")
+    if "_GradientScale" not in float_names:
+        return False
+    color_names = _saved_material_property_names(saved_props, "m_Colors")
+    return "_WeightNormal" in float_names or "_IsoPerimeter" in color_names
 
 
 def _has_tmp_material_signature(saved_props: Any) -> bool:
-    float_props = getattr(saved_props, "m_Floats", None)
-    if not isinstance(float_props, list):
-        return False
-    names = {
-        str(entry[0])
-        for entry in float_props
-        if isinstance(entry, (list, tuple)) and len(entry) >= 2
-    }
-    return bool(
-        {"_GradientScale", "_TextureWidth", "_TextureHeight"}.issubset(names)
-        and names & {"_WeightNormal", "_FaceDilate", "_ScaleRatioA"}
-    )
+    """Recognize an atlas-linked TMP SDF Material without classic-only fields."""
+    return _has_tmp_sdf_shader_signature(saved_props)
 
 
 def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -> bool:
@@ -4664,20 +4843,34 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
     changed = False
     float_overrides_raw = mat_info.get("float_overrides", {})
     float_overrides = (
-        float_overrides_raw if isinstance(float_overrides_raw, dict) else {}
+        {
+            str(key): value
+            for key, value in float_overrides_raw.items()
+            if str(key) in _TMP_PORTABLE_STYLE_FLOAT_KEYS
+        }
+        if isinstance(float_overrides_raw, dict)
+        else {}
     )
     color_overrides_raw = mat_info.get("color_overrides", {})
     color_overrides = (
-        color_overrides_raw if isinstance(color_overrides_raw, dict) else {}
+        {
+            str(key): value
+            for key, value in color_overrides_raw.items()
+            if str(key) in _TMP_PORTABLE_STYLE_COLOR_KEYS
+        }
+        if isinstance(color_overrides_raw, dict)
+        else {}
     )
     try:
         outline_ratio = float(mat_info.get("outline_ratio", 1.0))
     except Exception:
         outline_ratio = 1.0
-    if outline_ratio <= 0:
+    if not math.isfinite(outline_ratio) or outline_ratio <= 0:
         outline_ratio = 1.0
-    outline_fallback_used = False
     preserve_game_style = bool(mat_info.get("preserve_game_style", False))
+    game_outline_ratio_already_applied = bool(
+        mat_info.get("game_outline_ratio_already_applied", False)
+    )
     prune_raster_material = bool(mat_info.get("prune_raster_material", False))
     raster_shader_properties: set[str] = set()
     recompute_shader_ratios = bool(mat_info.get("recompute_shader_ratios", False))
@@ -4700,6 +4893,10 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
         saved_props
     ):
         return False
+    uses_srp_sdf_contract = "_IsoPerimeter" in _saved_material_property_names(
+        saved_props,
+        "m_Colors",
+    )
 
     if prune_raster_material:
         shader_kind = str(mat_info.get("raster_shader_kind", ""))
@@ -4731,9 +4928,11 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                 if not isinstance(entry, (list, tuple)) or len(entry) < 2:
                     continue
                 try:
-                    existing_float_map[str(entry[0])] = float(entry[1])
+                    existing_value = float(entry[1])
                 except Exception:
                     continue
+                if math.isfinite(existing_value):
+                    existing_float_map[str(entry[0])] = existing_value
 
             has_texture_height = False
             has_texture_width = False
@@ -4763,13 +4962,21 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                         float_props[i] = ("_GradientScale", candidate)
                         has_gradient_scale = True
                         changed = True
-                elif prop_name == "_TextureHeight" and texture_h is not None:
+                elif (
+                    prop_name == "_TextureHeight"
+                    and texture_h is not None
+                    and not uses_srp_sdf_contract
+                ):
                     # KR: _TextureHeight는 실제 아틀라스 크기가 float_overrides보다 우선합니다.
                     # EN: For _TextureHeight, the actual atlas size takes priority over float_overrides.
                     float_props[i] = ("_TextureHeight", texture_h)
                     has_texture_height = True
                     changed = True
-                elif prop_name == "_TextureWidth" and texture_w is not None:
+                elif (
+                    prop_name == "_TextureWidth"
+                    and texture_w is not None
+                    and not uses_srp_sdf_contract
+                ):
                     float_props[i] = ("_TextureWidth", texture_w)
                     has_texture_width = True
                     changed = True
@@ -4777,125 +4984,137 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                     candidate = existing_float_map.get(prop_name)
                     if candidate is None:
                         continue
-                    if prop_name in _MATERIAL_OUTLINE_RATIO_KEYS:
+                    if (
+                        prop_name in _MATERIAL_OUTLINE_RATIO_KEYS
+                        and not uses_srp_sdf_contract
+                        and not game_outline_ratio_already_applied
+                    ):
                         candidate = float(candidate * outline_ratio)
                         float_props[i] = (prop_name, float(candidate))
                         changed = True
-                elif prop_name in _MATERIAL_OUTLINE_RATIO_KEYS:
-                    candidate: float | None = None
-                    existing_value: float | None = None
+                elif prop_name in float_overrides and (
+                    not uses_srp_sdf_contract
+                    or prop_name in _TMP_SRP_PORTABLE_STYLE_FLOAT_KEYS
+                ):
                     try:
-                        existing_value = float(entry[1])
-                    except Exception:
-                        existing_value = None
-                    if prop_name in float_overrides:
-                        try:
-                            candidate = float(float_overrides[prop_name])
-                        except Exception:
-                            candidate = None
-                        if (
-                            outline_ratio != 1.0
-                            and candidate is not None
-                            and abs(candidate) <= 1e-9
-                        ):
-                            if existing_value is not None and abs(existing_value) > 1e-9:
-                                candidate = existing_value
-                                outline_fallback_used = True
-                            elif prop_name == "_OutlineWidth":
-                                baseline_gradient_scale = None
-                                try:
-                                    if "_GradientScale" in float_overrides:
-                                        baseline_gradient_scale = float(
-                                            float_overrides["_GradientScale"]
-                                        )
-                                    elif gradient_scale is not None:
-                                        baseline_gradient_scale = float(gradient_scale)
-                                    else:
-                                        baseline_gradient_scale = existing_float_map.get(
-                                            "_GradientScale"
-                                        )
-                                except Exception:
-                                    baseline_gradient_scale = None
-                                if (
-                                    baseline_gradient_scale is not None
-                                    and baseline_gradient_scale > 0
-                                ):
-                                    candidate = 1.0 / baseline_gradient_scale
-                                    outline_fallback_used = True
-                    elif outline_ratio != 1.0:
-                        candidate = existing_value
-                        if (
-                            prop_name == "_OutlineWidth"
-                            and candidate is not None
-                            and abs(candidate) <= 1e-9
-                        ):
-                            baseline_gradient_scale = None
-                            try:
-                                if "_GradientScale" in float_overrides:
-                                    baseline_gradient_scale = float(
-                                        float_overrides["_GradientScale"]
-                                    )
-                                elif gradient_scale is not None:
-                                    baseline_gradient_scale = float(gradient_scale)
-                                else:
-                                    baseline_gradient_scale = existing_float_map.get(
-                                        "_GradientScale"
-                                    )
-                            except Exception:
-                                baseline_gradient_scale = None
-                            if (
-                                baseline_gradient_scale is not None
-                                and baseline_gradient_scale > 0
-                            ):
-                                candidate = 1.0 / baseline_gradient_scale
-                                outline_fallback_used = True
-                    if candidate is not None:
-                        float_props[i] = (prop_name, float(candidate * outline_ratio))
+                        candidate = float(float_overrides[prop_name])
+                    except (TypeError, ValueError, OverflowError):
+                        candidate = float("nan")
+                    if (
+                        prop_name in _MATERIAL_OUTLINE_RATIO_KEYS
+                        and not uses_srp_sdf_contract
+                    ):
+                        candidate *= outline_ratio
+                    if math.isfinite(candidate):
+                        float_props[i] = (prop_name, candidate)
                         changed = True
-                elif prop_name in float_overrides:
-                    float_props[i] = (prop_name, float(float_overrides[prop_name]))
-                    changed = True
+                elif (
+                    prop_name in _MATERIAL_OUTLINE_RATIO_KEYS
+                    and not uses_srp_sdf_contract
+                    and outline_ratio != 1.0
+                    and not game_outline_ratio_already_applied
+                ):
+                    candidate = existing_float_map.get(prop_name)
+                    if candidate is not None:
+                        float_props[i] = (prop_name, candidate * outline_ratio)
+                        changed = True
                 if prop_name == "_TextureHeight":
                     has_texture_height = True
                 elif prop_name == "_TextureWidth":
                     has_texture_width = True
                 elif prop_name == "_GradientScale":
                     has_gradient_scale = True
-            if texture_h is not None and not has_texture_height:
+            if (
+                texture_h is not None
+                and not has_texture_height
+                and not uses_srp_sdf_contract
+            ):
                 float_props.append(("_TextureHeight", texture_h))
                 changed = True
-            if texture_w is not None and not has_texture_width:
+            if (
+                texture_w is not None
+                and not has_texture_width
+                and not uses_srp_sdf_contract
+            ):
                 float_props.append(("_TextureWidth", texture_w))
                 changed = True
             if gradient_scale is not None and not has_gradient_scale:
                 float_props.append(("_GradientScale", float(gradient_scale)))
                 changed = True
 
-            if recompute_shader_ratios and _recompute_tmp_shader_scale_ratios(
-                parse_dict,
-                float_props,
+            if (
+                recompute_shader_ratios
+                and not uses_srp_sdf_contract
+                and _recompute_tmp_shader_scale_ratios(parse_dict, float_props)
             ):
                 changed = True
 
-            if outline_fallback_used:
-                logger.debug(
-                    "outline_ratio used original material baseline because replacement outline values were zero: %s",
-                    mat_info.get("source_entry", ""),
-                )
-
         color_props = getattr(saved_props, "m_Colors", None)
-        if isinstance(color_props, list) and color_overrides:
+        if isinstance(color_props, list):
             for i in range(len(color_props)):
-                color_name = color_props[i][0]
+                color_name = str(color_props[i][0])
+                current_value = color_props[i][1]
+                scales_outline_components = (
+                    uses_srp_sdf_contract
+                    and color_name in _MATERIAL_OUTLINE_RATIO_VECTOR_KEYS
+                )
                 if preserve_game_style:
+                    if (
+                        scales_outline_components
+                        and outline_ratio != 1.0
+                        and not game_outline_ratio_already_applied
+                    ):
+                        scaled = _color_value_to_dict(
+                            current_value,
+                            {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
+                        )
+                        for channel in ("g", "b", "a"):
+                            scaled[channel] *= outline_ratio
+                        color_props[i] = (
+                            color_name,
+                            _apply_color_override(current_value, scaled),
+                        )
+                        changed = True
                     continue
                 override = color_overrides.get(color_name)
-                if not isinstance(override, dict):
+                if (
+                    uses_srp_sdf_contract
+                    and color_name not in _TMP_SRP_PORTABLE_STYLE_COLOR_KEYS
+                ):
+                    override = None
+                if isinstance(override, dict):
+                    effective_override = dict(override)
+                    if scales_outline_components:
+                        for channel in ("g", "b", "a"):
+                            if channel not in effective_override:
+                                continue
+                            try:
+                                effective_override[channel] = (
+                                    float(effective_override[channel]) * outline_ratio
+                                )
+                            except (TypeError, ValueError, OverflowError):
+                                effective_override.pop(channel, None)
+                    color_props[i] = (
+                        color_name,
+                        _apply_color_override(current_value, effective_override),
+                    )
+                    changed = True
                     continue
-                current_value = color_props[i][1]
+                if (
+                    not scales_outline_components
+                    or outline_ratio == 1.0
+                    or game_outline_ratio_already_applied
+                ):
+                    continue
+                scaled = _color_value_to_dict(
+                    current_value,
+                    {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
+                )
+                for channel in ("g", "b", "a"):
+                    scaled[channel] *= outline_ratio
                 color_props[i] = (
                     color_name,
-                    _apply_color_override(current_value, override),
+                    _apply_color_override(current_value, scaled),
                 )
                 changed = True
 
@@ -6838,8 +7057,9 @@ def replace_fonts_in_file(
     use_game_line_metrics=True면 게임 원본 줄 간격 메트릭을 그대로 사용합니다.
     pointSize는 옵션과 무관하게 교체 폰트 값을 유지합니다.
     material_scale_by_padding은 이전 호출자 호환을 위해 유지됩니다. SDF 스타일 값은 padding 비율로
-    곱하지 않고, atlas 고유 값과 공식 shader ratio만 안전하게 갱신합니다.
-    outline_ratio는 현재 선택된 Material 기준(_OutlineWidth/_OutlineSoftness)에 배율로 적용합니다.
+    곱하지 않습니다. 기본은 교체 Material의 호환 스타일값, use_game_mat=True면 게임 스타일값을 쓰며,
+    atlas 고유 값과 공식 shader ratio는 두 모드에서 항상 안전하게 갱신합니다.
+    outline_ratio는 현재 선택된 Material 기준의 classic/SRP outline 두께와 softness에 배율로 적용합니다.
     freeze_dynamic=True면 Dynamic FontAsset을 Static으로 고정하고 runtime source Font PPtr을 해제합니다.
     prefer_original_compress=True면 원본 압축 우선, False면 무압축 계열 우선 저장 전략을 사용합니다.
     ps5_swizzle=True면 대상 Atlas의 swizzle 상태를 판별해 교체 Atlas를 자동 swizzle/unswizzle합니다.
@@ -6853,9 +7073,11 @@ def replace_fonts_in_file(
     and applies them scaled to the replacement pointSize.
     use_game_line_metrics=True uses the game's original line-spacing metrics as-is.
     pointSize always retains the replacement font's value regardless of options.
-    material_scale_by_padding is retained for caller compatibility. SDF style values are no longer
-    multiplied by a padding ratio; only atlas-specific values and official shader ratios are updated.
-    outline_ratio applies as a multiplier to the selected Material's _OutlineWidth/_OutlineSoftness.
+    material_scale_by_padding is retained for caller compatibility. SDF style values are not
+    multiplied by a padding ratio. The default uses compatible replacement-Material style values,
+    while use_game_mat=True keeps game style; atlas-specific values and official shader ratios are
+    safely updated in both modes.
+    outline_ratio multiplies the selected Material's classic or SRP outline thickness and softness.
     freeze_dynamic=True freezes Dynamic FontAssets to Static and clears their runtime source Font PPtr.
     prefer_original_compress=True uses original compression first; False uses uncompressed-first strategy.
     ps5_swizzle=True detects target Atlas swizzle state and auto-swizzles/unswizzles the replacement Atlas.
@@ -8055,8 +8277,9 @@ def replace_fonts_in_file(
                             old_atlas_assets_name,
                             old_atlas_path_id,
                         )
-                        atlas_fallback_payload = dict(material_payload)
-                        atlas_fallback_payload["require_tmp_signature"] = True
+                        atlas_fallback_payload = _build_linked_material_payload(
+                            material_payload
+                        )
                         if collected_material_atlas_plans is not None:
                             stored_atlas_plan, _ = _store_consistent_patch_value(
                                 collected_material_atlas_plans,
@@ -8498,16 +8721,6 @@ def replace_fonts_in_file(
                             f"[replace_material] file={fn_without_path} path_id={fallback_path_id} "
                             "fallback_pathid_only_match_ambiguous=True; skipped"
                         )
-            if (
-                mat_info is not None
-                and patched_material_identities is not None
-                and material_identity in patched_material_identities
-            ):
-                if is_direct_material_plan and id(mat_info) in (
-                    incoming_material_ids | required_local_material_ids
-                ):
-                    consumed_material_ids.add(id(mat_info))
-                continue
             if mat_info is None:
                 if parse_dict is None:
                     parse_dict = _safe_parse_as_object(obj)
@@ -8524,6 +8737,25 @@ def replace_fonts_in_file(
                         material_replacements_by_atlas,
                         atlas_key,
                     )
+            linked_patch_already_applied = False
+            if mat_info is not None and patched_material_identities is not None:
+                linked_completion_key = _material_patch_completion_key(
+                    material_identity,
+                    direct=False,
+                )
+                linked_patch_already_applied = (
+                    linked_completion_key in patched_material_identities
+                )
+                if _material_patch_was_completed(
+                    patched_material_identities,
+                    material_identity,
+                    direct=is_direct_material_plan,
+                ):
+                    if is_direct_material_plan and id(mat_info) in (
+                        incoming_material_ids | required_local_material_ids
+                    ):
+                        consumed_material_ids.add(id(mat_info))
+                    continue
             if mat_info is not None:
                 if parse_dict is None:
                     parse_dict = _safe_parse_as_object(obj)
@@ -8603,6 +8835,12 @@ def replace_fonts_in_file(
                             "effects are unavailable for this Material."
                         )
 
+                if is_direct_material_plan and linked_patch_already_applied:
+                    effective_mat_info = dict(effective_mat_info)
+                    effective_mat_info[
+                        "game_outline_ratio_already_applied"
+                    ] = True
+
                 material_rebound = False
                 replacement_atlas_target = mat_info.get(
                     "replacement_atlas_target"
@@ -8663,7 +8901,12 @@ def replace_fonts_in_file(
                 ):
                     consumed_material_ids.add(id(mat_info))
                 if patched_material_identities is not None:
-                    newly_patched_material_identities.add(material_identity)
+                    newly_patched_material_identities.add(
+                        _material_patch_completion_key(
+                            material_identity,
+                            direct=is_direct_material_plan,
+                        )
+                    )
 
     # Atlas-keyed material plans are compatibility fallbacks. They are
     # best-effort and may legitimately have no Material in the texture file.
@@ -9628,14 +9871,14 @@ def main_cli(lang: Language = "ko") -> None:
             "스캔 제외 확장자 목록 (콤마 구분, 예: \"resS,.resource\")"
         )
         charset_help = "TTF/OTF에서 SDF/Raster atlas 자동 생성 시 사용할 글자셋 파일 또는 직접 문자열 (기본: CharList_3911.txt)"
-        game_mat_help = "이전 CLI 호환용. 게임 Material 스타일 보존은 기본이며 필수 atlas/shader 값은 항상 동기화"
+        game_mat_help = "교체 Material의 호환 스타일값 대신 게임 원본 Material 스타일값 사용 (atlas 필수값은 항상 동기화)"
         force_raster_help = "Raster atlas를 생성하고 도달 가능한 TMP Bitmap shader로 Material.m_Shader를 재연결"
         unsafe_full_color_help = "테스트 전용: raster atlas를 흰색 RGB가 보존되는 RGBA32로 저장하고 TMP Sprite/Bitmap Custom Atlas shader fallback 허용"
         unsafe_gui_text_help = "위험한 테스트 전용: TMP UI mask/depth를 지원하지 않는 GUI/Text Shader fallback 허용"
         freeze_dynamic_help = "Dynamic/DynamicOS TMP FontAsset을 baked Static atlas로 명시적으로 고정하고 source Font PPtr 해제"
         game_line_metrics_help = "SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용)"
         outline_ratio_help = (
-            "SDF 외곽선 비율 배율 (기본: 1.0, _OutlineWidth/_OutlineSoftness에 적용)"
+            "SDF 외곽선 배율 (기본: 1.0, classic/SRP outline 두께·softness에 적용)"
         )
         original_compress_help = (
             "저장 시 원본 압축 모드를 우선 사용 (기본값; --no-original-compress로 해제)"
@@ -9684,14 +9927,14 @@ Examples:
             "Additional scan-excluded extensions (comma-separated, e.g. \"resS,.resource\")"
         )
         charset_help = "Charset file or literal characters for TTF/OTF-to-SDF/raster atlas generation (default: CharList_3911.txt)"
-        game_mat_help = "Legacy CLI compatibility. Game Material style is preserved by default; required atlas/shader values are always synchronized"
+        game_mat_help = "Use the original in-game Material style instead of compatible replacement-Material style values (required atlas values are always synchronized)"
         force_raster_help = "Generate a raster atlas and retarget Material.m_Shader to a reachable TMP Bitmap shader"
         unsafe_full_color_help = "Testing only: store raster atlases as white-RGB RGBA32 and allow TMP Sprite/Bitmap Custom Atlas shader fallbacks"
         unsafe_gui_text_help = "Unsafe testing only: allow GUI/Text Shader fallback without TMP UI masking or depth support"
         freeze_dynamic_help = "Explicitly freeze Dynamic/DynamicOS TMP FontAssets to a baked Static atlas and clear the source Font PPtr"
         game_line_metrics_help = "Use original in-game line metrics for SDF replacement (default: adjusted replacement font metrics)"
         outline_ratio_help = (
-            "SDF outline ratio multiplier (default: 1.0, applied to _OutlineWidth/_OutlineSoftness)"
+            "SDF outline multiplier (default: 1.0, applied to classic/SRP outline thickness and softness)"
         )
         original_compress_help = "Prefer original compression mode on save (default; disable with --no-original-compress)"
         temp_dir_help = "Root path for temporary save files (fast SSD/NVMe recommended)"
@@ -9959,7 +10202,7 @@ Examples:
                 "--scan-stall-seconds must be greater than or equal to 0.",
                 lang=lang,
             )
-    if args.outline_ratio <= 0:
+    if not math.isfinite(args.outline_ratio) or args.outline_ratio <= 0:
         if is_ko:
             exit_with_error(
                 "--outline-ratio는 0보다 큰 실수여야 합니다.",
@@ -10069,17 +10312,21 @@ Examples:
 
     if args.use_game_material:
         if is_ko:
-            _log_console("Material 모드: 게임 원본 Material 파라미터를 사용합니다.")
-        else:
-            _log_console("Material mode: using original in-game Material parameters.")
-    else:
-        if is_ko:
             _log_console(
-                "Material 모드: 게임 원본 Material 스타일을 유지하고 atlas/padding 차이를 자동 보정합니다."
+                "Material 모드: 게임 원본 스타일값을 유지하고 atlas 필수값만 동기화합니다."
             )
         else:
             _log_console(
-                "Material mode: preserving original in-game Material style with automatic atlas/padding correction."
+                "Material mode: keeping in-game style values and synchronizing required atlas values."
+            )
+    else:
+        if is_ko:
+            _log_console(
+                "Material 모드: 교체 Material의 호환 스타일값을 적용하고 atlas 필수값을 동기화합니다."
+            )
+        else:
+            _log_console(
+                "Material mode: applying compatible replacement-Material style values and synchronizing required atlas values."
             )
     if args.ps5_swizzle:
         if is_ko:
@@ -10100,11 +10347,11 @@ Examples:
     if args.outline_ratio != 1.0:
         if is_ko:
             _log_console(
-                f"외곽선 비율 모드: Material _OutlineWidth/_OutlineSoftness에 x{args.outline_ratio:.3f} 배율을 적용합니다."
+                f"외곽선 비율 모드: classic/SRP outline 두께·softness에 x{args.outline_ratio:.3f} 배율을 적용합니다."
             )
         else:
             _log_console(
-                f"Outline ratio mode: applying x{args.outline_ratio:.3f} to Material _OutlineWidth/_OutlineSoftness."
+                f"Outline ratio mode: applying x{args.outline_ratio:.3f} to classic/SRP outline thickness and softness."
             )
 
     if args._validate_bundle:
