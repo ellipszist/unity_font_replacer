@@ -71,7 +71,35 @@ def _il2cpp_cache_root(explicit_root: str | None = None) -> str:
     return root
 
 
-def _il2cpp_dumper_path(explicit_path: str | None = None) -> str:
+def _pe_architecture(binary_path: str) -> str:
+    with open(binary_path, "rb") as binary:
+        dos_header = binary.read(64)
+        if len(dos_header) != 64 or dos_header[:2] != b"MZ":
+            raise ValueError(f"Invalid DOS header in PE binary: {binary_path}")
+        pe_offset = int.from_bytes(dos_header[60:64], "little")
+        if pe_offset < 64:
+            raise ValueError(f"Invalid PE header offset: {binary_path}")
+        binary.seek(pe_offset)
+        pe_header = binary.read(26)
+    if len(pe_header) != 26 or pe_header[:4] != b"PE\0\0":
+        raise ValueError(f"Invalid PE header: {binary_path}")
+    machine = int.from_bytes(pe_header[4:6], "little")
+    optional_size = int.from_bytes(pe_header[20:22], "little")
+    magic = int.from_bytes(pe_header[24:26], "little")
+    if optional_size >= 2:
+        if (machine, magic) == (0x014C, 0x010B):
+            return "x86"
+        if (machine, magic) == (0x8664, 0x020B):
+            return "x64"
+    raise ValueError(
+        f"Unsupported PE architecture (machine=0x{machine:04X}, magic=0x{magic:04X}): "
+        f"{binary_path}. Set UFR_IL2CPP_DUMPER to use a custom dumper."
+    )
+
+
+def _il2cpp_dumper_path(
+    explicit_path: str | None = None, *, binary_path: str | None = None,
+) -> str:
     configured = explicit_path or os.environ.get("UFR_IL2CPP_DUMPER", "")
     if configured:
         candidate = os.path.abspath(configured)
@@ -81,7 +109,10 @@ def _il2cpp_dumper_path(explicit_path: str | None = None) -> str:
             if getattr(sys, "frozen", False)
             else os.path.dirname(os.path.abspath(__file__))
         )
-        candidate = os.path.join(base, "Il2CppDumper", "Il2CppDumper.exe")
+        folder = os.path.join(base, "Il2CppDumper")
+        if binary_path is not None and _pe_architecture(binary_path) == "x86":
+            folder = os.path.join(folder, "x86")
+        candidate = os.path.join(folder, "Il2CppDumper.exe")
     if not os.path.isfile(candidate):
         raise FileNotFoundError(
             "Il2CppDumper.exe was not found. Expected it at " f"{candidate}"
@@ -132,7 +163,7 @@ def _ensure_il2cpp_dummy_dlls(
         raise FileNotFoundError(
             "IL2CPP requires GameAssembly.dll and global-metadata.dat."
         )
-    resolved_dumper = _il2cpp_dumper_path(dumper_path)
+    resolved_dumper = _il2cpp_dumper_path(dumper_path, binary_path=binary_path)
     resolved_cache_root = _il2cpp_cache_root(cache_root)
     manifest = {
         "format": _IL2CPP_CACHE_FORMAT,
@@ -201,6 +232,7 @@ def _ensure_il2cpp_dummy_dlls(
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = subprocess.SW_HIDE
         if log:
+            log(f"[generator] Using Il2CppDumper: {resolved_dumper}")
             log(f"[generator] Building external IL2CPP cache: {work_dir}")
         process = subprocess.run(
             command,

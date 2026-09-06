@@ -19,7 +19,7 @@ release_en/
 
 `make_sdf.exe` is distributed as a standalone ZIP (`make_sdf_vX.Y.Z.zip`).
 
-`Il2CppDumper/` includes the Windows x64 self-contained build from [release 17bc00ba5aae](https://github.com/snowyegret23/Il2CppDumper/releases/tag/17bc00ba5aae). No separate .NET installation is required for IL2CPP analysis. Keep the entire folder, including its DLLs and configuration, beside the tool rather than copying only the EXE.
+`Il2CppDumper/` includes Windows x64 and x86 self-contained builds of the same [snowyegret23/Il2CppDumper](https://github.com/snowyegret23/Il2CppDumper) commit. UFR automatically selects `Il2CppDumper/Il2CppDumper.exe` for a 64-bit `GameAssembly.dll` or `Il2CppDumper/x86/Il2CppDumper.exe` for a 32-bit one. No separate .NET installation is required for IL2CPP analysis. Keep the entire folder beside the tool; do not mix the two runtimes' DLLs or copy only their EXEs. Build provenance is recorded in `Il2CppDumper/BUNDLED_RELEASE.json`. Set `UFR_IL2CPP_DUMPER` to override automatic selection with a custom dumper.
 
 Recommended run:
 

@@ -19,7 +19,7 @@ release/
 
 `make_sdf.exe`는 별도 단독 ZIP(`make_sdf_vX.Y.Z.zip`)으로 제공합니다.
 
-`Il2CppDumper/`에는 [17bc00ba5aae 릴리즈](https://github.com/snowyegret23/Il2CppDumper/releases/tag/17bc00ba5aae)의 Windows x64 런타임 포함판이 들어 있습니다. IL2CPP 분석을 위해 .NET을 따로 설치할 필요가 없으며, EXE만 옮기지 말고 동봉된 DLL·설정 파일과 폴더 전체를 유지하세요.
+`Il2CppDumper/`에는 [snowyegret23/Il2CppDumper](https://github.com/snowyegret23/Il2CppDumper)의 동일 커밋으로 빌드한 Windows x64·x86 런타임 포함판이 들어 있습니다. UFR은 게임의 `GameAssembly.dll` 비트수에 맞춰 x64는 `Il2CppDumper/Il2CppDumper.exe`, x86은 `Il2CppDumper/x86/Il2CppDumper.exe`를 자동으로 선택합니다. IL2CPP 분석을 위해 .NET을 따로 설치할 필요가 없으며, 두 런타임의 DLL을 섞거나 EXE만 옮기지 말고 폴더 전체를 유지하세요. 빌드 출처는 `Il2CppDumper/BUNDLED_RELEASE.json`에 기록되어 있습니다. `UFR_IL2CPP_DUMPER` 환경변수를 지정하면 사용자 지정 덤퍼를 우선 사용합니다.
 
 권장 실행 방식:
 
