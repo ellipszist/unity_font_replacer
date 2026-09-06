@@ -404,6 +404,7 @@ EXE 대신 Python 소스로 실행하려면:
 
 - Python 3.12 권장
 - 패키지: `UnityPy 1.25.3 커스텀 포크`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`, `psutil`
+- Windows에서 아래 Git 소스를 설치하려면 C++ 컴파일러와 Windows SDK가 포함된 [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)가 필요합니다. 배포 EXE만 사용하는 경우에는 필요하지 않습니다.
 
 ```bash
 pip install TypeTreeGeneratorAPI Pillow fonttools numpy scipy psutil
@@ -413,6 +414,7 @@ pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@bccc488474
 이 저장소와 `UnityPy` 저장소가 같은 상위 폴더에 있으면 소스 실행 시 sibling
 `UnityPy`를 자동으로 우선 사용합니다. 필요한 저메모리 API가 없으면 저장 전에
 오류를 내고 중단합니다.
+배포 빌드와 같은 버전을 사용하려면 sibling checkout도 위 설치 명령의 커밋에 맞추세요.
 
 ### 실행 예시
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,19 @@ SAMPLE_BUNDLE = ACTIVE_UNITYPY_ROOT / "tests" / "samples" / "atlas_test"
 
 
 class UnityPyRuntimeTests(unittest.TestCase):
+    def test_custom_unitypy_install_revisions_match(self) -> None:
+        revisions = set()
+        for name in ("build.bat", ".github/workflows/release.yml", "README.md", "README_EN.md"):
+            with self.subTest(file=name):
+                content = (ROOT / name).read_text(encoding="utf-8-sig")
+                matches = re.findall(
+                    r"git\+https://github\.com/snowyegret23/UnityPy\.git@([0-9a-f]{40})\b",
+                    content,
+                )
+                self.assertEqual(len(matches), 1, name)
+                revisions.update(matches)
+        self.assertEqual(len(revisions), 1, "Custom UnityPy installation revisions differ")
+
     def test_bundled_il2cpp_dumper_has_local_runtime(self) -> None:
         folder = ROOT / "Il2CppDumper"
         for name in (

@@ -404,6 +404,7 @@ If you prefer Python scripts instead of EXEs:
 
 - Python 3.12 recommended
 - Packages: `custom UnityPy 1.25.3 fork`, `TypeTreeGeneratorAPI`, `Pillow`, `fontTools`, `numpy`, `scipy`, `psutil`
+- Installing the Git source below on Windows requires [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the C++ compiler and Windows SDK. These are not required to run the distributed EXEs.
 
 ```bash
 pip install TypeTreeGeneratorAPI Pillow fonttools numpy scipy psutil
@@ -413,6 +414,7 @@ pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@bccc488474
 When this repository and `UnityPy` share the same parent directory, source runs
 automatically prefer the sibling checkout. Saving stops with an actionable error
 if the required low-memory APIs are unavailable.
+To match the release build, keep the sibling checkout at the commit used in the installation command above.
 
 ### Examples
 
