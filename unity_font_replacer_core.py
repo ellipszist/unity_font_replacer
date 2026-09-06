@@ -1142,6 +1142,10 @@ class _DeferredPatchTransaction:
     def backup_directory(self) -> str:
         return self._backup_dir
 
+    def original_path(self, destination: str) -> str:
+        normalized = os.path.normcase(os.path.abspath(destination))
+        return self._backups.get(normalized) or destination
+
     @property
     def has_conflicts(self) -> bool:
         return bool(self._plan_conflicts)
@@ -3201,11 +3205,54 @@ def _changed_ttf_replacements(
     return changed
 
 
-def _priority_source(obj, data, outer_key, source_signature, asset_file_index, ttf_replacements):
+class _FontDependencyResolver:
+    def __init__(self, env, outer_key, source_signature, asset_file_index, transaction=None):
+        self.environments = {outer_key: env}
+        self.contexts = {id(obj.assets_file): (outer_key, source_signature) for obj in env.objects}
+        self.asset_file_index = asset_file_index
+        self.transaction = transaction
+        self.primary_environment = env
+
+    def __call__(self, owner, pointer):
+        file_id, path_id = _atlas_ref_ids(pointer)
+        if not path_id:
+            return None
+        if not file_id:
+            return owner.assets_file.objects[path_id]
+        outer_key, signature = self.contexts[id(owner.assets_file)]
+        assets_name = _resolve_target_assets_name(owner.assets_file, str(owner.assets_file.name), file_id)
+        target_outer = _resolve_target_outer_file_key(
+            outer_key, owner.assets_file, file_id, assets_name,
+            source_bundle_signature=signature, asset_file_index=self.asset_file_index,
+        )
+        if not target_outer or not assets_name:
+            raise ValueError(f"Cannot resolve font dependency: {assets_name}|{path_id}")
+        if target_outer not in self.environments:
+            source_path = (self.asset_file_index or {}).get("path_by_key", {}).get(target_outer)
+            if not source_path:
+                raise ValueError(f"Missing outer file for font dependency: {assets_name}|{path_id}")
+            original_path = self.transaction.original_path(source_path) if self.transaction else source_path
+            dependency = load_unitypy(original_path)
+            dependency.path = os.path.dirname(source_path)
+            dependency.typetree_generator = self.primary_environment.typetree_generator
+            self.environments[target_outer] = dependency
+            dependency_signature = _read_bundle_signature(original_path, BUNDLE_SIGNATURES)
+            self.contexts.update({
+                id(obj.assets_file): (target_outer, dependency_signature) for obj in dependency.objects
+            })
+        matches = [obj for obj in self.environments[target_outer].objects
+                   if str(obj.assets_file.name).casefold() == assets_name.casefold() and obj.path_id == path_id]
+        if len(matches) != 1:
+            raise ValueError(f"Missing or ambiguous font dependency: {assets_name}|{path_id}")
+        return matches[0]
+
+
+def _priority_source(obj, data, outer_key, source_signature, asset_file_index, ttf_replacements, resolve_ref=None):
+    resolve_ref = resolve_ref or _deref
     source_ref = data.get("m_SourceFontFile")
     if not _atlas_ref_ids(source_ref)[1]:
         for pointer in data.get("m_FallbackFontAssetTable", []) or []:
-            target = _deref(obj, pointer)
+            target = resolve_ref(obj, pointer)
             if target and str(target.peek_name()).startswith((f"{GENERATED_PREFIX}DYNAMIC__", f"{GENERATED_PREFIX}ORIGINAL__")):
                 source_ref = target.parse_as_dict().get("m_SourceFontFile")
                 break
@@ -3238,7 +3285,8 @@ def _priority_source(obj, data, outer_key, source_signature, asset_file_index, t
     return None, source_ref
 
 
-def _collect_font_priority_entries(env, outer_key, source_signature, asset_file_index, lookup):
+def _collect_font_priority_entries(env, outer_key, source_signature, asset_file_index, lookup, resolve_ref=None):
+    resolve_ref = resolve_ref or _deref
     entries = []
     atlas_owners = []
     cache = {}
@@ -3256,14 +3304,14 @@ def _collect_font_priority_entries(env, outer_key, source_signature, asset_file_
         if str(data.get("m_Name", "")).startswith(GENERATED_PREFIX):
             continue
         source_key, source_ref = _priority_source(
-            obj, data, outer_key, source_signature, asset_file_index, lookup,
+            obj, data, outer_key, source_signature, asset_file_index, lookup, resolve_ref,
         )
         selected = lookup.get(("SDF", file_name, str(obj.assets_file.name), int(obj.path_id)))
         if selected or source_key:
             _fallback_key(data)
             entries.append((obj, data, source_key, source_ref))
         for pointer in _all_valid_atlas_refs(data):
-            target = _deref(obj, pointer)
+            target = resolve_ref(obj, pointer)
             if target is None:
                 raise ValueError("A TMP atlas dependency could not be resolved")
             owner_id = f"{obj.assets_file.name}|{obj.path_id}"
@@ -4079,6 +4127,30 @@ def _classify_compatible_raster_shader(
         if shader_name == expected_name and required_properties.issubset(properties):
             return kind
     return None
+
+
+def _replacement_tmp_render_family(obj, data, resolve_ref):
+    family = _detect_tmp_font_render_family(data)
+    if family != "bitmap" or data.get("m_AtlasPopulationMode") != 0:
+        return family
+    material_key, _, material_id = _get_tmp_material_reference(data)
+    if not material_id:
+        return family
+    material = resolve_ref(obj, data[material_key])
+    if material is None or material.type.name != "Material":
+        return family
+    shader = resolve_ref(material, material.parse_as_dict().get("m_Shader"))
+    if shader is None or shader.type.name != "Shader":
+        return family
+    name, properties = _shader_name_and_properties(shader)
+    if (name.startswith("TextMeshPro/") and "Distance Field" in name
+            and {"_MainTex", "_GradientScale", "_TextureWidth", "_TextureHeight"}.issubset(properties)):
+        _log_warning(
+            f"[tmp_render_family] Static font {data.get('m_Name', obj.path_id)} has bitmap generation "
+            f"metadata but uses {name}; preserving the compiled SDF shader contract."
+        )
+        return "sdf"
+    return family
 
 
 def _raster_shader_descriptor(shader_reader: Any) -> JsonDict | None:
@@ -7443,6 +7515,9 @@ def replace_fonts_in_file(
     save_success = False
 
     priority_session = None
+    resolve_font_dependency = _FontDependencyResolver(
+        env, current_file_key, source_bundle_signature, asset_file_index, deferred_transaction,
+    )
     priority_owners: dict[tuple[str, int], set[tuple[str, int]]] = {}
     if (font_priority and not preview_export and (target_ttf_targets or replacement_sdf_targets)
             and any(obj.type.name == "MonoBehaviour" for obj in env.objects)):
@@ -7457,15 +7532,16 @@ def replace_fonts_in_file(
         }
         entries = _collect_font_priority_entries(
             env, current_file_key, source_bundle_signature, asset_file_index, priority_lookup,
+            resolve_font_dependency,
         )
-        priority_session = FontPrioritySession(env, entries, target_ttf_targets)
+        priority_session = FontPrioritySession(env, entries, target_ttf_targets, resolve_font_dependency)
         eligible = set()
         for owner, tree, source_key, _ in entries:
             owner_key = (str(owner.assets_file.name), int(owner.path_id))
             if source_key and owner_key in replacement_sdf_targets:
                 eligible.add(owner_key)
             for pointer in _all_valid_atlas_refs(tree) + [tree.get(_get_tmp_material_reference(tree)[0])]:
-                target = _deref(owner, pointer)
+                target = resolve_font_dependency(owner, pointer)
                 if target:
                     target_key = (str(target.assets_file.name), int(target.path_id))
                     priority_owners.setdefault(target_key, set()).add(owner_key)
@@ -7685,7 +7761,7 @@ def replace_fonts_in_file(
                         )
 
             if replacement_font:
-                target_render_family = _detect_tmp_font_render_family(parse_dict)
+                target_render_family = _replacement_tmp_render_family(obj, parse_dict, resolve_font_dependency)
                 replacement_meta = replacement_meta_lookup.get(
                     ("SDF", fn_without_path, assets_name, int(pathid)),
                     {},

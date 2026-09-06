@@ -82,7 +82,9 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 
 Replacement fonts take priority by default; missing characters fall back to a preserved original TMP font. TTF-only replacement clears the linked TMP glyph cache and generates characters dynamically from the replacement TTF. SDF-only uses replacement SDF → original; replacing both uses replacement SDF → replacement TTF → original. If SDF preparation/application fails and a linked TTF replacement is available in the same file, the unsaved attempt is discarded and retried using TTF priority.
 
-Use `--no-font-priority` for legacy replacement without adding original fallbacks. Preservation increases file size and requires valid TMP TypeTrees and references. The TTF path requires modern TMP with an explicit source Font reference. Unsupported structures, including replaced source TTFs/clone dependencies in another outer file and unsafe shared atlases, fail without saving. Verify game-specific text rendering and platform dynamic-font support in game.
+Use `--no-font-priority` for legacy replacement without adding original fallbacks. Preservation increases file size and requires valid TMP TypeTrees and references. The TTF path requires modern TMP with an explicit source Font reference. Atlases in external bundles are preserved by copying their original image data into the font's owning file when serialization versions and platforms are compatible. Unsupported structures, including replaced source TTFs/Material clones in another outer file and unsafe shared atlases, fail without saving. Verify game-specific text rendering and platform dynamic-font support in game.
+
+For static TMP fonts with Bitmap generation metadata, a verified TextMeshPro Distance Field shader and its required properties take precedence when selecting the replacement format. This correction does not apply to dynamic fonts or unverified shaders, and explicit `--force-raster` requests still take precedence.
 
 #### TMP FontAsset Options
 

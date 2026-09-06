@@ -138,8 +138,9 @@ def reset_dynamic_font(tree, font_bytes):
 
 
 class FontPrioritySession:
-    def __init__(self, env, entries, font_targets):
+    def __init__(self, env, entries, font_targets, resolve_ref=None):
         self.env = env
+        self.resolve_ref = resolve_ref or _deref
         self.entries = entries
         self.font_targets = font_targets
         self.editable = {id(obj.assets_file) for obj in env.objects}
@@ -155,38 +156,88 @@ class FontPrioritySession:
                 if obj.type.name == "Font" and str(name).startswith(f"{GENERATED_PREFIX}FONT__"):
                     self.previous_ttf.add((str(obj.assets_file.name), int(str(name).rsplit("__", 1)[1])))
 
-    def _clone(self, obj, name):
-        key = (id(obj.assets_file), name)
+    def _clone(self, obj, name, destination=None):
+        destination = obj.assets_file if destination is None else destination
+        external = destination is not obj.assets_file
+        if external:
+            name = f"{name}__{obj.assets_file.name}"
+        key = (id(destination), name)
         if key in self.named:
             return self.named[key]
-        if id(obj.assets_file) not in self.editable:
+        if id(destination) not in self.editable:
             raise ValueError("Font priority cannot yet clone dependencies from another outer asset file")
-        path_id = max([0, *obj.assets_file.objects]) + 1
+        if external and obj.type.name != "Texture2D":
+            raise ValueError("Only atlas textures can be localized from another asset file")
+        path_id = max([0, *destination.objects]) + 1
         limit = (1 << (63 if obj.version2 >= 14 or obj.assets_file.big_id_enabled else 31)) - 1
         if path_id > limit:
             raise ValueError("No free positive PathID for a preserved font object")
         clone = _view(obj, _original_bytes(obj))
         clone.path_id = path_id
+        if external:
+            self._localize_texture(clone, destination)
         peek = clone._get_typetree_node().get_name_peek_node()
         if not peek or peek[1] != "m_Name":
             raise ValueError("Cannot safely name a preserved font dependency")
-        node, key = peek
+        node, name_key = peek
         tree = clone.parse_as_dict(node, check_read=False)
         consumed = clone.reader.Position
         tail = _original_bytes(clone)[consumed:]
-        tree[key] = name
+        tree[name_key] = name
         clone.patch(tree, nodes=node)
         clone.set_raw_data(clone.get_raw_data() + tail)
-        obj.assets_file.objects[path_id] = clone
+        destination.objects[path_id] = clone
         self.named[key] = clone
         self.created.append((obj, clone))
         return clone
 
+    def _localize_texture(self, clone, destination):
+        source = clone.assets_file
+        if (source.header.version != destination.header.version or source.unity_version != destination.unity_version
+                or source.target_platform != destination.target_platform
+                or source.reader.endian != destination.reader.endian):
+            raise ValueError("External atlas serialization version, platform or endianness differs")
+        serialized_type = clone.serialized_type
+        if serialized_type is None or getattr(serialized_type, "type_dependencies", None):
+            raise ValueError("External atlas has unsupported serialized type dependencies")
+        tree = clone.parse_as_dict()
+        def check_pointers(value):
+            if isinstance(value, dict):
+                if "m_FileID" in value and "m_PathID" in value and value["m_PathID"]:
+                    raise ValueError("External atlas contains a non-null object reference")
+                for child in value.values():
+                    check_pointers(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    check_pointers(child)
+        check_pointers(tree)
+        texture = clone.parse_as_object()
+        stream = getattr(texture, "m_StreamData", None)
+        texture.image_data = bytes(texture.get_image_data()) if texture.image_data or (stream and stream.size) else b""
+        if stream is not None:
+            stream.path, stream.offset, stream.size = "", 0, 0
+        clone.patch(texture)
+        raw = clone.get_raw_data()
+        local_type = next((item for item in destination.types
+                           if item.class_id == serialized_type.class_id
+                           and item.old_type_hash == serialized_type.old_type_hash), None)
+        if local_type is None:
+            local_type = copy.copy(serialized_type)
+            if destination._enable_type_tree and local_type.node is None:
+                raise ValueError("External atlas is missing the destination's required TypeTree")
+            destination.types.append(local_type)
+        clone.assets_file = destination
+        clone.serialized_type = local_type
+        if clone.version2 >= 16:
+            clone.type_id = destination.types.index(local_type)
+        clone.reader = EndianBinaryReader(raw, endian=clone.reader.endian)
+        clone.byte_start, clone.byte_size, clone.data = 0, len(raw), None
+
     def _preserve_ref(self, owner, pointer, prefix, textures=None):
-        target = _deref(owner, pointer)
+        target = self.resolve_ref(owner, pointer)
         if target is None:
             return copy.deepcopy(pointer)
-        clone = self._clone(target, f"{GENERATED_PREFIX}{prefix}__{target.path_id}")
+        clone = self._clone(target, f"{GENERATED_PREFIX}{prefix}__{target.path_id}", owner.assets_file)
         if textures is not None and target.type.name == "Material":
             tree = _current_tree(clone)
             for pair in tree.get("m_SavedProperties", {}).get("m_TexEnvs", []):
@@ -194,12 +245,14 @@ class FontPrioritySession:
                 ref = value.get("m_Texture")
                 if not isinstance(ref, dict):
                     continue
-                texture = _deref(clone, ref)
+                texture = self.resolve_ref(clone, ref)
                 replacement = textures.get((id(texture.assets_file), texture.path_id)) if texture else None
                 if replacement:
+                    ref["m_FileID"] = 0
                     ref["m_PathID"] = replacement.path_id
             _write(clone, tree)
         result = copy.deepcopy(pointer)
+        result["m_FileID"] = 0
         result["m_PathID"] = clone.path_id
         return result
 
@@ -208,7 +261,7 @@ class FontPrioritySession:
         existing = self.named.get((id(owner.assets_file), marker))
         if existing is not None:
             tree = _current_tree(existing)
-            source = _deref(existing, tree.get("m_SourceFontFile"))
+            source = self.resolve_ref(existing, tree.get("m_SourceFontFile"))
             if source and (str(source.assets_file.name), source.path_id) in self.font_targets:
                 tree["m_SourceFontFile"] = self._preserve_ref(existing, tree["m_SourceFontFile"], "FONT")
                 _write(existing, tree)
@@ -218,29 +271,31 @@ class FontPrioritySession:
         tree["m_Name"] = marker
         textures = {}
         for pointer in _all_valid_atlas_refs(tree):
-            texture = _deref(owner, pointer)
-            preserved = self._clone(texture, f"{GENERATED_PREFIX}ATLAS__{texture.path_id}")
+            texture = self.resolve_ref(owner, pointer)
+            preserved = self._clone(texture, f"{GENERATED_PREFIX}ATLAS__{texture.path_id}", owner.assets_file)
             textures[(id(texture.assets_file), texture.path_id)] = preserved
         for pointer in tree.get("m_AtlasTextures", []):
-            texture = _deref(owner, pointer)
+            texture = self.resolve_ref(owner, pointer)
             if texture:
+                pointer["m_FileID"] = 0
                 pointer["m_PathID"] = textures[(id(texture.assets_file), texture.path_id)].path_id
         for key in ("atlas", "m_AtlasTexture"):
             pointer = tree.get(key)
-            texture = _deref(owner, pointer)
+            texture = self.resolve_ref(owner, pointer)
             if texture:
+                pointer["m_FileID"] = 0
                 pointer["m_PathID"] = textures[(id(texture.assets_file), texture.path_id)].path_id
         material_key, _, material_id = _get_tmp_material_reference(tree)
         if material_id:
             tree[material_key] = self._preserve_ref(owner, tree[material_key], "MATERIAL", textures)
-        source = _deref(owner, tree.get("m_SourceFontFile"))
+        source = self.resolve_ref(owner, tree.get("m_SourceFontFile"))
         if source and (str(source.assets_file.name), source.path_id) in self.font_targets:
             tree["m_SourceFontFile"] = self._preserve_ref(owner, tree["m_SourceFontFile"], "FONT")
         _write(clone, tree)
         return clone
 
     def _blank_atlas(self, owner, tree):
-        texture_obj = _deref(owner, tree["m_AtlasTextures"][0])
+        texture_obj = self.resolve_ref(owner, tree["m_AtlasTextures"][0])
         texture = _view(texture_obj, texture_obj.get_raw_data()).parse_as_object()
         with Image.new("RGBA", (int(tree["m_AtlasWidth"]), int(tree["m_AtlasHeight"])), (255, 255, 255, 0)) as image:
             texture.set_image(image, target_format=TextureFormat.Alpha8, mipmap_count=1)
@@ -264,7 +319,7 @@ class FontPrioritySession:
             tree = _current_tree(obj)
             original_ref = _ref(original.path_id)
             if has_ttf:
-                source = _deref(obj, source_ref)
+                source = self.resolve_ref(obj, source_ref)
                 font_bytes = _view(source, source.get_raw_data()).parse_as_object().m_FontData
                 if has_sdf:
                     name = f"{GENERATED_PREFIX}DYNAMIC__{obj.path_id}"
@@ -278,8 +333,8 @@ class FontPrioritySession:
                         suffix = f"DYNAMIC_{obj.assets_file.name}_{obj.path_id}"
                         pointer = dynamic_tree["m_AtlasTextures"][0]
                         dynamic_tree["m_AtlasTextures"] = [self._preserve_ref(obj, pointer, suffix)]
-                        texture = _deref(obj, pointer)
-                        new_texture = _deref(obj, dynamic_tree["m_AtlasTextures"][0])
+                        texture = self.resolve_ref(obj, pointer)
+                        new_texture = self.resolve_ref(obj, dynamic_tree["m_AtlasTextures"][0])
                         material_key, _, material_id = _get_tmp_material_reference(dynamic_tree)
                         if not material_id:
                             raise ValueError("Dynamic fallback requires a TMP material")
@@ -314,14 +369,14 @@ class FontPrioritySession:
             tree = _current_tree(original)
             for key in ("m_FallbackFontAssetTable", "fallbackFontAssets"):
                 for pointer in tree.get(key, []) or []:
-                    target = _deref(obj, pointer)
+                    target = self.resolve_ref(obj, pointer)
                     preserved = originals.get((id(target.assets_file), target.path_id)) if target else None
                     if preserved:
                         pointer["m_PathID"] = preserved.path_id
             for key in ("m_FontWeightTable", "fontWeights"):
                 for pair in tree.get(key, []) or []:
                     for pointer in pair.values():
-                        target = _deref(obj, pointer)
+                        target = self.resolve_ref(obj, pointer)
                         preserved = originals.get((id(target.assets_file), target.path_id)) if target else None
                         if preserved:
                             pointer["m_PathID"] = preserved.path_id

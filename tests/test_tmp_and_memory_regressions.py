@@ -66,6 +66,125 @@ class _Object:
 
 
 class TmpAndMemoryRegressionTests(unittest.TestCase):
+    def test_static_bitmap_metadata_uses_proven_compiled_sdf_shader(self) -> None:
+        material = SimpleNamespace(type=SimpleNamespace(name="Material"),
+                                   parse_as_dict=lambda: {"m_Shader": priority._ref(3)})
+        shader = SimpleNamespace(type=SimpleNamespace(name="Shader"))
+        obj = SimpleNamespace(path_id=1)
+        data = {"m_AtlasPopulationMode": 0, "m_AtlasRenderMode": 4121, "material": priority._ref(2)}
+        resolve = lambda owner, pointer: {2: material, 3: shader}[pointer["m_PathID"]]
+        props = frozenset({"_MainTex", "_GradientScale", "_TextureWidth", "_TextureHeight"})
+        self.assertEqual(core._detect_tmp_font_render_family(data), "bitmap")
+        with patch.object(core, "_shader_name_and_properties", return_value=("TextMeshPro/Distance Field", props)):
+            self.assertEqual(core._replacement_tmp_render_family(obj, data, resolve), "sdf")
+            for mode in (1, 2, None):
+                self.assertEqual(core._replacement_tmp_render_family(obj, dict(data, m_AtlasPopulationMode=mode), resolve), "bitmap")
+            self.assertEqual(core._replacement_tmp_render_family(obj, dict(data, m_AtlasRenderMode=0x1030), resolve), "conflict")
+        for name, properties in (("Custom/Distance Field", props), ("TextMeshPro/Bitmap", props),
+                                 ("TextMeshPro/Distance Field", props - {"_GradientScale"})):
+            with self.subTest(shader=name, properties=properties):
+                with patch.object(core, "_shader_name_and_properties", return_value=(name, properties)):
+                    self.assertEqual(core._replacement_tmp_render_family(obj, data, resolve), "bitmap")
+
+    def test_font_dependency_resolver_uses_exact_cab_and_transaction_original(self) -> None:
+        assets = SimpleNamespace(name="Owner", objects={})
+        owner = SimpleNamespace(assets_file=assets)
+        primary = SimpleNamespace(objects=[owner], typetree_generator=object())
+        target = SimpleNamespace(assets_file=SimpleNamespace(name="CAB-target"), path_id=-7)
+        unrelated = SimpleNamespace(assets_file=SimpleNamespace(name="CAB-other"), path_id=-7)
+        external = SimpleNamespace(objects=[unrelated, target])
+        index = {"path_by_key": {"external": "input/external.bundle"}}
+        transaction = SimpleNamespace(original_path=lambda path: "backup/original.bundle")
+        resolver = core._FontDependencyResolver(primary, "owner", "UnityFS", index, transaction)
+        with patch.object(core, "_resolve_target_assets_name", return_value="CAB-target"), \
+                patch.object(core, "_resolve_target_outer_file_key", return_value="external"), \
+                patch.object(core, "_read_bundle_signature", return_value="UnityFS"), \
+                patch.object(core, "load_unitypy", return_value=external) as load:
+            self.assertIs(resolver(owner, priority._ref(-7, 1)), target)
+            self.assertIs(resolver(owner, priority._ref(-7, 1)), target)
+            load.assert_called_once_with("backup/original.bundle")
+            self.assertIs(external.typetree_generator, primary.typetree_generator)
+            self.assertEqual(primary.objects, [owner])
+            with self.assertRaisesRegex(ValueError, "Missing or ambiguous"):
+                resolver(owner, priority._ref(9, 1))
+        with patch.object(core, "_resolve_target_assets_name", return_value="CAB-target"), \
+                patch.object(core, "_resolve_target_outer_file_key", return_value=None):
+            with self.assertRaisesRegex(ValueError, "Cannot resolve"):
+                resolver(owner, priority._ref(-7, 1))
+
+    def test_transaction_original_path_retains_pre_patch_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "input.bundle"
+            source.write_bytes(b"original")
+            transaction = core._DeferredPatchTransaction()
+            try:
+                self.assertEqual(transaction.original_path(str(source)), str(source))
+                transaction.backup(str(source))
+                source.write_bytes(b"patched")
+                self.assertEqual(Path(transaction.original_path(str(source))).read_bytes(), b"original")
+            finally:
+                transaction.rollback()
+            self.assertEqual(source.read_bytes(), b"original")
+
+    def test_external_atlas_is_localized_losslessly_and_clone_is_reused(self) -> None:
+        fixture = Path(runtime.UnityPy.__file__).resolve().parents[1] / "tests" / "samples" / "atlas_test"
+        if not fixture.is_file():
+            self.skipTest("UnityPy atlas_test fixture is unavailable")
+        source = runtime.load_unitypy(str(fixture))
+        destination = runtime.load_unitypy(str(fixture))
+        check = None
+        try:
+            texture = next(obj for obj in source.objects if obj.type.name == "Texture2D")
+            local = next(obj for obj in destination.objects if obj.type.name == "Texture2D").assets_file
+            original = texture.parse_as_object()
+            session = priority.FontPrioritySession(destination, [], set())
+            clone = session._clone(texture, "__UFR_ATLAS__test", local)
+            self.assertIs(session._clone(texture, "__UFR_ATLAS__test", local), clone)
+            self.assertEqual(len(session.created), 1)
+            self.assertIs(clone.assets_file, local)
+            check = runtime.UnityPy.load(destination.file.save(packer="original"))
+            saved = next(obj for obj in check.objects if obj.path_id == clone.path_id).parse_as_object()
+            self.assertEqual(bytes(saved.get_image_data()), bytes(original.get_image_data()))
+            self.assertEqual(saved.m_TextureFormat, original.m_TextureFormat)
+            self.assertEqual(saved.m_MipCount, original.m_MipCount)
+            self.assertFalse(saved.m_StreamData.path)
+            self.assertEqual(saved.m_StreamData.size, 0)
+            self.assertEqual(bytes(texture.parse_as_object().get_image_data()), bytes(original.get_image_data()))
+            local.unity_version += "-different"
+            with self.assertRaisesRegex(ValueError, "serialization version"):
+                session._clone(texture, "__UFR_ATLAS__incompatible", local)
+            local.unity_version = texture.assets_file.unity_version
+            empty_tree = texture.parse_as_dict()
+            empty_tree["image data"] = b""
+            empty_tree["m_StreamData"].update(path="", size=0, offset=0)
+            empty_texture = priority._view(texture, texture.patch(empty_tree))
+            empty_clone = session._clone(empty_texture, "__UFR_ATLAS__empty", local)
+            empty_saved = priority._current_tree(empty_clone)
+            self.assertEqual(bytes(empty_saved["image data"]), b"")
+            self.assertEqual(empty_saved["m_StreamData"]["path"], "")
+            self.assertEqual(empty_saved["m_StreamData"]["size"], 0)
+        finally:
+            for environment in (source, destination, check):
+                runtime.close_unitypy_env(environment)
+
+    def test_preserved_material_repoints_external_atlas_to_local_clone(self) -> None:
+        assets = object()
+        owner = SimpleNamespace(assets_file=assets)
+        material = SimpleNamespace(type=SimpleNamespace(name="Material"), path_id=7)
+        texture = SimpleNamespace(assets_file=object(), path_id=-10)
+        clone = SimpleNamespace(path_id=20)
+        new_texture = SimpleNamespace(path_id=30)
+        session = object.__new__(priority.FontPrioritySession)
+        session.resolve_ref = lambda obj, pointer: material if obj is owner else texture
+        tree = {"m_SavedProperties": {"m_TexEnvs": [("_MainTex", {"m_Texture": priority._ref(-10, 2)})]}}
+        with patch.object(session, "_clone", return_value=clone), \
+                patch.object(priority, "_current_tree", return_value=tree), \
+                patch.object(priority, "_write") as write:
+            pointer = session._preserve_ref(owner, priority._ref(7), "MATERIAL",
+                                            {(id(texture.assets_file), -10): new_texture})
+        self.assertEqual(pointer, priority._ref(20))
+        self.assertEqual(write.call_args.args[1]["m_SavedProperties"]["m_TexEnvs"][0][1]["m_Texture"], priority._ref(30))
+
     def test_ttf_priority_clears_glyph_ids_and_preserves_fallback_and_layout(self) -> None:
         tree = {
             "m_SourceFontFile": {"m_FileID": 0, "m_PathID": 7},

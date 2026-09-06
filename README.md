@@ -82,7 +82,9 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 
 기본적으로 교체 폰트를 우선 사용하고, 없는 문자는 보존한 원본 TMP 폰트에서 찾습니다. TTF만 교체하면 연결된 TMP의 이전 글리프 캐시를 초기화하고 새 TTF에서 동적으로 생성합니다. SDF만 교체하면 교체 SDF → 원본, 둘 다 교체하면 교체 SDF → 교체 TTF → 원본 순서입니다. SDF 준비/적용에 실패한 대상은 같은 파일에서 연결된 TTF 교체가 가능한 경우에만, 저장 전 시도를 폐기하고 TTF 경로로 재시도합니다.
 
-`--no-font-priority`로 이 동작을 끄면 원본 fallback을 추가하지 않는 기존 교체 방식을 사용합니다. 원본 보존으로 파일 크기가 증가하며 TMP TypeTree와 유효한 참조가 필요합니다. TTF 경로는 명시적인 source Font 참조가 있는 modern TMP에 적용됩니다. 다른 최상위 파일의 교체 TTF/복제 대상, 안전하지 않은 공유 atlas 등 지원하지 않는 구조는 저장하지 않고 오류를 보고합니다. 게임 전용 텍스트 처리와 플랫폼별 동적 폰트 지원은 실제 실행으로 확인하세요.
+`--no-font-priority`로 이 동작을 끄면 원본 fallback을 추가하지 않는 기존 교체 방식을 사용합니다. 원본 보존으로 파일 크기가 증가하며 TMP TypeTree와 유효한 참조가 필요합니다. TTF 경로는 명시적인 source Font 참조가 있는 modern TMP에 적용됩니다. 외부 번들의 atlas도 직렬화 버전·플랫폼이 호환되면 원본 이미지 데이터를 폰트 소유 파일에 복사해 보존합니다. 다른 최상위 파일의 교체 TTF/Material 복제, 안전하지 않은 공유 atlas 등 지원하지 않는 구조는 저장하지 않고 오류를 보고합니다. 게임 전용 텍스트 처리와 플랫폼별 동적 폰트 지원은 실제 실행으로 확인하세요.
+
+Static TMP 폰트의 생성 설정이 Bitmap이어도 실제 연결된 TextMeshPro Distance Field shader와 필수 속성이 확인되면 SDF로 교체합니다. Dynamic 폰트나 확인되지 않은 shader에는 이 보정을 적용하지 않으며, 명시적인 `--force-raster` 설정은 그대로 따릅니다.
 
 #### TMP FontAsset 교체 옵션
 
