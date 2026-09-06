@@ -78,9 +78,9 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 | `--ttfonly` | Replace TTF fonts only |
 | `--target-file <name>` | Limit replacement to specific file name(s) (repeatable/comma-separated) |
 
-Changing only a Dynamic TMP source TTF can reuse stale glyph IDs and display unrelated characters. Such TTF-only replacements are refused. Select the linked SDF assets with `--freeze-dynamic`, or leave the source TTF unchanged. TTF replacement may now require TypeTrees to check these dependencies.
+Replacement fonts take priority by default; missing characters fall back to a preserved original TMP font. TTF-only replacement clears the linked TMP glyph cache and generates characters dynamically from the replacement TTF. SDF-only uses replacement SDF → original; replacing both uses replacement SDF → replacement TTF → original. If SDF preparation/application fails and a linked TTF replacement is available in the same file, the unsaved attempt is discarded and retried using TTF priority.
 
-TTF replacement is optional. Use `--sdfonly --freeze-dynamic` to replace the selected TMP character tables, glyphs and atlases together while preserving the original TTFs. Static atlases cannot add missing characters dynamically, so include the required character set or provide a suitable fallback.
+Use `--no-font-priority` for legacy replacement without adding original fallbacks. Preservation increases file size and requires valid TMP TypeTrees and references. The TTF path requires modern TMP with an explicit source Font reference. Unsupported structures, including replaced source TTFs/clone dependencies in another outer file and unsafe shared atlases, fail without saving. Verify game-specific text rendering and platform dynamic-font support in game.
 
 #### TMP FontAsset Options
 
@@ -91,6 +91,7 @@ TTF replacement is optional. Use `--sdfonly --freeze-dynamic` to replace the sel
 | `--allow-unsafe-full-color-shader-fallback` | Testing only. Store raster atlases as white-RGB RGBA32 and explicitly allow `TextMeshPro/Sprite`/`Bitmap Custom Atlas` fallbacks |
 | `--allow-unsafe-gui-text-fallback` | Testing only. Use RGBA32 storage and explicitly allow the `GUI/Text Shader` fallback without TMP UI masking or depth support |
 | `--freeze-dynamic` | Explicitly freeze Dynamic/DynamicOS TMP FontAssets to baked Static and clear the runtime source Font PPtr |
+| `--no-font-priority` | Disable replacement-font priority and original fallback preservation |
 | `--use-game-line-metrics` | Keep in-game line metrics (pointSize still follows replacement font) |
 | `--outline-ratio <float>` | Multiply classic/SRP outline thickness and softness on the currently selected Material baseline (default `1.0`) |
 | `--charset <file/text>` | Charset for TTF/OTF-to-SDF/raster atlas generation (default `CharList_3911.txt`) |
@@ -161,7 +162,7 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --use-game
 unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --use-game-line-metrics
 
 :: Replace a Dynamic FontAsset as Static when runtime glyph addition is intentionally disabled
-unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --freeze-dynamic
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --no-font-priority --freeze-dynamic
 
 :: Make outlines 25% thicker on the current material baseline
 unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --outline-ratio 1.25
@@ -457,7 +458,7 @@ python export_fonts_en.py "D:\MyGame"
 - If translated text contains Hangul, CJK, or special characters outside the default charset, pass the real character list with `--charset <file>`. Per JSON entry, use `Charset` or `charset`.
 - Empty TMP fallback FontAssets are included as SDF replacement targets when they still have an atlas reference. This prevents unresolved characters from falling back into an unchanged `* SDF - Fallback` asset with no glyphs.
 - When FontAssets share an atlas, every owner must be selected for the same replacement. Partial selection or conflicting replacement fonts are refused.
-- Results are normalized to a static single atlas. Dynamic/DynamicOS targets are refused by default; use `--freeze-dynamic` only when disabling runtime glyph addition is intentional. It freezes the asset to Static and clears the runtime source Font PPtr, so every required character must be included with `--charset`.
+- Replacement SDFs use a static single atlas. By default, the replacement TTF (where applicable) and preserved original are separate fallbacks. With `--no-font-priority`, Dynamic/DynamicOS targets require `--freeze-dynamic`, and missing characters must be provided separately.
 - Existing Bitmap TMP FontAssets automatically receive a raster atlas. Use `force_raster: "True"` or `--force-raster` to convert an SDF FontAsset to raster.
 - Raster conversion uses only shaders reachable through existing PPtr routes and preserves the currently linked compatible PPtr first. The officially safe automatic Alpha8 candidates are `TextMeshPro/Bitmap` and `TextMeshPro/Mobile/Bitmap`; the concrete compiled property contract is verified before selection. The tool fails before saving when no safe candidate is reachable.
 - `TextMeshPro/Sprite` and `TextMeshPro/Bitmap Custom Atlas` consume full RGB samples, so connecting an unchanged Alpha8 atlas produces black glyphs. `--allow-unsafe-full-color-shader-fallback` stores raster atlases as RGBA32 with `RGB=(255,255,255), A=coverage`. Raw texture memory is four times that of Alpha8.

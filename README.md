@@ -78,9 +78,9 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 | `--ttfonly` | TTF 폰트만 교체 |
 | `--target-file <파일명>` | 지정한 파일명만 교체 대상에 포함 (여러 번/콤마로 지정 가능) |
 
-Dynamic TMP의 source TTF만 변경하면 기존 glyph ID와 충돌해 한글이 다른 문자로 표시될 수 있습니다. 이런 TTF 단독 교체는 중단됩니다. 연결된 SDF도 함께 선택하고 `--freeze-dynamic`을 사용하거나 source TTF를 교체 대상에서 제외하세요. TTF 교체 실행 시에도 이 연결을 검사할 TypeTree가 필요할 수 있습니다.
+기본적으로 교체 폰트를 우선 사용하고, 없는 문자는 보존한 원본 TMP 폰트에서 찾습니다. TTF만 교체하면 연결된 TMP의 이전 글리프 캐시를 초기화하고 새 TTF에서 동적으로 생성합니다. SDF만 교체하면 교체 SDF → 원본, 둘 다 교체하면 교체 SDF → 교체 TTF → 원본 순서입니다. SDF 준비/적용에 실패한 대상은 같은 파일에서 연결된 TTF 교체가 가능한 경우에만, 저장 전 시도를 폐기하고 TTF 경로로 재시도합니다.
 
-TTF 교체는 필수가 아닙니다. `--sdfonly --freeze-dynamic`으로 선택한 TMP의 문자표·글리프·atlas를 함께 교체하면 원본 TTF는 유지됩니다. Static atlas에 포함되지 않은 문자는 동적으로 추가되지 않으므로 필요한 글자셋이나 fallback을 준비해야 합니다.
+`--no-font-priority`로 이 동작을 끄면 원본 fallback을 추가하지 않는 기존 교체 방식을 사용합니다. 원본 보존으로 파일 크기가 증가하며 TMP TypeTree와 유효한 참조가 필요합니다. TTF 경로는 명시적인 source Font 참조가 있는 modern TMP에 적용됩니다. 다른 최상위 파일의 교체 TTF/복제 대상, 안전하지 않은 공유 atlas 등 지원하지 않는 구조는 저장하지 않고 오류를 보고합니다. 게임 전용 텍스트 처리와 플랫폼별 동적 폰트 지원은 실제 실행으로 확인하세요.
 
 #### TMP FontAsset 교체 옵션
 
@@ -91,6 +91,7 @@ TTF 교체는 필수가 아닙니다. `--sdfonly --freeze-dynamic`으로 선택�
 | `--allow-unsafe-full-color-shader-fallback` | 테스트 전용. Raster atlas를 흰색 RGB가 보존되는 RGBA32로 저장하고 `TextMeshPro/Sprite`/`Bitmap Custom Atlas` fallback을 명시적으로 허용 |
 | `--allow-unsafe-gui-text-fallback` | 테스트 전용. RGBA32 저장과 함께 TMP UI mask/depth를 지원하지 않는 `GUI/Text Shader` fallback을 명시적으로 허용 |
 | `--freeze-dynamic` | Dynamic/DynamicOS TMP FontAsset을 명시적으로 baked Static으로 고정하고 runtime source Font PPtr 해제 |
+| `--no-font-priority` | 교체 폰트 우선 처리 및 원본 fallback 보존 해제 |
 | `--use-game-line-metrics` | 게임 원본 줄 간격 메트릭 사용 (pointSize는 교체값 유지) |
 | `--outline-ratio <float>` | 현재 선택된 Material 기준 classic/SRP outline 두께·softness에 배율 적용 (기본 `1.0`) |
 | `--charset <파일/문자열>` | TTF/OTF에서 SDF/Raster atlas 자동 생성 시 사용할 글자셋 지정 (기본 `CharList_3911.txt`) |
@@ -160,8 +161,8 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --use-game
 :: 게임 원본 줄 간격 메트릭 유지
 unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --use-game-line-metrics
 
-:: Dynamic FontAsset이 있는 게임에서 동적 글리프 추가를 포기하고 Static으로 교체
-unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --freeze-dynamic
+:: 원본 fallback 보존 없이 기존 방식으로 Static 교체
+unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --no-font-priority --freeze-dynamic
 
 :: 현재 선택된 Material 기준 외곽선 1.25배
 unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --outline-ratio 1.25
@@ -458,7 +459,7 @@ python export_fonts_ko.py "D:\MyGame"
 - 번역문에 기본 문자셋에 없는 한글/한자/특수문자가 있으면 `--charset <파일>`로 실제 사용 문자 목록을 지정하세요. JSON 항목별로는 `Charset` 또는 `charset` 필드를 사용할 수 있습니다.
 - 글리프가 0개인 TMP fallback FontAsset도 atlas 참조가 있으면 SDF 교체 대상에 포함합니다. 일부 게임의 `* SDF - Fallback` 빈 에셋이 남아 누락 글자가 빈칸으로 떨어지는 문제를 줄이기 위한 처리입니다.
 - 하나의 atlas를 여러 FontAsset이 공유하면 모든 소유자를 같은 폰트로 선택한 경우에만 교체합니다. 일부만 선택하거나 서로 다른 폰트로 지정하면 중단합니다.
-- 교체 결과는 static single-atlas로 정규화됩니다. 원래 Dynamic/DynamicOS인 FontAsset은 기본적으로 중단하며, 동적 글리프 추가를 포기할 의도가 명확할 때만 `--freeze-dynamic`으로 Static 고정 및 runtime source Font PPtr 해제를 허용합니다. 이때 필요한 모든 문자를 `--charset`에 포함해야 합니다.
+- 교체 SDF는 Static 단일 atlas로 사용하고, 기본 모드에서는 교체 TTF(해당하는 경우)와 보존한 원본을 별도 fallback으로 연결합니다. `--no-font-priority`로 보존 기능을 끈 경우 Dynamic/DynamicOS 대상에는 `--freeze-dynamic`이 필요하며, 누락 문자는 별도로 준비해야 합니다.
 - 원래 Bitmap인 TMP FontAsset은 자동으로 Raster atlas를 생성합니다. SDF FontAsset은 `force_raster: "True"` 또는 `--force-raster`로 Raster 변환할 수 있습니다.
 - Raster 변환은 기존 PPtr 경로로 도달 가능한 shader만 사용하고, 현재 연결된 호환 PPtr을 우선 보존합니다. Alpha8에서 공식적으로 안전한 자동 후보는 `TextMeshPro/Bitmap`과 `TextMeshPro/Mobile/Bitmap`이며, compiled Shader의 실제 property 계약까지 검증합니다. 안전한 후보가 없으면 저장 전에 중단합니다.
 - `TextMeshPro/Sprite`와 `TextMeshPro/Bitmap Custom Atlas`는 RGB 전체를 읽으므로 Alpha8 atlas를 그대로 연결하면 검정 glyph가 됩니다. `--allow-unsafe-full-color-shader-fallback`은 해당 교체 작업의 Raster atlas를 `RGB=(255,255,255), A=coverage`인 RGBA32로 저장합니다. 원시 texture 메모리는 Alpha8의 4배가 됩니다.

@@ -57,6 +57,7 @@ from functools import lru_cache, wraps
 from typing import Any, Callable, Iterable, Literal, NoReturn, cast
 
 from PIL import Image, ImageOps
+from tmp_font_priority import FontPrioritySession, GENERATED_PREFIX, _deref, _fallback_key
 from addressables_catalog import (
     find_addressables_catalogs,
     patch_addressables_catalog_bytes,
@@ -3200,52 +3201,80 @@ def _changed_ttf_replacements(
     return changed
 
 
-def _validate_dynamic_ttf_source(
-    obj: Any,
-    data: JsonDict,
-    outer_key: str,
-    source_signature: str | None,
-    asset_file_index: dict[str, Any] | None,
-    changed_ttf: dict[tuple[str, str, str, int], str],
-    sdf_replacements: dict[tuple[str, str, str, int], str],
-    freeze_dynamic: bool,
-) -> None:
-    if not changed_ttf:
-        return
-    if not int(data.get("m_AtlasPopulationMode", 0)) and not parse_bool_flag(
-        data.get("InternalDynamicOS")
-    ):
-        return
-    source_file_id, source_path_id = _atlas_ref_ids(data.get("m_SourceFontFile"))
+def _priority_source(obj, data, outer_key, source_signature, asset_file_index, ttf_replacements):
+    source_ref = data.get("m_SourceFontFile")
+    if not _atlas_ref_ids(source_ref)[1]:
+        for pointer in data.get("m_FallbackFontAssetTable", []) or []:
+            target = _deref(obj, pointer)
+            if target and str(target.peek_name()).startswith((f"{GENERATED_PREFIX}DYNAMIC__", f"{GENERATED_PREFIX}ORIGINAL__")):
+                source_ref = target.parse_as_dict().get("m_SourceFontFile")
+                break
+    source_file_id, source_path_id = _atlas_ref_ids(source_ref)
     if not source_path_id:
-        return
-    assets_name = str(obj.assets_file.name)
-    source_assets = _resolve_target_assets_name(obj.assets_file, assets_name, source_file_id)
+        return None, source_ref
+    assets_name = _resolve_target_assets_name(obj.assets_file, str(obj.assets_file.name), source_file_id)
     source_outer = _resolve_target_outer_file_key(
-        outer_key, obj.assets_file, source_file_id, source_assets,
+        outer_key, obj.assets_file, source_file_id, assets_name,
         source_bundle_signature=source_signature, asset_file_index=asset_file_index,
     )
-    if not source_assets or not source_outer:
-        raise ValueError("Could not resolve a Dynamic TMP source Font; refusing TTF replacement.")
-    source_key = (os.path.basename(source_outer).casefold(), source_assets.casefold(), source_path_id)
-    if not any(
-        (key[1].casefold(), key[2].casefold(), key[3]) == source_key
-        for key in changed_ttf
-    ):
-        return
-    owner_key = ("SDF", os.path.basename(outer_key), assets_name, int(obj.path_id))
-    owner_selected = any(
-        key[0] == "SDF" and value
-        and (key[1].casefold(), key[2].casefold(), key[3])
-        == (owner_key[1].casefold(), assets_name.casefold(), owner_key[3])
-        for key, value in sdf_replacements.items()
-    )
-    if not freeze_dynamic or not owner_selected:
-        raise ValueError(
-            f"TTF replacement would leave stale Dynamic TMP glyphs: {owner_key!r}. "
-            "Select the linked TMP FontAsset for SDF replacement with --freeze-dynamic, "
-            "or leave its source TTF unchanged. TTF-only/split saving is unsafe."
+    for key, value in ttf_replacements.items():
+        if value and key[0] == "TTF" and source_outer and assets_name and (
+            key[1].casefold(), key[2].casefold(), key[3]
+        ) == (os.path.basename(source_outer).casefold(), assets_name.casefold(), source_path_id):
+            if source_outer != outer_key:
+                raise ValueError(
+                    "Font priority cannot yet preserve a replaced source TTF in another outer file. "
+                    "Use --no-font-priority only if the legacy replacement behavior is intended."
+                )
+            return (str(assets_name), int(source_path_id)), source_ref
+    if not ttf_replacements.get(("SDF", os.path.basename(outer_key), str(obj.assets_file.name), int(obj.path_id))):
+        return None, source_ref
+    source = _deref(obj, source_ref) if source_outer == outer_key and hasattr(obj.assets_file, "objects") else None
+    if source is not None and source_outer == outer_key:
+        marker = f"{GENERATED_PREFIX}FONT__{source_path_id}"
+        if any(candidate.type.name == "Font" and candidate.peek_name() == marker
+               for candidate in source.assets_file.objects.values()):
+            return (str(assets_name), int(source_path_id)), source_ref
+    return None, source_ref
+
+
+def _collect_font_priority_entries(env, outer_key, source_signature, asset_file_index, lookup):
+    entries = []
+    atlas_owners = []
+    cache = {}
+    file_name = os.path.basename(outer_key)
+    for obj in env.objects:
+        if obj.type.name != "MonoBehaviour":
+            continue
+        identity = _read_monobehaviour_script_identity(
+            obj, current_outer_key=outer_key, source_bundle_signature=source_signature,
+            asset_file_index=asset_file_index, identity_cache=cache,
         )
+        if not _is_tmp_fontasset_script_identity(identity):
+            continue
+        data = obj.parse_as_dict()
+        if str(data.get("m_Name", "")).startswith(GENERATED_PREFIX):
+            continue
+        source_key, source_ref = _priority_source(
+            obj, data, outer_key, source_signature, asset_file_index, lookup,
+        )
+        selected = lookup.get(("SDF", file_name, str(obj.assets_file.name), int(obj.path_id)))
+        if selected or source_key:
+            _fallback_key(data)
+            entries.append((obj, data, source_key, source_ref))
+        for pointer in _all_valid_atlas_refs(data):
+            target = _deref(obj, pointer)
+            if target is None:
+                raise ValueError("A TMP atlas dependency could not be resolved")
+            owner_id = f"{obj.assets_file.name}|{obj.path_id}"
+            atlas_owners.append({
+                "atlas_identity": f"{id(target.assets_file)}|{target.path_id}",
+                "owner_identity": owner_id,
+                "owner_label": owner_id,
+                "replacement_font": selected or (f"TTF priority {owner_id}" if source_key else ""),
+            })
+    _validate_shared_atlas_owner_records(atlas_owners)
+    return entries
 
 
 def _preflight_shared_atlas_owners(
@@ -3255,6 +3284,7 @@ def _preflight_shared_atlas_owners(
     asset_file_index: dict[str, Any],
     *,
     freeze_dynamic: bool = False,
+    font_priority: bool = True,
 ) -> None:
     """Read every TMP FontAsset and validate exact outer/CAB/PathID atlas ownership."""
     sdf_replacements = {
@@ -3345,10 +3375,13 @@ def _preflight_shared_atlas_owners(
                 ):
                     continue
 
-                _validate_dynamic_ttf_source(
-                    obj, data, outer_key, source_signature, asset_file_index,
-                    changed_ttf, sdf_replacements, freeze_dynamic,
-                )
+                if str(data.get("m_Name", "")).startswith(GENERATED_PREFIX):
+                    continue
+                priority_source = None
+                if font_priority:
+                    priority_source, _ = _priority_source(
+                        obj, data, outer_key, source_signature, asset_file_index, changed_ttf,
+                    )
                 atlas_refs = _all_valid_atlas_refs(data)
                 if not atlas_refs:
                     continue
@@ -3361,6 +3394,8 @@ def _preflight_shared_atlas_owners(
                     path_id,
                 )
                 replacement_font = sdf_replacements.get(lookup_key, "")
+                if priority_source and not replacement_font:
+                    replacement_font = f"TTF priority {object_label}"
                 owner_identity = _make_outer_assets_object_key(
                     outer_key,
                     assets_name,
@@ -7106,6 +7141,50 @@ def _cleanup_replace_call_resources(func: Callable[..., bool]) -> Callable[..., 
     return wrapper
 
 
+def _retry_font_priority(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        bound = inspect.signature(func).bind(*args, **kwargs)
+        disabled_sdf = set()
+        while True:
+            attempt = {}
+            bound.arguments["_priority_attempt"] = attempt
+            transaction = bound.arguments.get("deferred_transaction")
+            snapshot = {
+                key: copy.copy(getattr(transaction, key))
+                for key in ("_plan_fingerprints", "_payload_fingerprints", "_plan_conflicts", "_failures")
+            } if transaction is not None else {}
+            try:
+                result = func(*bound.args, **bound.kwargs)
+            except Exception as exc:
+                targets = set(attempt.get("targets", ()))
+                eligible = set(attempt.get("eligible", ()))
+                if isinstance(exc, MemoryError) or not targets or not targets <= eligible or targets & disabled_sdf:
+                    raise
+                for key, value in snapshot.items():
+                    setattr(transaction, key, value)
+                disabled_sdf.update(targets)
+                lookup = bound.arguments.get("replacement_lookup")
+                if lookup is None:
+                    lookup, _ = build_replacement_lookup(bound.arguments["replacements"])
+                file_name = os.path.basename(bound.arguments["assets_file"])
+                bound.arguments["replacement_lookup"] = {
+                    key: value for key, value in lookup.items()
+                    if not (key[0] == "SDF" and key[1] == file_name and (key[2], key[3]) in disabled_sdf)
+                }
+                _log_warning(
+                    f"[font_priority] SDF failed for {sorted(targets)}: {type(exc).__name__}: {exc}. "
+                    "Discarding the unsaved attempt and retrying with TTF priority."
+                )
+                continue
+            outcome = bound.arguments.get("operation_outcome")
+            if outcome is not None and disabled_sdf:
+                outcome["fallback_sdf_targets"] = sorted(disabled_sdf)
+            return result
+    return wrapper
+
+
+@_retry_font_priority
 @cleanup_unitypy_environments
 @_cleanup_replace_call_resources
 def replace_fonts_in_file(
@@ -7142,9 +7221,11 @@ def replace_fonts_in_file(
     deferred_transaction: _DeferredPatchTransaction | None = None,
     operation_outcome: JsonDict | None = None,
     freeze_dynamic: bool = False,
+    font_priority: bool = True,
     allow_unsafe_gui_text_fallback: bool = False,
     allow_unsafe_full_color_shader_fallback: bool = False,
     _deferred_payload_dir: str | None = None,
+    _priority_attempt: JsonDict | None = None,
 ) -> bool:
     """KR: 단일 assets 파일의 TTF/SDF 폰트를 교체하고 저장합니다.
 
@@ -7361,34 +7442,39 @@ def replace_fonts_in_file(
     modified = False
     save_success = False
 
-    changed_ttf = (
-        _changed_ttf_replacements(env, fn_without_path, replacement_lookup)
-        if replace_ttf and not preview_export else {}
-    )
-    if changed_ttf:
-        script_identity_cache: dict[tuple[str, str, int], tuple[str, str, str]] = {}
-        for obj in env.objects:
-            if obj.type.name != "MonoBehaviour":
-                continue
-            identity = _read_monobehaviour_script_identity(
-                obj, current_outer_key=current_file_key,
-                source_bundle_signature=source_bundle_signature,
-                asset_file_index=asset_file_index, identity_cache=script_identity_cache,
+    priority_session = None
+    priority_owners: dict[tuple[str, int], set[tuple[str, int]]] = {}
+    if (font_priority and not preview_export and (target_ttf_targets or replacement_sdf_targets)
+            and any(obj.type.name == "MonoBehaviour" for obj in env.objects)):
+        if generator is None:
+            generator = _create_generator(
+                unity_version, game_path, data_path, get_compile_method(data_path), lang=lang,
             )
-            if not _is_tmp_fontasset_script_identity(identity):
-                continue
-            if generator is None:
-                generator = _create_generator(
-                    unity_version, game_path, data_path, get_compile_method(data_path), lang=lang,
-                )
-                env.typetree_generator = generator
-            _validate_dynamic_ttf_source(
-                obj, obj.parse_as_dict(), current_file_key, source_bundle_signature,
-                asset_file_index, changed_ttf,
-                replacement_lookup if replace_sdf else {}, freeze_dynamic,
-            )
+            env.typetree_generator = generator
+        priority_lookup = {
+            key: value for key, value in replacement_lookup.items()
+            if (key[0] == "TTF" and replace_ttf) or (key[0] == "SDF" and replace_sdf)
+        }
+        entries = _collect_font_priority_entries(
+            env, current_file_key, source_bundle_signature, asset_file_index, priority_lookup,
+        )
+        priority_session = FontPrioritySession(env, entries, target_ttf_targets)
+        eligible = set()
+        for owner, tree, source_key, _ in entries:
+            owner_key = (str(owner.assets_file.name), int(owner.path_id))
+            if source_key and owner_key in replacement_sdf_targets:
+                eligible.add(owner_key)
+            for pointer in _all_valid_atlas_refs(tree) + [tree.get(_get_tmp_material_reference(tree)[0])]:
+                target = _deref(owner, pointer)
+                if target:
+                    target_key = (str(target.assets_file.name), int(target.path_id))
+                    priority_owners.setdefault(target_key, set()).add(owner_key)
+        if _priority_attempt is not None:
+            _priority_attempt["eligible"] = eligible
 
     for obj in env.objects:
+        if _priority_attempt is not None:
+            _priority_attempt["targets"] = set()
         assets_name = obj.assets_file.name
         if obj.type.name == "Font" and replace_ttf:
             font_pathid = obj.path_id
@@ -7480,6 +7566,8 @@ def replace_fonts_in_file(
             target_key = (assets_name, int(pathid))
             if target_sdf_targets and target_key not in target_sdf_targets:
                 continue
+            if _priority_attempt is not None and target_key in replacement_sdf_targets:
+                _priority_attempt["targets"] = {target_key}
             try:
                 parse_dict = _safe_parse_as_dict(obj)
             except Exception as e:
@@ -7628,18 +7716,17 @@ def replace_fonts_in_file(
                     )
                 froze_dynamic = _prepare_static_tmp_population(
                     parse_dict,
-                    allow_freeze=freeze_dynamic,
+                    allow_freeze=freeze_dynamic or font_priority,
                 )
                 if froze_dynamic:
                     if lang == "ko":
                         _log_console(
-                            "  Dynamic FontAsset을 명시적으로 Static으로 고정하고 "
-                            "source Font PPtr을 해제합니다."
+                            "  교체 SDF를 Static으로 사용합니다. 원본 보존은 폰트 우선순위 설정을 따릅니다."
                         )
                     else:
                         _log_console(
-                            "  Explicitly freezing Dynamic FontAsset to Static and "
-                            "clearing its source Font PPtr."
+                            "  Using a static replacement SDF; original preservation "
+                            "follows the font-priority setting."
                         )
                 _log_debug(
                     f"[replace_sdf] file={fn_without_path} assets={assets_name} path_id={pathid} "
@@ -8594,6 +8681,8 @@ def replace_fonts_in_file(
     )
     for obj in env.objects:
         assets_name = obj.assets_file.name
+        if _priority_attempt is not None:
+            _priority_attempt["targets"] = priority_owners.get((str(assets_name), int(obj.path_id)), set()) & replacement_sdf_targets
         if obj.type.name == "Texture2D":
             replacement_key = _make_assets_object_key(assets_name, int(obj.path_id))
             texture_plan = _lookup_patch_value(texture_patch_plans, replacement_key)
@@ -9034,6 +9123,8 @@ def replace_fonts_in_file(
     # Atlas-keyed material plans are compatibility fallbacks. They are
     # best-effort and may legitimately have no Material in the texture file.
     handled_material_atlas_ids.update(incoming_material_atlas_ids)
+    if _priority_attempt is not None:
+        _priority_attempt["targets"] = set()
 
     _emit_phase_callback(
         phase_callback,
@@ -9051,6 +9142,10 @@ def replace_fonts_in_file(
     ) - consumed_material_ids
     unsatisfied_ttf_targets = target_ttf_targets - satisfied_ttf_targets
     unsatisfied_sdf_targets = replacement_sdf_targets - patched_sdf_target_keys
+    if unsatisfied_sdf_targets and _priority_attempt is not None:
+        if unsatisfied_sdf_targets <= set(_priority_attempt.get("eligible", ())):
+            _priority_attempt["targets"] = unsatisfied_sdf_targets
+            raise ValueError(f"SDF replacement did not complete: {sorted(unsatisfied_sdf_targets)}")
     unstaged_transaction_required = bool(
         deferred_transaction is None
         and (staged_texture_plans or staged_material_plans)
@@ -9109,6 +9204,11 @@ def replace_fonts_in_file(
 
     changed_object_manifest: list[JsonDict] = []
     validation_manifest_path: str | None = None
+    if priority_session is not None and not save_blocked_by_deferred_patch:
+        priority_count = priority_session.apply(satisfied_ttf_targets, patched_sdf_target_keys)
+        if priority_count:
+            modified = True
+            _log_console(f"[font_priority] {priority_count} TMP font(s): replacement first, original fallback preserved")
     if modified and not save_blocked_by_deferred_patch:
         changed_object_manifest = _collect_changed_object_manifest(env)
         if not changed_object_manifest:
@@ -9999,6 +10099,7 @@ def main_cli(lang: Language = "ko") -> None:
         unsafe_full_color_help = "테스트 전용: raster atlas를 흰색 RGB가 보존되는 RGBA32로 저장하고 TMP Sprite/Bitmap Custom Atlas shader fallback 허용"
         unsafe_gui_text_help = "위험한 테스트 전용: TMP UI mask/depth를 지원하지 않는 GUI/Text Shader fallback 허용"
         freeze_dynamic_help = "Dynamic/DynamicOS TMP FontAsset을 baked Static atlas로 명시적으로 고정하고 source Font PPtr 해제"
+        no_font_priority_help = "교체 폰트 우선 처리와 원본 fallback 보존을 끄고 기존 교체 방식 사용"
         game_line_metrics_help = "SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용)"
         outline_ratio_help = (
             "SDF 외곽선 배율 (기본: 1.0, classic/SRP outline 두께·softness에 적용)"
@@ -10055,6 +10156,7 @@ Examples:
         unsafe_full_color_help = "Testing only: store raster atlases as white-RGB RGBA32 and allow TMP Sprite/Bitmap Custom Atlas shader fallbacks"
         unsafe_gui_text_help = "Unsafe testing only: allow GUI/Text Shader fallback without TMP UI masking or depth support"
         freeze_dynamic_help = "Explicitly freeze Dynamic/DynamicOS TMP FontAssets to a baked Static atlas and clear the source Font PPtr"
+        no_font_priority_help = "Disable replacement-font priority and original fallback preservation; use legacy replacement"
         game_line_metrics_help = "Use original in-game line metrics for SDF replacement (default: adjusted replacement font metrics)"
         outline_ratio_help = (
             "SDF outline multiplier (default: 1.0, applied to classic/SRP outline thickness and softness)"
@@ -10108,6 +10210,7 @@ Examples:
     parser.add_argument(
         "--freeze-dynamic", action="store_true", help=freeze_dynamic_help
     )
+    parser.add_argument("--no-font-priority", action="store_true", help=no_font_priority_help)
     parser.add_argument("--use-game-mat", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--use-game-line-metrics", action="store_true", help=game_line_metrics_help
@@ -11066,6 +11169,7 @@ Examples:
             replacement_lookup,
             generator,
             asset_file_index,
+            font_priority=not args.no_font_priority,
             freeze_dynamic=args.freeze_dynamic,
         )
         if is_ko:
@@ -11214,6 +11318,7 @@ Examples:
                             force_raster=args.force_raster,
                             allow_unsafe_full_color_shader_fallback=args.allow_unsafe_full_color_shader_fallback,
                             allow_unsafe_gui_text_fallback=args.allow_unsafe_gui_text_fallback,
+                            font_priority=not args.no_font_priority,
                             freeze_dynamic=args.freeze_dynamic,
                             use_game_line_metrics=args.use_game_line_metrics,
                             material_scale_by_padding=material_scale_by_padding,
@@ -11283,6 +11388,7 @@ Examples:
                                 force_raster=args.force_raster,
                                 allow_unsafe_full_color_shader_fallback=args.allow_unsafe_full_color_shader_fallback,
                                 allow_unsafe_gui_text_fallback=args.allow_unsafe_gui_text_fallback,
+                                font_priority=not args.no_font_priority,
                                 freeze_dynamic=args.freeze_dynamic,
                                 use_game_line_metrics=args.use_game_line_metrics,
                                 material_scale_by_padding=material_scale_by_padding,
@@ -11407,6 +11513,7 @@ Examples:
                                         force_raster=args.force_raster,
                                         allow_unsafe_full_color_shader_fallback=args.allow_unsafe_full_color_shader_fallback,
                                         allow_unsafe_gui_text_fallback=args.allow_unsafe_gui_text_fallback,
+                                        font_priority=not args.no_font_priority,
                                         freeze_dynamic=args.freeze_dynamic,
                                         use_game_line_metrics=args.use_game_line_metrics,
                                         material_scale_by_padding=material_scale_by_padding,
@@ -11556,6 +11663,7 @@ Examples:
                         force_raster=args.force_raster,
                         allow_unsafe_full_color_shader_fallback=args.allow_unsafe_full_color_shader_fallback,
                         allow_unsafe_gui_text_fallback=args.allow_unsafe_gui_text_fallback,
+                        font_priority=not args.no_font_priority,
                         freeze_dynamic=args.freeze_dynamic,
                         use_game_line_metrics=args.use_game_line_metrics,
                         material_scale_by_padding=material_scale_by_padding,
@@ -11701,6 +11809,7 @@ Examples:
                     force_raster=args.force_raster,
                     allow_unsafe_full_color_shader_fallback=args.allow_unsafe_full_color_shader_fallback,
                     allow_unsafe_gui_text_fallback=args.allow_unsafe_gui_text_fallback,
+                    font_priority=not args.no_font_priority,
                     freeze_dynamic=args.freeze_dynamic,
                     use_game_line_metrics=args.use_game_line_metrics,
                     material_scale_by_padding=material_scale_by_padding,

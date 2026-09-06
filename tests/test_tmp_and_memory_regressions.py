@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import struct
 import tempfile
@@ -15,6 +16,7 @@ import export_fonts_core as exporter
 import make_sdf
 import unity_font_replacer_core as core
 import unitypy_runtime as runtime
+import tmp_font_priority as priority
 from addressables_catalog import (
     inspect_addressables_bundle_options,
     patch_addressables_catalog_bytes,
@@ -64,6 +66,121 @@ class _Object:
 
 
 class TmpAndMemoryRegressionTests(unittest.TestCase):
+    def test_ttf_priority_clears_glyph_ids_and_preserves_fallback_and_layout(self) -> None:
+        tree = {
+            "m_SourceFontFile": {"m_FileID": 0, "m_PathID": 7},
+            "m_SourceFontFilePath": "old.ttf",
+            "m_AtlasPopulationMode": 2, "InternalDynamicOS": True,
+            "m_AtlasWidth": 1024, "m_AtlasHeight": 512, "m_AtlasRenderMode": 4165,
+            "m_AtlasTextures": [priority._ref(8), priority._ref(9)], "m_AtlasTextureIndex": 1,
+            "m_IsMultiAtlasTexturesEnabled": True,
+            "m_FaceInfo": {"m_PointSize": 48, "m_FaceIndex": 3, "m_FamilyName": "Old"},
+            "m_GlyphTable": [{"m_Index": 8725}], "m_CharacterTable": [{"m_Unicode": 0xC815}],
+            "m_UsedGlyphRects": [{"m_X": 1}], "m_FreeGlyphRects": [],
+            "m_FontFeatureTable": {"m_GlyphPairAdjustmentRecords": [{"stale": True}]},
+            "m_KerningTable": {"kerningPairs": [{"stale": True}]},
+            "m_FontWeightTable": [{"regularTypeface": priority._ref(10), "italicTypeface": priority._ref(11)}],
+            "m_FallbackFontAssetTable": [priority._ref(12)],
+        }
+        priority.reset_dynamic_font(tree, (ROOT / "KR_ASSETS" / "NanumGothic.ttf").read_bytes())
+        self.assertEqual(tree["m_AtlasPopulationMode"], 1)
+        self.assertFalse(tree["InternalDynamicOS"])
+        self.assertEqual(tree["m_SourceFontFile"], priority._ref(7))
+        self.assertEqual(tree["m_SourceFontFilePath"], "")
+        self.assertEqual(tree["m_GlyphTable"], [])
+        self.assertEqual(tree["m_CharacterTable"], [])
+        self.assertEqual(tree["m_UsedGlyphRects"], [])
+        self.assertEqual(tree["m_FreeGlyphRects"], [{"m_X": 0, "m_Y": 0, "m_Width": 1023, "m_Height": 511}])
+        self.assertEqual(tree["m_FontFeatureTable"]["m_GlyphPairAdjustmentRecords"], [])
+        self.assertEqual(tree["m_KerningTable"]["kerningPairs"], [])
+        self.assertEqual(tree["m_AtlasTextures"], [priority._ref(8)])
+        self.assertEqual(tree["m_AtlasTextureIndex"], 0)
+        self.assertTrue(tree["m_IsMultiAtlasTexturesEnabled"])
+        self.assertEqual(tree["m_FaceInfo"]["m_PointSize"], 48)
+        self.assertEqual(tree["m_FaceInfo"]["m_FaceIndex"], 0)
+        self.assertEqual(tree["m_FallbackFontAssetTable"], [priority._ref(12)])
+        self.assertEqual(tree["m_FontWeightTable"][0]["regularTypeface"], priority._ref(0))
+
+    def test_priority_retry_discards_failed_sdf_but_keeps_other_successes(self) -> None:
+        ttf = ("TTF", "game.assets", "CAB", 7)
+        first = ("SDF", "game.assets", "CAB", 11)
+        second = ("SDF", "game.assets", "CAB", 12)
+        calls = []
+
+        @core._retry_font_priority
+        def run(assets_file, replacements, replacement_lookup=None, operation_outcome=None,
+                deferred_transaction=None, _priority_attempt=None):
+            calls.append(dict(replacement_lookup))
+            if first in replacement_lookup:
+                _priority_attempt.update(eligible={("CAB", 11)}, targets={("CAB", 11)})
+                deferred_transaction._failures.append("discard this attempted SDF")
+                raise ValueError("invalid SDF glyph data")
+            self.assertEqual(deferred_transaction._failures, [])
+            return True
+
+        transaction = SimpleNamespace(_plan_fingerprints={}, _payload_fingerprints={}, _plan_conflicts=[], _failures=[])
+        outcome = {}
+        self.assertTrue(run("game.assets", {}, replacement_lookup={ttf: "User", first: "User", second: "User"},
+                            operation_outcome=outcome, deferred_transaction=transaction))
+        self.assertEqual(calls[1], {ttf: "User", second: "User"})
+        self.assertEqual(outcome["fallback_sdf_targets"], [("CAB", 11)])
+
+    def test_priority_retry_does_not_mask_ttf_or_save_failure(self) -> None:
+        @core._retry_font_priority
+        def run(assets_file, replacements, _priority_attempt=None):
+            _priority_attempt.update(eligible={("CAB", 11)}, targets=set())
+            raise OSError("save failed")
+        with self.assertRaisesRegex(OSError, "save failed"):
+            run("game.assets", {})
+
+    def test_previous_ttf_priority_is_only_reused_for_selected_sdf(self) -> None:
+        backup = SimpleNamespace(type=SimpleNamespace(name="Font"), peek_name=lambda: "__UFR_FONT__7")
+        assets = SimpleNamespace(name="CAB", objects={20: backup})
+        obj = SimpleNamespace(assets_file=assets, path_id=11)
+        source = SimpleNamespace(assets_file=assets, path_id=7)
+        data = {"m_SourceFontFile": priority._ref(7)}
+        outer = core._normalize_asset_file_key(str(ROOT / "game.assets"))
+        with patch.object(core, "_deref", return_value=source) as deref:
+            self.assertIsNone(core._priority_source(obj, data, outer, None, None, {})[0])
+            deref.assert_not_called()
+            result = core._priority_source(obj, data, outer, None, None, {("SDF", "game.assets", "CAB", 11): "User"})
+            self.assertEqual(result[0], ("CAB", 7))
+
+    def test_priority_reset_rejects_legacy_schema_before_editing(self) -> None:
+        tree = {"m_glyphInfoList": [{"id": 65}]}
+        before = copy.deepcopy(tree)
+        with self.assertRaisesRegex(ValueError, "modern"):
+            priority.reset_dynamic_font(tree, b"unused")
+        self.assertEqual(tree, before)
+
+    def test_priority_bundle_preloads_include_preserved_objects(self) -> None:
+        assets_file = object()
+        tree = {
+            "m_PreloadTable": [priority._ref(7)],
+            "m_Container": [("font", {"preloadIndex": 0, "preloadSize": 1})],
+            "m_MainAsset": {"preloadIndex": 0, "preloadSize": 1},
+        }
+        bundle = SimpleNamespace(type=SimpleNamespace(name="AssetBundle"), assets_file=assets_file,
+                                 parse_as_dict=lambda: copy.deepcopy(tree))
+        session = object.__new__(priority.FontPrioritySession)
+        session.env = SimpleNamespace(objects=[bundle])
+        session.created = [(None, SimpleNamespace(assets_file=assets_file, path_id=8))]
+        with patch.object(priority, "_write") as write:
+            session._update_preloads()
+        saved = write.call_args.args[1]
+        for info in [saved["m_Container"][0][1], saved["m_MainAsset"]]:
+            start, size = info["preloadIndex"], info["preloadSize"]
+            self.assertEqual(saved["m_PreloadTable"][start:start + size], [priority._ref(7), priority._ref(8)])
+
+    def test_priority_bundle_rejects_cross_cab_preloads(self) -> None:
+        session = object.__new__(priority.FontPrioritySession)
+        session.env = SimpleNamespace(objects=[SimpleNamespace(
+            type=SimpleNamespace(name="AssetBundle"), assets_file=object(), parse_as_dict=lambda: {},
+        )])
+        session.created = [(None, SimpleNamespace(assets_file=object(), path_id=8))]
+        with self.assertRaisesRegex(ValueError, "Cross-CAB"):
+            session._update_preloads()
+
     def test_addressables_catalog_patch_preserves_compact_offsets(self) -> None:
         def make_record(
             bundle_name: str,
@@ -1291,51 +1408,32 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
         self.assertEqual(default.parent.name, "Il2CppDumper")
         self.assertEqual(explicit.name, "custom.exe")
 
-    def test_dynamic_ttf_guard_requires_both_linked_sdf_and_freeze(self) -> None:
+    def test_priority_resolves_linked_ttf_without_freezing(self) -> None:
         obj = SimpleNamespace(assets_file=SimpleNamespace(name="CAB-font"), path_id=12)
-        data = {
-            "m_AtlasPopulationMode": 1,
-            "m_SourceFontFile": {"m_FileID": 0, "m_PathID": 7},
-            "m_GlyphTable": [{"m_Index": 8725}],
-        }
-        changed = {("TTF", "Fonts.assets", "CAB-font", 7): "NanumGothic"}
-        selected = {("SDF", "Fonts.assets", "CAB-font", 12): "NanumGothic"}
-        outer_key = core._normalize_asset_file_key(str(ROOT / "Fonts.assets"))
-        for sdf, freeze in [({}, False), ({}, True), (selected, False)]:
-            with self.subTest(sdf=sdf, freeze=freeze):
-                with self.assertRaisesRegex(ValueError, "stale Dynamic TMP glyphs"):
-                    core._validate_dynamic_ttf_source(
-                        obj, data, outer_key, None, None, changed, sdf, freeze,
-                    )
-        core._validate_dynamic_ttf_source(
-            obj, data, outer_key, None, None, changed, selected, True,
+        data = {"m_SourceFontFile": priority._ref(7), "m_AtlasPopulationMode": 1}
+        outer = core._normalize_asset_file_key(str(ROOT / "Fonts.assets"))
+        source, pointer = core._priority_source(
+            obj, data, outer, None, None,
+            {("TTF", "Fonts.assets", "CAB-font", 7): "NanumGothic"},
         )
-        self.assertEqual(data["m_GlyphTable"], [{"m_Index": 8725}])
+        self.assertEqual(source, ("CAB-font", 7))
+        self.assertEqual(pointer, priority._ref(7))
         self.assertEqual(data["m_AtlasPopulationMode"], 1)
-        for mode, source_path in [(0, 7), (1, 8), (2, 0)]:
-            data["m_AtlasPopulationMode"] = mode
-            data["m_SourceFontFile"]["m_PathID"] = source_path
-            core._validate_dynamic_ttf_source(
-                obj, data, outer_key, None, None, changed, {}, False,
-            )
+        self.assertIsNone(core._priority_source(obj, data, outer, None, None, {})[0])
 
-    def test_dynamic_ttf_guard_resolves_external_source_font(self) -> None:
+    def test_priority_rejects_unhandled_external_ttf_transaction(self) -> None:
         source_path = str(ROOT / "Source.assets")
         owner_path = str(ROOT / "Owner.assets")
         index = core._build_asset_file_index([source_path, owner_path], str(ROOT))
         obj = SimpleNamespace(
-            assets_file=SimpleNamespace(
-                name="Owner.assets", externals=[SimpleNamespace(path="Source.assets")],
-            ), path_id=12,
+            assets_file=SimpleNamespace(name="Owner.assets", externals=[SimpleNamespace(path="Source.assets")]),
+            path_id=12,
         )
-        data = {
-            "m_AtlasPopulationMode": 1,
-            "m_SourceFontFile": {"m_FileID": 1, "m_PathID": 7},
-        }
-        with self.assertRaisesRegex(ValueError, "stale Dynamic TMP glyphs"):
-            core._validate_dynamic_ttf_source(
-                obj, data, core._normalize_asset_file_key(owner_path), None, index,
-                {("TTF", "Source.assets", "Source.assets", 7): "NanumGothic"}, {}, False,
+        with self.assertRaisesRegex(ValueError, "another outer file"):
+            core._priority_source(
+                obj, {"m_SourceFontFile": priority._ref(7, 1)},
+                core._normalize_asset_file_key(owner_path), None, index,
+                {("TTF", "Source.assets", "Source.assets", 7): "NanumGothic"},
             )
 
     def test_unchanged_ttf_does_not_require_tmp_freezing(self) -> None:

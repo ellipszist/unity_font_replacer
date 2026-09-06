@@ -204,6 +204,8 @@ def scan_fonts_from_env(
         try:
             if scan_ttf and obj.type.name == "Font":
                 font_name = obj.peek_name()
+                if str(font_name).startswith("__UFR_"):
+                    continue
                 if not font_name:
                     try:
                         font = obj.parse_as_object()
@@ -278,6 +280,8 @@ def scan_fonts_from_env(
                         )
                     continue
 
+                if str(obj.peek_name()).startswith("__UFR_"):
+                    continue
                 sdf_info: JsonDict = {
                     "file": file_name,
                     "assets_name": obj.assets_file.name,
