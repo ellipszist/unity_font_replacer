@@ -78,6 +78,10 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 | `--ttfonly` | TTF 폰트만 교체 |
 | `--target-file <파일명>` | 지정한 파일명만 교체 대상에 포함 (여러 번/콤마로 지정 가능) |
 
+Dynamic TMP의 source TTF만 변경하면 기존 glyph ID와 충돌해 한글이 다른 문자로 표시될 수 있습니다. 이런 TTF 단독 교체는 중단됩니다. 연결된 SDF도 함께 선택하고 `--freeze-dynamic`을 사용하거나 source TTF를 교체 대상에서 제외하세요. TTF 교체 실행 시에도 이 연결을 검사할 TypeTree가 필요할 수 있습니다.
+
+TTF 교체는 필수가 아닙니다. `--sdfonly --freeze-dynamic`으로 선택한 TMP의 문자표·글리프·atlas를 함께 교체하면 원본 TTF는 유지됩니다. Static atlas에 포함되지 않은 문자는 동적으로 추가되지 않으므로 필요한 글자셋이나 fallback을 준비해야 합니다.
+
 #### TMP FontAsset 교체 옵션
 
 | 옵션 | 설명 |

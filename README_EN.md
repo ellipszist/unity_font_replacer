@@ -78,6 +78,10 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --font "D:\Fonts\MyFont.
 | `--ttfonly` | Replace TTF fonts only |
 | `--target-file <name>` | Limit replacement to specific file name(s) (repeatable/comma-separated) |
 
+Changing only a Dynamic TMP source TTF can reuse stale glyph IDs and display unrelated characters. Such TTF-only replacements are refused. Select the linked SDF assets with `--freeze-dynamic`, or leave the source TTF unchanged. TTF replacement may now require TypeTrees to check these dependencies.
+
+TTF replacement is optional. Use `--sdfonly --freeze-dynamic` to replace the selected TMP character tables, glyphs and atlases together while preserving the original TTFs. Static atlases cannot add missing characters dynamically, so include the required character set or provide a suitable fallback.
+
 #### TMP FontAsset Options
 
 | Option | Description |

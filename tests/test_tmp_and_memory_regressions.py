@@ -1238,16 +1238,119 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
                     cache_root=str(cache_root),
                     dumper_path=str(dumper),
                 )
+                dumper.with_suffix(".dll").write_bytes(b"updated-managed-dumper")
+                runtime.create_type_tree_generator(
+                    "2019.4.0f1", str(game_path), str(data_path), "Il2cpp",
+                    cache_root=str(cache_root), dumper_path=str(dumper),
+                )
 
-            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_count, 2)
             self.assertEqual(first.loaded, [b"dummy"])
             self.assertEqual(second.loaded, [b"dummy"])
             self.assertFalse((data_path / "Managed").exists())
             self.assertFalse((data_path / "Managed_").exists())
             self.assertEqual(
                 len(list((cache_root / "il2cpp_cache").glob("*/manifest.json"))),
-                1,
+                2,
             )
+
+    def test_il2cpp_exit_zero_with_errors_does_not_cache_partial_dlls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data = root / "Game_Data"
+            metadata = data / "il2cpp_data" / "Metadata" / "global-metadata.dat"
+            metadata.parent.mkdir(parents=True)
+            metadata.write_bytes(struct.pack("<II", 0xFAB11BAF, 39))
+            (root / "GameAssembly.dll").write_bytes(b"assembly")
+            dumper = root / "Il2CppDumper.exe"
+            dumper.write_bytes(b"dumper")
+
+            def fake_run(command, **kwargs):
+                dummy = Path(command[3]) / "DummyDll"
+                dummy.mkdir()
+                (dummy / "Unity.TextMeshPro.dll").write_bytes(b"incomplete")
+                return SimpleNamespace(
+                    returncode=0, stdout="ERROR: Error while restoring attributeIndex 1", stderr="",
+                )
+
+            with patch.object(runtime.subprocess, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "incomplete DummyDll"):
+                    runtime._ensure_il2cpp_dummy_dlls(
+                        "6000.3.15f1", str(root), str(data),
+                        cache_root=str(root / "cache"), dumper_path=str(dumper),
+                    )
+            self.assertEqual(list((root / "cache").rglob("manifest.json")), [])
+
+    def test_il2cpp_dumper_selection_keeps_default_and_explicit_paths(self) -> None:
+        with (
+            patch.dict(runtime.os.environ, {"UFR_IL2CPP_DUMPER": ""}),
+            patch.object(runtime.os.path, "isfile", return_value=True),
+        ):
+            default = Path(runtime._il2cpp_dumper_path())
+            explicit = Path(runtime._il2cpp_dumper_path("custom.exe"))
+        self.assertEqual(default.parent.name, "Il2CppDumper")
+        self.assertEqual(explicit.name, "custom.exe")
+
+    def test_dynamic_ttf_guard_requires_both_linked_sdf_and_freeze(self) -> None:
+        obj = SimpleNamespace(assets_file=SimpleNamespace(name="CAB-font"), path_id=12)
+        data = {
+            "m_AtlasPopulationMode": 1,
+            "m_SourceFontFile": {"m_FileID": 0, "m_PathID": 7},
+            "m_GlyphTable": [{"m_Index": 8725}],
+        }
+        changed = {("TTF", "Fonts.assets", "CAB-font", 7): "NanumGothic"}
+        selected = {("SDF", "Fonts.assets", "CAB-font", 12): "NanumGothic"}
+        outer_key = core._normalize_asset_file_key(str(ROOT / "Fonts.assets"))
+        for sdf, freeze in [({}, False), ({}, True), (selected, False)]:
+            with self.subTest(sdf=sdf, freeze=freeze):
+                with self.assertRaisesRegex(ValueError, "stale Dynamic TMP glyphs"):
+                    core._validate_dynamic_ttf_source(
+                        obj, data, outer_key, None, None, changed, sdf, freeze,
+                    )
+        core._validate_dynamic_ttf_source(
+            obj, data, outer_key, None, None, changed, selected, True,
+        )
+        self.assertEqual(data["m_GlyphTable"], [{"m_Index": 8725}])
+        self.assertEqual(data["m_AtlasPopulationMode"], 1)
+        for mode, source_path in [(0, 7), (1, 8), (2, 0)]:
+            data["m_AtlasPopulationMode"] = mode
+            data["m_SourceFontFile"]["m_PathID"] = source_path
+            core._validate_dynamic_ttf_source(
+                obj, data, outer_key, None, None, changed, {}, False,
+            )
+
+    def test_dynamic_ttf_guard_resolves_external_source_font(self) -> None:
+        source_path = str(ROOT / "Source.assets")
+        owner_path = str(ROOT / "Owner.assets")
+        index = core._build_asset_file_index([source_path, owner_path], str(ROOT))
+        obj = SimpleNamespace(
+            assets_file=SimpleNamespace(
+                name="Owner.assets", externals=[SimpleNamespace(path="Source.assets")],
+            ), path_id=12,
+        )
+        data = {
+            "m_AtlasPopulationMode": 1,
+            "m_SourceFontFile": {"m_FileID": 1, "m_PathID": 7},
+        }
+        with self.assertRaisesRegex(ValueError, "stale Dynamic TMP glyphs"):
+            core._validate_dynamic_ttf_source(
+                obj, data, core._normalize_asset_file_key(owner_path), None, index,
+                {("TTF", "Source.assets", "Source.assets", 7): "NanumGothic"}, {}, False,
+            )
+
+    def test_unchanged_ttf_does_not_require_tmp_freezing(self) -> None:
+        font = SimpleNamespace(
+            type=SimpleNamespace(name="Font"), assets_file=SimpleNamespace(name="CAB-font"),
+            path_id=7,
+        )
+        with (
+            patch.object(core, "_safe_parse_as_object", return_value=SimpleNamespace(m_FontData=b"same")),
+            patch.object(core, "load_font_assets", return_value={"ttf_data": b"same"}),
+        ):
+            self.assertEqual(core._changed_ttf_replacements(
+                SimpleNamespace(objects=[font]), "Fonts.assets",
+                {("TTF", "Fonts.assets", "CAB-font", 7): "NanumGothic"},
+            ), {})
 
     def test_material_main_texture_key_resolves_external_file_id(self) -> None:
         external = SimpleNamespace(path="sharedassets0.assets")
@@ -2489,6 +2592,34 @@ class TmpAndMemoryRegressionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "reference is null"):
             core._read_monobehaviour_script_identity(null_script_object)
+
+    def test_local_monoscript_cache_is_scoped_to_outer_and_inner_files(self) -> None:
+        reads = []
+
+        def read_script():
+            reads.append(True)
+            return SimpleNamespace(
+                m_Namespace="TMPro", m_ClassName="TMP_FontAsset",
+                m_AssemblyName="Unity.TextMeshPro.dll",
+            )
+
+        obj = SimpleNamespace(
+            assets_file=SimpleNamespace(name="CAB-one"),
+            parse_monobehaviour_head=lambda: SimpleNamespace(
+                m_Script=SimpleNamespace(m_FileID=0, m_PathID=7, read=read_script),
+            ),
+        )
+        cache = {}
+        for outer, inner in [
+            ("one.bundle", "CAB-one"), ("one.bundle", "CAB-one"),
+            ("two.bundle", "CAB-one"), ("two.bundle", "CAB-two"),
+        ]:
+            obj.assets_file.name = inner
+            self.assertEqual(core._read_monobehaviour_script_identity(
+                obj, current_outer_key=outer, identity_cache=cache,
+            ), ("TMPro", "TMP_FontAsset", "Unity.TextMeshPro.dll"))
+        self.assertEqual(len(reads), 3)
+        self.assertEqual(len(cache), 3)
 
     def test_monoscript_identity_resolves_an_external_addressables_cab(
         self,

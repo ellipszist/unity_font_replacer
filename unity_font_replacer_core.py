@@ -3092,10 +3092,20 @@ def _read_monobehaviour_script_identity(
         raise ValueError("MonoScript reference cannot be resolved")
     source_assets_file = getattr(obj, "assets_file", None)
     if script_file_id == 0:
+        local_key = (
+            _normalize_asset_file_key(current_outer_key) or "",
+            str(getattr(source_assets_file, "name", "")).lower(),
+            script_path_id,
+        )
+        if identity_cache is not None and current_outer_key and local_key in identity_cache:
+            return identity_cache[local_key]
         try:
-            return _coerce_monoscript_identity(read_script())
+            identity = _coerce_monoscript_identity(read_script())
         except Exception as exc:
             raise ValueError("MonoScript reference could not be resolved") from exc
+        if identity_cache is not None and current_outer_key:
+            identity_cache[local_key] = identity
+        return identity
 
     # UnityPy's generic external PPtr dereference may select the first file
     # with a matching basename.  Resolve every external script through the
@@ -3171,11 +3181,80 @@ def _is_tmp_fontasset_script_identity(identity: tuple[str, str, str]) -> bool:
     }
 
 
+def _changed_ttf_replacements(
+    env: Any,
+    file_name: str,
+    replacement_lookup: dict[tuple[str, str, str, int], str],
+) -> dict[tuple[str, str, str, int], str]:
+    changed = {}
+    for obj in env.objects:
+        if obj.type.name != "Font":
+            continue
+        key = ("TTF", file_name, str(obj.assets_file.name), int(obj.path_id))
+        replacement = replacement_lookup.get(key)
+        if not replacement:
+            continue
+        font_data = load_font_assets(replacement, generate_sdf=False).get("ttf_data")
+        if font_data and bytes(_safe_parse_as_object(obj).m_FontData) != font_data:
+            changed[key] = replacement
+    return changed
+
+
+def _validate_dynamic_ttf_source(
+    obj: Any,
+    data: JsonDict,
+    outer_key: str,
+    source_signature: str | None,
+    asset_file_index: dict[str, Any] | None,
+    changed_ttf: dict[tuple[str, str, str, int], str],
+    sdf_replacements: dict[tuple[str, str, str, int], str],
+    freeze_dynamic: bool,
+) -> None:
+    if not changed_ttf:
+        return
+    if not int(data.get("m_AtlasPopulationMode", 0)) and not parse_bool_flag(
+        data.get("InternalDynamicOS")
+    ):
+        return
+    source_file_id, source_path_id = _atlas_ref_ids(data.get("m_SourceFontFile"))
+    if not source_path_id:
+        return
+    assets_name = str(obj.assets_file.name)
+    source_assets = _resolve_target_assets_name(obj.assets_file, assets_name, source_file_id)
+    source_outer = _resolve_target_outer_file_key(
+        outer_key, obj.assets_file, source_file_id, source_assets,
+        source_bundle_signature=source_signature, asset_file_index=asset_file_index,
+    )
+    if not source_assets or not source_outer:
+        raise ValueError("Could not resolve a Dynamic TMP source Font; refusing TTF replacement.")
+    source_key = (os.path.basename(source_outer).casefold(), source_assets.casefold(), source_path_id)
+    if not any(
+        (key[1].casefold(), key[2].casefold(), key[3]) == source_key
+        for key in changed_ttf
+    ):
+        return
+    owner_key = ("SDF", os.path.basename(outer_key), assets_name, int(obj.path_id))
+    owner_selected = any(
+        key[0] == "SDF" and value
+        and (key[1].casefold(), key[2].casefold(), key[3])
+        == (owner_key[1].casefold(), assets_name.casefold(), owner_key[3])
+        for key, value in sdf_replacements.items()
+    )
+    if not freeze_dynamic or not owner_selected:
+        raise ValueError(
+            f"TTF replacement would leave stale Dynamic TMP glyphs: {owner_key!r}. "
+            "Select the linked TMP FontAsset for SDF replacement with --freeze-dynamic, "
+            "or leave its source TTF unchanged. TTF-only/split saving is unsafe."
+        )
+
+
 def _preflight_shared_atlas_owners(
     all_assets_files: list[str],
     replacement_lookup: dict[tuple[str, str, str, int], str],
     generator: TypeTreeGenerator | None,
     asset_file_index: dict[str, Any],
+    *,
+    freeze_dynamic: bool = False,
 ) -> None:
     """Read every TMP FontAsset and validate exact outer/CAB/PathID atlas ownership."""
     sdf_replacements = {
@@ -3183,7 +3262,20 @@ def _preflight_shared_atlas_owners(
         for key, value in replacement_lookup.items()
         if len(key) == 4 and key[0] == "SDF" and str(value).strip()
     }
-    if not sdf_replacements:
+    ttf_files = {key[1] for key in replacement_lookup if key[0] == "TTF"}
+    changed_ttf: dict[tuple[str, str, str, int], str] = {}
+    for outer_path in all_assets_files:
+        if os.path.basename(outer_path) not in ttf_files:
+            continue
+        env = None
+        try:
+            env = load_unitypy(outer_path)
+            changed_ttf.update(_changed_ttf_replacements(
+                env, os.path.basename(outer_path), replacement_lookup,
+            ))
+        finally:
+            close_unitypy_env(env)
+    if not sdf_replacements and not changed_ttf:
         return
 
     records: list[JsonDict] = []
@@ -3224,7 +3316,7 @@ def _preflight_shared_atlas_owners(
                     continue
 
                 try:
-                    data = _safe_parse_as_dict(obj)
+                    data = obj.parse_as_dict() if changed_ttf else _safe_parse_as_dict(obj)
                 except Exception as exc:
                     parse_failures.append(
                         f"{object_label} TMP payload "
@@ -3253,6 +3345,10 @@ def _preflight_shared_atlas_owners(
                 ):
                     continue
 
+                _validate_dynamic_ttf_source(
+                    obj, data, outer_key, source_signature, asset_file_index,
+                    changed_ttf, sdf_replacements, freeze_dynamic,
+                )
                 atlas_refs = _all_valid_atlas_refs(data)
                 if not atlas_refs:
                     continue
@@ -7265,6 +7361,33 @@ def replace_fonts_in_file(
     modified = False
     save_success = False
 
+    changed_ttf = (
+        _changed_ttf_replacements(env, fn_without_path, replacement_lookup)
+        if replace_ttf and not preview_export else {}
+    )
+    if changed_ttf:
+        script_identity_cache: dict[tuple[str, str, int], tuple[str, str, str]] = {}
+        for obj in env.objects:
+            if obj.type.name != "MonoBehaviour":
+                continue
+            identity = _read_monobehaviour_script_identity(
+                obj, current_outer_key=current_file_key,
+                source_bundle_signature=source_bundle_signature,
+                asset_file_index=asset_file_index, identity_cache=script_identity_cache,
+            )
+            if not _is_tmp_fontasset_script_identity(identity):
+                continue
+            if generator is None:
+                generator = _create_generator(
+                    unity_version, game_path, data_path, get_compile_method(data_path), lang=lang,
+                )
+                env.typetree_generator = generator
+            _validate_dynamic_ttf_source(
+                obj, obj.parse_as_dict(), current_file_key, source_bundle_signature,
+                asset_file_index, changed_ttf,
+                replacement_lookup if replace_sdf else {}, freeze_dynamic,
+            )
+
     for obj in env.objects:
         assets_name = obj.assets_file.name
         if obj.type.name == "Font" and replace_ttf:
@@ -10869,7 +10992,7 @@ Examples:
             lang=lang,
             cache_root=generator_cache_root,
         )
-        if replace_sdf
+        if replace_sdf or replace_ttf
         else None
     )
     replacement_lookup, files_to_process = build_replacement_lookup(replacements)
@@ -10932,17 +11055,18 @@ Examples:
         f"[runtime] matched_asset_files={len(asset_file_queue)} all_candidates={len(all_assets_files)}"
     )
     if mode != "preview_export" and any(
-        len(key) == 4 and key[0] == "SDF" for key in replacement_lookup
+        len(key) == 4 and key[0] in {"SDF", "TTF"} for key in replacement_lookup
     ):
         if is_ko:
-            _log_console("공유 TMP Atlas 소유권을 읽기 전용으로 사전 검사합니다...")
+            _log_console("TMP Atlas 소유권과 TTF 연결을 읽기 전용으로 사전 검사합니다...")
         else:
-            _log_console("Preflighting shared TMP atlas ownership (read-only)...")
+            _log_console("Preflighting TMP atlas ownership and TTF dependencies (read-only)...")
         _preflight_shared_atlas_owners(
             all_assets_files,
             replacement_lookup,
             generator,
             asset_file_index,
+            freeze_dynamic=args.freeze_dynamic,
         )
         if is_ko:
             _log_console("공유 TMP Atlas 소유권 검사 완료")

@@ -140,6 +140,11 @@ def _ensure_il2cpp_dummy_dlls(
         "game_assembly_sha256": _sha256_file(binary_path),
         "global_metadata_sha256": _sha256_file(metadata_path),
         "dumper_sha256": _sha256_file(resolved_dumper),
+        "dumper_companions_sha256": {
+            path.name: _sha256_file(str(path))
+            for path in sorted(Path(resolved_dumper).parent.iterdir())
+            if path.is_file() and path.suffix.lower() in {".dll", ".json"}
+        },
     }
     cache_key = hashlib.sha256(
         json.dumps(manifest, sort_keys=True).encode("utf-8")
@@ -210,6 +215,15 @@ def _ensure_il2cpp_dummy_dlls(
             raise RuntimeError(
                 f"Il2CppDumper failed with exit code {process.returncode}: "
                 f"{details[-4000:]}"
+            )
+        restoration_errors = [
+            line for line in (process.stdout + "\n" + process.stderr).splitlines()
+            if line.lstrip().startswith("ERROR:")
+        ]
+        if restoration_errors:
+            raise RuntimeError(
+                "Il2CppDumper reported errors; refusing incomplete DummyDll metadata: "
+                + "\n".join(restoration_errors[:5])
             )
         dummy_dir = os.path.join(work_dir, "DummyDll")
         dll_names = (
