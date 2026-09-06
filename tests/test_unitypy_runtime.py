@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +24,32 @@ SAMPLE_BUNDLE = ACTIVE_UNITYPY_ROOT / "tests" / "samples" / "atlas_test"
 
 
 class UnityPyRuntimeTests(unittest.TestCase):
+    def test_bundled_il2cpp_dumper_has_local_runtime(self) -> None:
+        folder = ROOT / "Il2CppDumper"
+        for name in (
+            "Il2CppDumper.exe", "Il2CppDumper.dll", "Mono.Cecil.dll",
+            "coreclr.dll", "hostfxr.dll", "hostpolicy.dll", "System.Private.CoreLib.dll",
+            "Il2CppDumper.deps.json", "LICENSE", "LICENSE.TXT", "THIRD-PARTY-NOTICES.TXT",
+            "Mono.Cecil.LICENSE.txt",
+        ):
+            with self.subTest(file=name):
+                self.assertTrue((folder / name).is_file(), name)
+                self.assertGreater((folder / name).stat().st_size, 0)
+        config = json.loads((folder / "config.json").read_text(encoding="utf-8-sig"))
+        self.assertFalse(config["RequireAnyKey"])
+        self.assertTrue(config["GenerateDummyDll"])
+        self.assertFalse(config["StringsOnly"])
+        self.assertFalse(config["RestoreExplicitInterfaces"])
+        runtime_options = json.loads(
+            (folder / "Il2CppDumper.runtimeconfig.json").read_text(encoding="utf-8-sig")
+        )["runtimeOptions"]
+        self.assertNotIn("framework", runtime_options)
+        self.assertNotIn("frameworks", runtime_options)
+        self.assertTrue(any(
+            framework["name"] == "Microsoft.NETCore.App"
+            for framework in runtime_options["includedFrameworks"]
+        ))
+
     def test_explicit_close_removes_environment_from_scoped_tracking(self) -> None:
         class FakeEnvironment:
             file = None

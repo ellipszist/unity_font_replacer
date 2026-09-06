@@ -19,6 +19,8 @@ release_en/
 
 `make_sdf.exe` is distributed as a standalone ZIP (`make_sdf_vX.Y.Z.zip`).
 
+`Il2CppDumper/` includes the Windows x64 self-contained build from [release 17bc00ba5aae](https://github.com/snowyegret23/Il2CppDumper/releases/tag/17bc00ba5aae). No separate .NET installation is required for IL2CPP analysis. Keep the entire folder, including its DLLs and configuration, beside the tool rather than copying only the EXE.
+
 Recommended run:
 
 ```bat
@@ -502,6 +504,7 @@ python export_fonts_en.py "D:\MyGame"
 
 - [UnityPy](https://github.com/K0lb3/UnityPy) by K0lb3
 - [Il2CppDumper](https://github.com/Perfare/Il2CppDumper) by Perfare
+- [Il2CppDumper fork](https://github.com/snowyegret23/Il2CppDumper) by snowyegret23 — bundled modern metadata support
 - [NanumGothic](https://hangeul.naver.com/font) by NAVER | [License](https://help.naver.com/service/30016/contents/18088?osType=PC&lang=ko)
 - [Mulmaru](https://github.com/mushsooni/mulmaru) by mushsooni | [License](https://github.com/mushsooni/mulmaru/blob/main/LICENSE_ko)
 

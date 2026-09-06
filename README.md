@@ -19,6 +19,8 @@ release/
 
 `make_sdf.exe`는 별도 단독 ZIP(`make_sdf_vX.Y.Z.zip`)으로 제공합니다.
 
+`Il2CppDumper/`에는 [17bc00ba5aae 릴리즈](https://github.com/snowyegret23/Il2CppDumper/releases/tag/17bc00ba5aae)의 Windows x64 런타임 포함판이 들어 있습니다. IL2CPP 분석을 위해 .NET을 따로 설치할 필요가 없으며, EXE만 옮기지 말고 동봉된 DLL·설정 파일과 폴더 전체를 유지하세요.
+
 권장 실행 방식:
 
 ```bat
@@ -501,6 +503,7 @@ python export_fonts_ko.py "D:\MyGame"
 
 - [UnityPy](https://github.com/K0lb3/UnityPy) by K0lb3
 - [Il2CppDumper](https://github.com/Perfare/Il2CppDumper) by Perfare
+- [Il2CppDumper fork](https://github.com/snowyegret23/Il2CppDumper) by snowyegret23 — 동봉된 최신 메타데이터 지원판
 - [나눔고딕](https://hangeul.naver.com/font) by NAVER | [License](https://help.naver.com/service/30016/contents/18088?osType=PC&lang=ko)
 - [물마루](https://github.com/mushsooni/mulmaru) by mushsooni | [License](https://github.com/mushsooni/mulmaru/blob/main/LICENSE_ko)
 
