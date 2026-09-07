@@ -4,20 +4,41 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '릴리즈 버전 (예: 1.0.0)'
+        description: '릴리즈 버전 (예: 1.3.0 또는 v1.3.0, 기존 버전은 첨부 ZIP만 교체)'
         required: true
         type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: ufr-release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      BUILD_BRANCH: ${{ github.event.repository.default_branch }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BUILD_BRANCH }}
+
+      - name: Validate release version
+        env:
+          RELEASE_VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          $version = $env:RELEASE_VERSION_INPUT.Trim()
+          if ($version -cnotmatch '^v?(?<version>[0-9]+(?:\.[0-9]+)*(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?)$') {
+            throw 'Invalid version. Use a version such as 1.3.0, v1.3.0, or 1.3.0-beta.1.'
+          }
+          "RELEASE_TAG=v$($Matches.version)" >> $env:GITHUB_ENV
+          $buildSha = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the build source commit' }
+          "BUILD_SHA=$buildSha" >> $env:GITHUB_ENV
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -30,8 +51,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
           pip install pyinstaller Pillow TypeTreeGeneratorAPI fmod_toolkit archspec numpy scipy fonttools psutil
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
           pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git@bccc488474556a5aab30121d7a6c7500c54a80c7
+          if ($LASTEXITCODE -ne 0) { throw 'UnityPy installation failed' }
           python -c "import UnityPy,sys; from UnityPy.files.BundleFile import BundleFile; from UnityPy.files.ObjectReader import ObjectReader; from UnityPy.files.SerializedFile import SerializedFile; from UnityPy.helpers import CompressionHelper; v=tuple(int(x) for x in UnityPy.__version__.split('.')[:3]); probe=type('Probe',(),{'data':b'modified'})(); print(sys.version); print(UnityPy.__version__); print(UnityPy.__file__); assert v >= (1,25,3) and ObjectReader.get_raw_data(probe)==b'modified' and callable(getattr(BundleFile,'save_to',None)) and callable(getattr(BundleFile,'_write_decompressed_block',None)) and callable(getattr(SerializedFile,'save_to',None)) and callable(getattr(SerializedFile,'get_spill_store',None)) and callable(getattr(CompressionHelper,'chunk_based_compress_iter_to_file',None)) and callable(getattr(CompressionHelper,'create_lzma_decompressor',None)), 'Required custom UnityPy low-memory APIs are missing'"
 
       - name: Run regression tests
@@ -46,6 +70,7 @@ jobs:
             --collect-all archspec `
             --collect-all fontTools `
             unity_font_replacer_ko.py
+          if ($LASTEXITCODE -ne 0) { throw 'Korean font replacer build failed' }
 
           pyinstaller --onefile --name export_fonts_ko `
             --collect-all UnityPy `
@@ -53,6 +78,7 @@ jobs:
             --collect-all fmod_toolkit `
             --collect-all archspec `
             export_fonts_ko.py
+          if ($LASTEXITCODE -ne 0) { throw 'Korean font exporter build failed' }
 
           pyinstaller --onefile --name unity_font_replacer_en `
             --collect-all UnityPy `
@@ -61,6 +87,7 @@ jobs:
             --collect-all archspec `
             --collect-all fontTools `
             unity_font_replacer_en.py
+          if ($LASTEXITCODE -ne 0) { throw 'English font replacer build failed' }
 
           pyinstaller --onefile --name export_fonts_en `
             --collect-all UnityPy `
@@ -68,27 +95,27 @@ jobs:
             --collect-all fmod_toolkit `
             --collect-all archspec `
             export_fonts_en.py
+          if ($LASTEXITCODE -ne 0) { throw 'English font exporter build failed' }
 
           pyinstaller --onefile --name make_sdf `
             --collect-all numpy `
             --collect-all scipy `
             --collect-all fontTools `
             make_sdf.py
+          if ($LASTEXITCODE -ne 0) { throw 'SDF generator build failed' }
 
       - name: Prepare release files
         run: |
           mkdir release
           copy dist\unity_font_replacer_ko.exe release\
           copy dist\export_fonts_ko.exe release\
-          xcopy KR_ASSETS release\KR_ASSETS\ /E /I
-          xcopy Il2CppDumper release\Il2CppDumper\ /E /I
+          Copy-Item -LiteralPath KR_ASSETS, Il2CppDumper -Destination release -Recurse
           copy README.md release\
           if (Test-Path CharList_3911.txt) { copy CharList_3911.txt release\ }
           mkdir release_en
           copy dist\unity_font_replacer_en.exe release_en\
           copy dist\export_fonts_en.exe release_en\
-          xcopy KR_ASSETS release_en\KR_ASSETS\ /E /I
-          xcopy Il2CppDumper release_en\Il2CppDumper\ /E /I
+          Copy-Item -LiteralPath KR_ASSETS, Il2CppDumper -Destination release_en -Recurse
           copy README_EN.md release_en\
           if (Test-Path CharList_3911.txt) { copy CharList_3911.txt release_en\ }
           mkdir release_make_sdf
@@ -99,27 +126,51 @@ jobs:
 
       - name: Create ZIP archive
         run: |
-          Compress-Archive -Path release\* -DestinationPath Unity_Font_Replacer_v${{ inputs.version }}.zip
-          Compress-Archive -Path release_en\* -DestinationPath Unity_Font_Replacer_EN_v${{ inputs.version }}.zip
-          Compress-Archive -Path release_make_sdf\* -DestinationPath make_sdf_v${{ inputs.version }}.zip
+          Compress-Archive -Path release\* -DestinationPath "Unity_Font_Replacer_$env:RELEASE_TAG.zip"
+          Compress-Archive -Path release_en\* -DestinationPath "Unity_Font_Replacer_EN_$env:RELEASE_TAG.zip"
+          Compress-Archive -Path release_make_sdf\* -DestinationPath "make_sdf_$env:RELEASE_TAG.zip"
 
-      - name: Create tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag v${{ inputs.version }} ${{ github.sha }}
-          git push origin v${{ inputs.version }}
-
-      - name: Create release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: v${{ inputs.version }}
-          name: v${{ inputs.version }}
-          draft: true
-          files: |
-            Unity_Font_Replacer_v${{ inputs.version }}.zip
-            Unity_Font_Replacer_EN_v${{ inputs.version }}.zip
-            make_sdf_v${{ inputs.version }}.zip
-          generate_release_notes: true
+      - name: Create release or replace existing assets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $assets = @(
+            "Unity_Font_Replacer_$tag.zip"
+            "Unity_Font_Replacer_EN_$tag.zip"
+            "make_sdf_$tag.zip"
+          )
+          foreach ($asset in $assets) {
+            if (!(Test-Path -LiteralPath $asset -PathType Leaf) -or (Get-Item -LiteralPath $asset).Length -eq 0) {
+              throw "Missing or empty release asset: $asset"
+            }
+          }
+
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $release = $null
+          $page = 1
+          do {
+            $releaseUri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases?per_page=100&page=$page"
+            $releasePage = Invoke-RestMethod -Uri $releaseUri -Headers $headers -ErrorAction Stop
+            $release = $releasePage | Where-Object { $_.tag_name -ceq $tag } | Select-Object -First 1
+            $page++
+          } while ($null -eq $release -and $releasePage.Count -eq 100)
+          if ($null -ne $release) {
+            if ($release.immutable) {
+              throw "Release $tag is immutable; GitHub does not allow replacing its assets. Use a new version."
+            }
+            gh release upload $tag @assets --clobber --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Release asset upload failed. Re-run this workflow to complete the replacement.'
+            }
+            "Updated ZIP assets for $tag. Release notes, title, tag, and publication state were left unchanged." >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            gh release create $tag @assets --repo $env:GITHUB_REPOSITORY --target $env:BUILD_SHA --title $tag --draft --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed' }
+            "Created draft release $tag with generated release notes." >> $env:GITHUB_STEP_SUMMARY
+          }
+          "Build source commit: $env:BUILD_SHA ($env:BUILD_BRANCH). Existing tags are never moved." >> $env:GITHUB_STEP_SUMMARY

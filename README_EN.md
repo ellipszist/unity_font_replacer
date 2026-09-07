@@ -504,6 +504,15 @@ python export_fonts_en.py "D:\MyGame"
 
 ---
 
+## Release builds with Actions
+
+Open `Actions` → `Build and Release` → `Run workflow`, then enter a version such as `1.3.0` or `v1.3.0`. Builds always use the latest commit on the default branch at checkout time.
+
+- Existing version: replace only the three matching ZIP assets for Korean UFR, English UFR, and `make_sdf`. Release notes, title, published/draft, prerelease and Latest status, the existing tag, and unrelated assets are preserved.
+- New version: create a draft release with automatically generated release notes.
+- The entered version is used only for the release tag and ZIP names, not to select historical source code. Existing tags are never moved, so GitHub's `Source code` downloads still refer to the original tagged source. The actual build commit is recorded in the Actions run summary.
+- Uploads start only after tests, builds, and packaging succeed. Asset replacement is not atomic: an interrupted upload can leave missing assets or a mix of old and new files. Re-run the same version to retry. GitHub releases locked as immutable cannot have their assets replaced.
+
 ## Special Thanks
 
 - [UnityPy](https://github.com/K0lb3/UnityPy) by K0lb3
