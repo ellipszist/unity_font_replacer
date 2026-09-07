@@ -1,10 +1,10 @@
 {
   "repository": "https://github.com/snowyegret23/Il2CppDumper",
-  "commit": "a67301db02a38c61392e392bb978f543c94554d7",
+  "commit": "2a10ec57b15a17948ea29256b9c1f2de3cff33e3",
+  "tag": "2a10ec57b15a",
+  "release_url": "https://github.com/snowyegret23/Il2CppDumper/releases/tag/2a10ec57b15a",
   "build": {
-    "kind": "local",
-    "source_tree": "clean",
-    "sdk": "8.0.424",
+    "kind": "github-release",
     "workflow": ".github/workflows/release.yml",
     "configuration": "Release",
     "framework": "net8.0",
@@ -13,27 +13,30 @@
   "packages": {
     "x64": {
       "entry_point": "Il2CppDumper.exe",
-      "asset": "Il2CppDumper-a67301db02a3-net8.0-win-x64-self-contained.zip",
-      "archive_sha256": "3788df8cf2b55a0415b8b71c117fa80a627a27d632395a97c00720b6435bdc80",
+      "asset": "Il2CppDumper-2a10ec57b15a-net8.0-win-x64-self-contained.zip",
+      "archive_sha256": "771fbb97df94e65238e2abe8baaa80865427556bf1b35db5aa08d4774beeb237",
       "runtime": "Microsoft.NETCore.App 8.0.30 win-x64",
       "files_sha256": {
-        "Il2CppDumper.exe": "9c1a61ea9b744aea67565a0e822f3aeb9cf28077eabc308e1c0846887cc0aabf",
-        "Il2CppDumper.dll": "299d1ba1142a77046620a129eaf2ecf9b4a2294998ef253637605847fb61fd1e"
+        "Il2CppDumper.exe": "ce122f02763215c2b7f75834b7301d594da001450dc6b9298191ddc4567bc25f",
+        "Il2CppDumper.dll": "5df172b1df09e13e3a63cdf9f7db5709d8be829c566c937fe04a6b8d558b03a7"
       }
     },
     "x86": {
       "entry_point": "x86/Il2CppDumper.exe",
-      "asset": "Il2CppDumper-a67301db02a3-net8.0-win-x86-self-contained.zip",
-      "archive_sha256": "3d947938f2ce0c59fe151f1e20d529f1cc2f6fc8d7e44d5a13aecdd0f2f0040c",
+      "asset": "Il2CppDumper-2a10ec57b15a-net8.0-win-x86-self-contained.zip",
+      "archive_sha256": "6508defcdc69a781618afbaf06b7683e1efba4f4052145a6adf773983dee1785",
       "runtime": "Microsoft.NETCore.App 8.0.30 win-x86",
       "files_sha256": {
-        "Il2CppDumper.exe": "d97a793f14060c843680386ca24391bd4eb2c096d3ea8d394fc1f629dc7f47d8",
-        "Il2CppDumper.dll": "5cde2328e422c0b6cf9dbcdc4e7cff9d4ef54af0f8f32bb1d4455c93c90d9e74"
+        "Il2CppDumper.exe": "c3228ef528871c961ac6bb317a5aa761be75639dbedc5024af27b9b6e3392dd9",
+        "Il2CppDumper.dll": "c0bd58e4e5511464af368c1f2ded2ec8d58ed66a98891bf2037350c0ebb86ed1"
       }
     }
   },
   "config_overrides": {
     "RequireAnyKey": false
+  },
+  "supplemental_documents": {
+    "README.ko-KR.md": "https://raw.githubusercontent.com/snowyegret23/Il2CppDumper/2a10ec57b15a17948ea29256b9c1f2de3cff33e3/README.ko-KR.md"
   },
   "supplemental_notices": {
     "LICENSE.TXT": "https://github.com/dotnet/runtime/blob/v8.0.30/LICENSE.TXT",
